@@ -1,0 +1,222 @@
+@import "tailwindcss";
+@import "uplot/dist/uPlot.min.css";
+
+:root {
+  color-scheme: dark;
+  --ink: #eef7f5;
+  --muted: #a2b9b5;
+  --surface-0: #071110;
+  --surface-1: #0c1918;
+  --surface-2: #112422;
+  --surface-3: #17312d;
+  --line: rgba(170, 205, 198, 0.16);
+  --accent: #37d2be;
+  --accent-strong: #128d81;
+  --accent-soft: rgba(55, 210, 190, 0.14);
+  --danger: #ff7b88;
+  --success: #55d59c;
+  --warning: #f7b756;
+  --info: #6fc3ef;
+  --shadow-elevated: 0 24px 100px rgba(0, 0, 0, 0.34);
+  --chart-axis: #95aca8;
+  --chart-grid: rgba(160, 194, 187, 0.14);
+  --chart-momentary: #37d2be;
+  --chart-shortterm: #f7b756;
+  --chart-truepeak: #ff9c55;
+  --page-bg: linear-gradient(180deg, #050e0d 0%, #071211 36%, #0a1716 100%);
+}
+
+[data-theme="light"] {
+  color-scheme: light;
+  --ink: #0b1f1c;
+  --muted: #55706b;
+  --surface-0: #ffffff;
+  --surface-1: #f3f8f6;
+  --surface-2: #e8f1ee;
+  --surface-3: #dbeae5;
+  --line: rgba(13, 49, 44, 0.14);
+  --accent: #0f9684;
+  --accent-strong: #0c7568;
+  --accent-soft: rgba(15, 150, 132, 0.13);
+  --danger: #bc2740;
+  --success: #11744e;
+  --warning: #8a5a00;
+  --info: #1f6f9e;
+  --shadow-elevated: 0 24px 80px rgba(10, 55, 49, 0.13);
+  --chart-axis: #55706b;
+  --chart-grid: rgba(13, 49, 44, 0.1);
+  --chart-momentary: #0c7568;
+  --chart-shortterm: #a4690b;
+  --chart-truepeak: #c4552f;
+  --page-bg: linear-gradient(180deg, #f6faf8 0%, #eef4f2 42%, #e8f1ed 100%);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  scroll-behavior: smooth;
+  background: var(--page-bg);
+}
+
+body {
+  min-height: 100vh;
+  margin: 0;
+  overflow-x: hidden;
+  background: var(--page-bg);
+  color: var(--ink);
+  font-family: var(--font-sans), sans-serif;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+}
+
+input::placeholder {
+  color: var(--muted);
+}
+
+::selection {
+  background: color-mix(in srgb, var(--accent) 24%, transparent);
+}
+
+.uplot {
+  font-family: var(--font-mono), monospace;
+}
+
+.u-wrap {
+  max-width: 100%;
+}
+
+.u-legend {
+  color: var(--muted);
+}
+
+@keyframes tp-fade-up {
+  from {
+    opacity: 0;
+    transform: translate3d(0, 16px, 0);
+  }
+
+  to {
+    opacity: 1;
+    transform: translate3d(0, 0, 0);
+  }
+}
+
+@keyframes tp-fade-in {
+  from {
+    opacity: 0;
+  }
+
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes tp-scale-in {
+  from {
+    opacity: 0;
+    transform: translate3d(0, 10px, 0) scale(0.985);
+  }
+
+  to {
+    opacity: 1;
+    transform: translate3d(0, 0, 0) scale(1);
+  }
+}
+
+.tp-enter {
+  animation: tp-fade-up 420ms cubic-bezier(0.2, 0.8, 0.2, 1) both;
+}
+
+.tp-enter-soft {
+  animation: tp-fade-up 280ms cubic-bezier(0.2, 0.8, 0.2, 1) both;
+}
+
+.tp-fade-in {
+  animation: tp-fade-in 220ms ease-out both;
+}
+
+.tp-dialog-in,
+.tp-drawer-in {
+  animation: tp-scale-in 260ms cubic-bezier(0.2, 0.8, 0.2, 1) both;
+}
+
+.tp-notice-in {
+  animation: tp-fade-up 220ms ease-out both;
+}
+
+.tp-selected-row {
+  transition:
+    background-color 180ms ease,
+    border-color 180ms ease,
+    box-shadow 180ms ease,
+    transform 180ms ease;
+}
+
+.tp-selected-row[data-selected="true"] {
+  transform: translate3d(0, -1px, 0);
+}
+
+/* Semantic status tones — theme-aware so chips stay legible in light *and* dark.
+   Border + soft fill are mixed from the token; text uses the solid token. */
+.tone-success {
+  border-color: color-mix(in srgb, var(--success) 32%, transparent);
+  background-color: color-mix(in srgb, var(--success) 12%, transparent);
+  color: var(--success);
+}
+
+.tone-danger {
+  border-color: color-mix(in srgb, var(--danger) 32%, transparent);
+  background-color: color-mix(in srgb, var(--danger) 12%, transparent);
+  color: var(--danger);
+}
+
+.tone-warning {
+  border-color: color-mix(in srgb, var(--warning) 34%, transparent);
+  background-color: color-mix(in srgb, var(--warning) 13%, transparent);
+  color: var(--warning);
+}
+
+.tone-info {
+  border-color: color-mix(in srgb, var(--info) 32%, transparent);
+  background-color: color-mix(in srgb, var(--info) 12%, transparent);
+  color: var(--info);
+}
+
+.tone-neutral {
+  border-color: var(--line);
+  background-color: var(--surface-2);
+  color: var(--muted);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+
+  .tp-enter,
+  .tp-enter-soft,
+  .tp-fade-in,
+  .tp-dialog-in,
+  .tp-drawer-in,
+  .tp-notice-in {
+    animation: none !important;
+  }
+}

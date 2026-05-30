@@ -1,0 +1,46 @@
+{
+  "name": "truepeak",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "prepare:ffmpeg": "node scripts/prepare-ffmpeg-assets.mjs",
+    "postinstall": "npm run prepare:ffmpeg",
+    "predev": "npm run prepare:ffmpeg",
+    "dev": "next dev",
+    "prebuild": "npm run prepare:ffmpeg",
+    "build": "next build",
+    "start": "next start",
+    "lint": "eslint .",
+    "test:dsp": "node scripts/dsp/validate-dsp.mjs",
+    "test:ebu": "node scripts/dsp/validate-ebu.mjs",
+    "test:session": "node scripts/dsp/validate-session.mjs",
+    "test:robustness": "node scripts/dsp/validate-robustness.mjs",
+    "test:export": "node scripts/dsp/validate-export.mjs",
+    "test": "npm run test:dsp && npm run test:ebu && npm run test:session && npm run test:robustness && npm run test:export"
+  },
+  "dependencies": {
+    "@ffmpeg/core": "^0.12.9",
+    "@ffmpeg/ffmpeg": "^0.12.15",
+    "@ffmpeg/util": "^0.12.2",
+    "@vercel/analytics": "^2.0.1",
+    "@vercel/speed-insights": "^2.0.0",
+    "class-variance-authority": "^0.7.1",
+    "clsx": "^2.1.1",
+    "lucide-react": "^1.7.0",
+    "next": "^16.2.2",
+    "react": "^19.2.4",
+    "react-dom": "^19.2.4",
+    "tailwind-merge": "^3.5.0",
+    "uplot": "^1.6.32"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "^4.2.2",
+    "@types/node": "^25.5.2",
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
+    "eslint": "^9.39.4",
+    "eslint-config-next": "^16.2.2",
+    "tailwindcss": "^4.2.2",
+    "typescript": "^6.0.2"
+  }
+}
