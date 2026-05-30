@@ -2,6 +2,21 @@
   <img src="./public/logo.png" alt="TruePeak logo" width="120" />
   <h1>TruePeak</h1>
   <p>A loudness and true peak review tool that runs entirely in your browser. Load your audio, read the numbers, compare a batch, and export the results. Nothing is uploaded anywhere.</p>
+
+  <p>
+    <a href="https://true-peak.vercel.app/">
+      <img src="https://img.shields.io/badge/Open_the_live_app-true--peak.vercel.app-0f9684?style=for-the-badge&logo=vercel&logoColor=white" alt="Open the live app" />
+    </a>
+  </p>
+
+  <p>
+    <img src="https://img.shields.io/badge/Next.js-000000?style=for-the-badge&logo=nextdotjs&logoColor=white" alt="Next.js" />
+    <img src="https://img.shields.io/badge/React-20232A?style=for-the-badge&logo=react&logoColor=61DAFB" alt="React" />
+    <img src="https://img.shields.io/badge/TypeScript-3178C6?style=for-the-badge&logo=typescript&logoColor=white" alt="TypeScript" />
+    <img src="https://img.shields.io/badge/Tailwind_CSS-0B1120?style=for-the-badge&logo=tailwindcss&logoColor=38BDF8" alt="Tailwind CSS" />
+    <img src="https://img.shields.io/badge/WebAssembly-654FF0?style=for-the-badge&logo=webassembly&logoColor=white" alt="WebAssembly via ffmpeg.wasm" />
+    <img src="https://img.shields.io/badge/Deployed_on_Vercel-000000?style=for-the-badge&logo=vercel&logoColor=white" alt="Deployed on Vercel" />
+  </p>
 </div>
 
 > **Note**
@@ -9,6 +24,8 @@
 > TruePeak is a review tool, not a certified broadcast compliance meter. WAV and AIFF are read directly. Compressed formats are decoded by the browser or by a local copy of ffmpeg.wasm, and codec behaviour can vary a little between browsers. Use it to check your work, not to sign off a broadcast deliverable.
 
 TruePeak keeps the whole loudness review in one place. Instead of jumping between a meter, a normalization calculator, a file inspector, and a comparison sheet, you get the batch queue, per file detail, timeline charts, target checks, and exports in the same screen. The measurements follow ITU-R BS.1770 and EBU R128.
+
+**Live app:** [true-peak.vercel.app](https://true-peak.vercel.app/)
 
 ## Contents
 
@@ -128,6 +145,8 @@ Decoding and analysis run in Web Workers so the heavy math stays off the main th
 
 ## Getting started
 
+The app is hosted at [true-peak.vercel.app](https://true-peak.vercel.app/), so you can use it without installing anything. To run it locally:
+
 You need Node.js 24 or newer (the build runs on 20+, but the test scripts use Node's native TypeScript support, which needs 24) and npm.
 
 Install dependencies:
@@ -177,6 +196,8 @@ A good first run: leave it in Simple mode, add a few WAV or AIFF files, pick Tar
 The scripts run the real TypeScript source directly through Node, with a small loader that maps the `@/` path alias. That is why they need Node 24.
 
 ## Deploying to Vercel
+
+The current build is live at [true-peak.vercel.app](https://true-peak.vercel.app/). To deploy your own copy:
 
 1. Push the repository to GitHub.
 2. Import the project into Vercel.
