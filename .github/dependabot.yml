@@ -7,6 +7,11 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
+    ignore:
+      # The ffmpeg core ships the wasm binary that prepare-ffmpeg-assets.mjs
+      # integrity-pins; automated bumps would fail the build until a human
+      # reviews and re-pins anyway. Updates to it are deliberate, manual events.
+      - dependency-name: "@ffmpeg/core"
     groups:
       minor-and-patch:
         update-types:
