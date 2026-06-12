@@ -16,7 +16,8 @@
     "test:session": "node scripts/dsp/validate-session.mjs",
     "test:robustness": "node scripts/dsp/validate-robustness.mjs",
     "test:export": "node scripts/dsp/validate-export.mjs",
-    "test": "npm run test:dsp && npm run test:ebu && npm run test:session && npm run test:robustness && npm run test:export"
+    "test:fuzz": "node scripts/dsp/validate-fuzz.mjs",
+    "test": "npm run test:dsp && npm run test:ebu && npm run test:session && npm run test:robustness && npm run test:export && npm run test:fuzz"
   },
   "dependencies": {
     "@ffmpeg/core": "^0.12.9",

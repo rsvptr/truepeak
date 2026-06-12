@@ -131,11 +131,21 @@ export function parseAiffBuffer(
       ssndSize = chunkSize;
     }
 
+    // One COMM and one SSND chunk describe a valid file; stop scanning once
+    // both are known so attacker-padded chunk tails can't burn time.
+    if (commOffset && ssndOffset) {
+      break;
+    }
+
     offset = dataOffset + chunkSize + (chunkSize % 2);
   }
 
   if (!commOffset || !ssndOffset) {
     throw new Error("AIFF file is missing COMM or SSND chunks.");
+  }
+
+  if (commSize < 18 || commOffset + 18 > view.byteLength) {
+    throw new Error("AIFF COMM chunk is truncated.");
   }
 
   const channelCount = view.getUint16(commOffset, false);
@@ -144,7 +154,13 @@ export function parseAiffBuffer(
   const sampleRate = Math.round(readExtendedFloat80(view, commOffset + 8));
   let compressionType = "NONE";
 
-  if (channelCount <= 0 || sampleRate <= 0 || bitsPerSample <= 0) {
+  // The 80-bit float can encode NaN/Infinity, which `<= 0` does not reject.
+  if (
+    channelCount <= 0 ||
+    !Number.isFinite(sampleRate) ||
+    sampleRate <= 0 ||
+    bitsPerSample <= 0
+  ) {
     throw new Error("Invalid AIFF format values.");
   }
 
