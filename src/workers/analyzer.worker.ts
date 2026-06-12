@@ -15,10 +15,18 @@ ctx.onmessage = (event: MessageEvent<AnalyzerRequest>) => {
   }
 
   try {
-    postMessageSafe({ type: "progress", jobId: message.jobId, progress: 0.15, label: "Preparing analysis windows" });
+    postMessageSafe({ type: "progress", jobId: message.jobId, progress: 0, label: "Preparing analysis windows" });
     const asset = fromTransferAsset(message.asset);
-    postMessageSafe({ type: "progress", jobId: message.jobId, progress: 0.55, label: "Computing LUFS, LRA, and peak metrics" });
-    const result = analyzeDecodedAsset(asset, message.target ?? null);
+    // Forward real measurement progress as a 0..1 fraction; the UI maps it
+    // into the job's overall progress band.
+    const result = analyzeDecodedAsset(asset, message.target ?? null, (fraction) => {
+      postMessageSafe({
+        type: "progress",
+        jobId: message.jobId,
+        progress: fraction,
+        label: "Measuring loudness, peaks, and dynamics",
+      });
+    });
     postMessageSafe({ type: "result", jobId: message.jobId, result });
   } catch (error) {
     postMessageSafe({

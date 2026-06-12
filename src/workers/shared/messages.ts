@@ -5,7 +5,9 @@ export type DecoderRequest = {
   jobId: string;
   fileName: string;
   mimeType: string;
-  buffer: ArrayBuffer;
+  // The worker reads the bytes itself so large files never occupy the main
+  // thread (a File handle is cheap to clone; the data stays on disk until read).
+  file: File;
 };
 
 export type DecoderResponse =
