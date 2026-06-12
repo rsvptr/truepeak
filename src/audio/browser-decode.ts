@@ -70,7 +70,9 @@ function readAscii(view: DataView, offset: number, length: number) {
   return out;
 }
 
-function parseFlacStreamInfo(buffer: ArrayBuffer): FlacStreamInfo | null {
+// Exported for the fuzz suite: this runs on the main thread against untrusted
+// bytes before the browser decoder sees them, so it gets fuzzed directly.
+export function parseFlacStreamInfo(buffer: ArrayBuffer): FlacStreamInfo | null {
   if (buffer.byteLength < 42) {
     return null;
   }

@@ -118,6 +118,9 @@ export function parseWavBuffer(
   }
 
   const warnings: string[] = [];
+  // Track only the chunks the parser actually reads. Recording every chunk in
+  // a map let a hostile file made of millions of tiny chunks balloon memory
+  // before any audio was parsed; unknown chunk IDs are now just skipped over.
   const chunks = new Map<string, ChunkInfo>();
   let offset = 12;
   let dataSizeFromDs64: number | null = null;
@@ -131,11 +134,21 @@ export function parseWavBuffer(
         ? dataSizeFromDs64
         : chunkSize;
 
-    if (id === "ds64" && chunkSize >= 28) {
+    if (id === "ds64" && chunkSize >= 28 && dataOffset + 16 <= view.byteLength) {
       dataSizeFromDs64 = readUint64LE(view, dataOffset + 8);
     }
 
-    chunks.set(id, { offset: dataOffset, size });
+    if (id === "fmt " || id === "data" || id === "ds64") {
+      chunks.set(id, { offset: dataOffset, size });
+    }
+
+    // Spec-conforming files carry one fmt and one data chunk (and ds64, when
+    // present, precedes data), so once both are known nothing later can
+    // legitimately change the result — stop scanning attacker-padded tails.
+    if (chunks.has("fmt ") && chunks.has("data")) {
+      break;
+    }
+
     offset = dataOffset + chunkSize + (chunkSize % 2);
   }
 
@@ -143,6 +156,10 @@ export function parseWavBuffer(
   const data = chunks.get("data");
   if (!fmt || !data) {
     throw new Error("Wave file is missing fmt or data chunks.");
+  }
+
+  if (fmt.size < 16 || fmt.offset + 16 > view.byteLength) {
+    throw new Error("Wave fmt chunk is truncated.");
   }
 
   let formatTag = view.getUint16(fmt.offset, true);
@@ -156,7 +173,7 @@ export function parseWavBuffer(
   }
 
   if (formatTag === WAVE_FORMAT_EXTENSIBLE) {
-    if (fmt.size < 40) {
+    if (fmt.size < 40 || fmt.offset + 40 > view.byteLength) {
       throw new Error("Invalid WAVE_FORMAT_EXTENSIBLE chunk.");
     }
 
