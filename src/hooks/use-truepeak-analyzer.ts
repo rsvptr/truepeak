@@ -14,8 +14,8 @@ import {
 } from "@/audio/export";
 import {
   MAX_SESSION_FILE_BYTES,
-  SESSION_FILE_NAME,
   buildSessionFile,
+  getSessionFileName,
   parseSessionFile,
 } from "@/audio/session-file";
 import {
@@ -1530,7 +1530,7 @@ export function useTruePeakAnalyzer(
   const exportSession = useCallback(() => {
     try {
       downloadTextFile(
-        SESSION_FILE_NAME,
+        getSessionFileName(),
         buildSessionFile(jobsRef.current),
         "application/json;charset=utf-8",
       );

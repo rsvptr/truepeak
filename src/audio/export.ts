@@ -1,4 +1,5 @@
 import { getComplianceSummary } from "@/audio/compliance";
+import { fileNameTimestamp } from "@/lib/format";
 import type { AnalysisJob } from "@/types/audio";
 
 export type ExportFormat = "csv" | "json" | "markdown";
@@ -38,15 +39,8 @@ function completedJobs(jobs: AnalysisJob[]) {
   return jobs.filter((job) => job.result);
 }
 
-// Timestamped so repeated exports land as separate files instead of silently
-// overwriting (or "(1)"-suffixing) the previous download.
-function exportTimestamp(now = new Date()) {
-  const pad = (value: number) => String(value).padStart(2, "0");
-  return `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
-}
-
 export function getExportFileName(format: ExportFormat) {
-  const base = `${EXPORT_BASENAME}-${exportTimestamp()}`;
+  const base = `${EXPORT_BASENAME}-${fileNameTimestamp()}`;
   switch (format) {
     case "csv":
       return `${base}.csv`;
