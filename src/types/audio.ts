@@ -147,6 +147,13 @@ export interface AnalysisJob {
   // True for jobs reconstructed from an imported session file (results only — no
   // source audio handle, so they can't be re-analyzed).
   imported?: boolean;
+  // True for jobs restored from this browser's persisted live session after a
+  // refresh. Results only, like imported jobs.
+  restored?: boolean;
+  // Wall-clock processing window for this run (epoch ms). Session-local only:
+  // used for the per-file timing display and the batch ETA estimate.
+  startedAtMs?: number;
+  finishedAtMs?: number;
 }
 
 export interface RecentSessionEntry {
