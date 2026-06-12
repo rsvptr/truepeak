@@ -78,8 +78,29 @@ textarea {
   font: inherit;
 }
 
+/* Native <select> popups paint options on a browser-chosen background (often
+   white on Windows) while the options inherit the control's text color. In the
+   dark theme that produced near-white text on a white popup — unreadable. Give
+   options an explicit themed background/foreground so every browser renders a
+   legible list in both themes. */
+select option,
+select optgroup {
+  background-color: var(--surface-1);
+  color: var(--ink);
+}
+
 input::placeholder {
   color: var(--muted);
+}
+
+/* Remove the tap-highlight/double-tap-zoom delay on interactive controls. */
+a,
+button,
+input,
+select,
+summary,
+[role="button"] {
+  touch-action: manipulation;
 }
 
 ::selection {
@@ -96,6 +117,13 @@ input::placeholder {
 
 .u-legend {
   color: var(--muted);
+}
+
+/* uPlot's cursor overlay swallows touch events for drag-select zoom, which
+   traps vertical page scrolling on phones. Let vertical pans scroll the page;
+   horizontal gestures still reach the chart. */
+.u-over {
+  touch-action: pan-y;
 }
 
 @keyframes tp-fade-up {
@@ -195,6 +223,34 @@ input::placeholder {
   border-color: var(--line);
   background-color: var(--surface-2);
   color: var(--muted);
+}
+
+/* Respect notches and home-indicator areas on phones. */
+@supports (padding: env(safe-area-inset-left)) {
+  body {
+    padding-left: env(safe-area-inset-left);
+    padding-right: env(safe-area-inset-right);
+    padding-bottom: env(safe-area-inset-bottom);
+  }
+}
+
+/* Touch ergonomics: on touch-primary devices, keep interactive controls at a
+   comfortable target size. */
+@media (pointer: coarse) {
+  button,
+  select,
+  input[type="search"],
+  input[type="number"] {
+    min-height: 44px;
+  }
+
+  /* iOS Safari zooms the whole page when a focused control's font-size is
+     below 16px. Keep form controls at 16px on small touch screens. */
+  input[type="search"],
+  input[type="number"],
+  select {
+    font-size: 16px;
+  }
 }
 
 @media (prefers-reduced-motion: reduce) {
