@@ -32,6 +32,7 @@ import {
 } from "lucide-react";
 import { getComplianceSummary } from "@/audio/compliance";
 import { DEFAULT_TARGET_PRESET, TARGET_PRESETS } from "@/audio/presets";
+import { MAX_DROPPED_FILES, collectDroppedFiles } from "@/lib/dropped-files";
 import { HistoryPreferenceCard, RecentSessionsPanel } from "@/components/history-panels";
 import { useTruePeakAnalyzer } from "@/hooks/use-truepeak-analyzer";
 import {
@@ -69,14 +70,18 @@ import {
 } from "@/lib/session-selectors";
 import {
   readHistoryPreference,
+  readParallelPreference,
   readThemePreference,
   readUiModePreference,
   subscribeHistoryPreference,
+  subscribeParallelPreference,
   subscribeThemePreference,
   subscribeUiModePreference,
+  type ParallelLanesPreference,
   type WorkspaceTheme,
   type WorkspaceUiMode,
   writeHistoryPreference,
+  writeParallelPreference,
   writeThemePreference,
   writeUiModePreference,
 } from "@/lib/workspace-preferences";
@@ -513,6 +518,10 @@ export function TruePeakWorkbench() {
   const preferredUiMode = useSyncExternalStore<UiMode>(subscribeUiModePreference, readUiModePreference, () => "simple");
   const historyEnabled = useSyncExternalStore(subscribeHistoryPreference, readHistoryPreference, () => false);
   const theme = useSyncExternalStore<WorkspaceTheme>(subscribeThemePreference, readThemePreference, () => "dark");
+  const parallelPreference = useSyncExternalStore<ParallelLanesPreference>(subscribeParallelPreference, readParallelPreference, () => "auto");
+  const setParallelPreference = useCallback((next: ParallelLanesPreference) => {
+    writeParallelPreference(next);
+  }, []);
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
   }, [theme]);
@@ -825,6 +834,7 @@ export function TruePeakWorkbench() {
     completedJobs,
     recentSessions,
     notice,
+    parallelLimit,
     enqueueFiles,
     cancelJob,
     cancelActiveJobs,
@@ -844,6 +854,7 @@ export function TruePeakWorkbench() {
     analysisMode,
     decodePreference,
     persistHistory: historyEnabled,
+    parallelPreference,
   });
 
   const filteredJobs = useMemo(
@@ -895,6 +906,39 @@ export function TruePeakWorkbench() {
   const targetingEnabled = analysisMode === "targeted";
   const currentModeLabel = targetingEnabled ? currentTarget.label : "Measure Only";
   const queueCounts = useMemo(() => countQueueJobs(jobs), [jobs]);
+  // Aggregate batch progress for the toolbar while anything is running.
+  // The ETA is deliberately rough: median completed duration in this session,
+  // scaled by how many files each parallel pass clears.
+  const batchProgress = useMemo(() => {
+    if (!jobs.length) {
+      return null;
+    }
+
+    const activeJobs = jobs.filter(isActiveJob);
+    if (!activeJobs.length) {
+      return null;
+    }
+
+    const finished = jobs.length - activeJobs.length;
+    const inFlightProgress = activeJobs.reduce(
+      (sum, job) => sum + Math.min(Math.max(job.progressPercent, 0), 1),
+      0,
+    );
+    const percent = ((finished + inFlightProgress) / jobs.length) * 100;
+
+    const durations = jobs
+      .filter((job) => job.status === "complete" && job.startedAtMs != null && job.finishedAtMs != null)
+      .map((job) => job.finishedAtMs! - job.startedAtMs!)
+      .sort((left, right) => left - right);
+    const median = durations.length ? durations[Math.floor(durations.length / 2)] : null;
+    const lanes = Math.max(1, parallelLimit);
+    const etaSeconds =
+      median != null
+        ? Math.max(1, Math.round((Math.ceil(activeJobs.length / lanes) * median) / 1000))
+        : null;
+
+    return { finished, total: jobs.length, percent, etaSeconds };
+  }, [jobs, parallelLimit]);
   const visibleQueueCount = sortedQueueJobs.length;
   const queueViewIsFiltered = queueSearchDraft.trim().length > 0 || queueFilter !== "all" || queueSort !== "recent";
   const queueShownLabel = queueViewIsFiltered
@@ -1024,14 +1068,46 @@ export function TruePeakWorkbench() {
     updateWorkspaceRoute({ drawer: "presets" });
   }, [pushUiNotice, targetValidation.message, updateWorkspaceRoute]);
 
-  const openPicker = () => {
+  const openPicker = useCallback(() => {
     if (targetInputBlocked) {
       showTargetInputBlock();
       return;
     }
 
     inputRef.current?.click();
-  };
+  }, [showTargetInputBlock, targetInputBlocked]);
+
+  // Desktop shortcuts: "/" focuses the queue search (when visible), Ctrl/Cmd+O
+  // opens the file picker instead of the browser's own open dialog.
+  const openPickerRef = useRef(openPicker);
+  useEffect(() => {
+    openPickerRef.current = openPicker;
+  }, [openPicker]);
+
+  useEffect(() => {
+    const handleShortcuts = (event: globalThis.KeyboardEvent) => {
+      const target = event.target instanceof HTMLElement ? event.target : null;
+      const inEditable = !!target?.closest("input, textarea, select, [contenteditable='true']");
+
+      if ((event.ctrlKey || event.metaKey) && !event.shiftKey && !event.altKey && event.key.toLowerCase() === "o") {
+        event.preventDefault();
+        openPickerRef.current();
+        return;
+      }
+
+      if (event.key === "/" && !inEditable && !event.ctrlKey && !event.metaKey && !event.altKey) {
+        const search = document.getElementById("queue-search");
+        if (search instanceof HTMLInputElement) {
+          event.preventDefault();
+          search.focus();
+          search.select();
+        }
+      }
+    };
+
+    window.addEventListener("keydown", handleShortcuts);
+    return () => window.removeEventListener("keydown", handleShortcuts);
+  }, []);
   const openSessionWorkspace = () => {
     updateWorkspaceRoute({ screen: "session", tab: "queue" });
   };
@@ -1049,10 +1125,93 @@ export function TruePeakWorkbench() {
       return;
     }
 
-    enqueueFiles(files);
-    updateWorkspaceRoute({ screen: "session", tab: "queue", drawer: null });
+    const added = enqueueFiles(files);
+    if (added > 0) {
+      updateWorkspaceRoute({ screen: "session", tab: "queue", drawer: null });
+    }
     if (inputRef.current) inputRef.current.value = "";
   };
+
+  // Drag-and-drop is owned here, on the always-mounted workbench, so dropping
+  // a file works on every screen. (It used to live in the home stage only;
+  // dropping onto the session screen made the browser navigate to the file
+  // and silently destroyed the in-memory session.)
+  const handleDropTransfer = useCallback((dataTransfer: DataTransfer) => {
+    if (targetInputBlocked) {
+      showTargetInputBlock();
+      return;
+    }
+
+    // Called synchronously from the drop event: collectDroppedFiles snapshots
+    // the transfer's items before yielding, then walks folders asynchronously.
+    void collectDroppedFiles(dataTransfer).then(({ files, truncated }) => {
+      if (truncated) {
+        pushUiNotice(`That drop was larger than ${numberFormatter.format(MAX_DROPPED_FILES)} files, so only the first ${numberFormatter.format(MAX_DROPPED_FILES)} were considered.`);
+      }
+
+      if (!files.length) return;
+      const added = enqueueFiles(files);
+      if (added > 0) {
+        updateWorkspaceRoute({ screen: "session", tab: "queue", drawer: null });
+      }
+    });
+  }, [enqueueFiles, pushUiNotice, showTargetInputBlock, targetInputBlocked, updateWorkspaceRoute]);
+  const dropTransferRef = useRef(handleDropTransfer);
+  useEffect(() => {
+    dropTransferRef.current = handleDropTransfer;
+  }, [handleDropTransfer]);
+
+  useEffect(() => {
+    const hasFiles = (event: DragEvent) => !!event.dataTransfer?.types?.includes("Files");
+    // dragenter/dragleave fire for every child crossing; a depth counter keeps
+    // the highlight stable until the pointer truly leaves the window.
+    let depth = 0;
+
+    const handleDragEnter = (event: DragEvent) => {
+      if (!hasFiles(event)) return;
+      event.preventDefault();
+      depth += 1;
+      setIsDragging(true);
+    };
+    const handleDragOver = (event: DragEvent) => {
+      if (hasFiles(event)) {
+        event.preventDefault();
+      }
+    };
+    const handleDragLeave = (event: DragEvent) => {
+      if (!hasFiles(event)) return;
+      depth = Math.max(0, depth - 1);
+      if (depth === 0) {
+        setIsDragging(false);
+      }
+    };
+    const handleDrop = (event: DragEvent) => {
+      if (!hasFiles(event)) return;
+      event.preventDefault();
+      depth = 0;
+      setIsDragging(false);
+      if (event.dataTransfer) {
+        dropTransferRef.current(event.dataTransfer);
+      }
+    };
+    const reset = () => {
+      depth = 0;
+      setIsDragging(false);
+    };
+
+    window.addEventListener("dragenter", handleDragEnter);
+    window.addEventListener("dragover", handleDragOver);
+    window.addEventListener("dragleave", handleDragLeave);
+    window.addEventListener("drop", handleDrop);
+    window.addEventListener("dragend", reset);
+    return () => {
+      window.removeEventListener("dragenter", handleDragEnter);
+      window.removeEventListener("dragover", handleDragOver);
+      window.removeEventListener("dragleave", handleDragLeave);
+      window.removeEventListener("drop", handleDrop);
+      window.removeEventListener("dragend", reset);
+    };
+  }, []);
 
   const openSessionPicker = () => {
     sessionInputRef.current?.click();
@@ -1318,7 +1477,7 @@ export function TruePeakWorkbench() {
                 Load a batch, measure LUFS and true peak, and review delivery targets without sending files anywhere. Use it as a review aid, not a certified compliance meter.
               </p>
             </div>
-            <div className="flex items-center gap-2">
+            <div className="flex flex-wrap items-center gap-2">
               <ThemeToggle theme={theme} onToggle={toggleTheme} />
               <Button type="button" size="sm" variant="secondary" onClick={openSessionPicker}>
                 <FolderOpen className="h-4 w-4" />
@@ -1344,6 +1503,8 @@ export function TruePeakWorkbench() {
             uiMode={uiMode}
             analysisMode={analysisMode}
             decodePreference={decodePreference}
+            parallelPreference={parallelPreference}
+            resolvedParallelLimit={parallelLimit}
             currentTarget={targetingEnabled ? currentTarget : null}
             currentModeLabel={currentModeLabel}
             supportedFormats={SUPPORTED_FORMATS}
@@ -1353,9 +1514,8 @@ export function TruePeakWorkbench() {
             onSetUiMode={setUiMode}
             onSetAnalysisMode={setAnalysisMode}
             onSetDecodePreference={setDecodePreference}
+            onSetParallelPreference={setParallelPreference}
             onOpenPresetLibrary={() => setWorkspaceDrawer("presets")}
-            onDropFiles={handleFiles}
-            onDragStateChange={setIsDragging}
           />
 
           {showHomeSupportSection ? (
@@ -1435,6 +1595,17 @@ export function TruePeakWorkbench() {
         </>
       ) : (
         <>
+          {isDragging ? (
+            <div
+              aria-hidden="true"
+              className="pointer-events-none fixed inset-0 z-[80] flex items-center justify-center bg-[color:var(--surface-0)]/72 p-6 backdrop-blur-[2px]"
+            >
+              <div className="rounded-[26px] border-2 border-dashed border-[var(--accent)] bg-[var(--surface-1)] px-8 py-6 text-center shadow-[var(--shadow-elevated)]">
+                <div className="text-lg font-semibold text-[var(--ink)]">Drop audio files to add them</div>
+                <div className="mt-1 text-sm text-[var(--muted)]">They join the current session queue. Folders are scanned for audio.</div>
+              </div>
+            </div>
+          ) : null}
           <StudioToolbar
             currentModeLabel={currentModeLabel}
             uiMode={uiMode}
@@ -1444,6 +1615,8 @@ export function TruePeakWorkbench() {
             activeCount={queueCounts.active}
             finishedCount={finishedCount}
             jobsCount={jobs.length}
+            parallelLimit={parallelLimit}
+            batchProgress={batchProgress}
             themeControl={<ThemeToggle theme={theme} onToggle={toggleTheme} />}
             onGoHome={() => setWorkspaceScreen("home")}
             onOpenPicker={openPicker}
@@ -1574,6 +1747,7 @@ export function TruePeakWorkbench() {
                         value={queueSearchDraft}
                         onChange={(event) => setSearchQuery(event.target.value)}
                         aria-label="Search files in the current session"
+                        aria-keyshortcuts="/"
                         autoComplete="off"
                         spellCheck={false}
                         placeholder="Search by file, status, preset, decoder, or layout"

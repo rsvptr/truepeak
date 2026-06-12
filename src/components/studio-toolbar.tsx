@@ -13,10 +13,19 @@ import {
   Square,
   Trash2,
 } from "lucide-react";
+import { formatDuration } from "@/lib/format";
 import { TruePeakLogo } from "@/components/truepeak-logo";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
+import { Progress } from "@/components/ui/progress";
+
+export interface BatchProgressSummary {
+  finished: number;
+  total: number;
+  percent: number;
+  etaSeconds: number | null;
+}
 
 interface StudioToolbarProps {
   currentModeLabel: string;
@@ -27,6 +36,8 @@ interface StudioToolbarProps {
   activeCount: number;
   finishedCount: number;
   jobsCount: number;
+  parallelLimit?: number;
+  batchProgress?: BatchProgressSummary | null;
   themeControl?: ReactNode;
   onGoHome: () => void;
   onOpenPicker: () => void;
@@ -51,6 +62,8 @@ export function StudioToolbar({
   activeCount,
   finishedCount,
   jobsCount,
+  parallelLimit,
+  batchProgress,
   themeControl,
   onGoHome,
   onOpenPicker,
@@ -155,9 +168,9 @@ export function StudioToolbar({
   };
 
   return (
-    <div className="sticky top-4 z-30">
-      <Card className="border-[var(--line)]/65 bg-[color:var(--surface-0)]/94 px-4 py-4 shadow-[0_14px_34px_rgba(0,0,0,0.14)] sm:px-5">
-        <div className="flex flex-col gap-4 xl:flex-row xl:items-center xl:justify-between">
+    <div className="sticky top-2 z-30 sm:top-4">
+      <Card className="border-[var(--line)]/65 bg-[color:var(--surface-0)]/94 px-3 py-3 shadow-[0_14px_34px_rgba(0,0,0,0.14)] sm:px-5 sm:py-4">
+        <div className="flex flex-col gap-3 sm:gap-4 xl:flex-row xl:items-center xl:justify-between">
           <div className="min-w-0">
             <div className="flex flex-wrap items-center gap-2">
               <Button type="button" size="sm" variant="ghost" onClick={onGoHome}>
@@ -166,17 +179,31 @@ export function StudioToolbar({
               </Button>
               <span className="hidden h-6 w-px rounded-full bg-[var(--line)] sm:block" aria-hidden="true" />
               <TruePeakLogo size="sm" subtitle="Review session" />
-              <Badge>{currentModeLabel}</Badge>
-              <Badge className="border-[var(--line)]/80 bg-[var(--surface-1)]/70 text-[var(--muted)]">
+              {/* Badge chips are context, not controls — drop them on phones so
+                  the sticky toolbar stays a thin strip above the queue. */}
+              <Badge className="hidden md:inline-flex">{currentModeLabel}</Badge>
+              <Badge className="hidden border-[var(--line)]/80 bg-[var(--surface-1)]/70 text-[var(--muted)] md:inline-flex">
                 {uiMode === "simple" ? "Simple view" : "Advanced view"}
               </Badge>
-              <Badge className="border-[var(--line)]/80 bg-[var(--surface-1)]/70 text-[var(--muted)]">
+              <Badge className="hidden border-[var(--line)]/80 bg-[var(--surface-1)]/70 text-[var(--muted)] md:inline-flex">
                 {decodeLabel} decode
               </Badge>
             </div>
-            <div className="mt-3 text-sm leading-6 text-[var(--muted)]">
+            <div className="mt-2 text-xs leading-5 text-[var(--muted)] sm:mt-3 sm:text-sm sm:leading-6">
               {jobsCount} file{jobsCount === 1 ? "" : "s"} in this session, {activeCount} in progress, {completedCount} ready to review.
+              {parallelLimit && parallelLimit > 1 ? ` Runs up to ${parallelLimit} files at once.` : ""}
             </div>
+            {batchProgress ? (
+              <div className="mt-2 flex items-center gap-3">
+                <div className="min-w-0 max-w-[420px] flex-1">
+                  <Progress value={batchProgress.percent} label="Batch progress" />
+                </div>
+                <span className="shrink-0 text-xs tabular-nums text-[var(--muted)]">
+                  {batchProgress.finished}/{batchProgress.total} done
+                  {batchProgress.etaSeconds != null ? ` · ~${formatDuration(batchProgress.etaSeconds)} left` : ""}
+                </span>
+              </div>
+            ) : null}
           </div>
 
           <div className="flex flex-wrap items-center gap-2">

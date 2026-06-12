@@ -125,6 +125,16 @@ export function InspectorPanel({
 }: InspectorPanelProps) {
   const result = job.result ?? null;
   const selectedTarget = result?.target ?? null;
+  const processingSeconds =
+    job.status === "complete" && job.startedAtMs != null && job.finishedAtMs != null
+      ? Math.max(0, (job.finishedAtMs - job.startedAtMs) / 1000)
+      : null;
+  const processingLabel =
+    processingSeconds == null
+      ? null
+      : processingSeconds < 10
+        ? `${processingSeconds.toFixed(1)} s`
+        : `${Math.round(processingSeconds)} s`;
   const selectedCompliance = result ? getComplianceSummary(result) : null;
   const selectedNotes = result
     ? Array.from(new Set([...result.metadata.decodeNotes, ...result.metadata.warnings, ...result.metrics.warnings]))
@@ -402,6 +412,7 @@ export function InspectorPanel({
                 <MetadataRow label="Layout confidence" value={result.metadata.channelLayout.guessed ? "Guessed" : "Explicit"} hint={result.metadata.channelLayout.labels.join(" / ")} />
                 <MetadataRow label="Frame count" value={result.metadata.frameCount.toLocaleString("en-GB")} hint="Decoded sample frames" />
                 <MetadataRow label="Duration" value={formatDuration(result.metadata.durationSeconds)} hint="Source duration" />
+                {processingLabel ? <MetadataRow label="Processing time" value={processingLabel} hint="Read, decode, and analysis for this run" /> : null}
               </dl>
             </section>
 
@@ -426,6 +437,7 @@ export function InspectorPanel({
               <InspectorMetric density={density} label="Layout confidence" value={result.metadata.channelLayout.guessed ? "Guessed" : "Explicit"} hint={result.metadata.channelLayout.labels.join(" / ")} />
               <InspectorMetric density={density} label="Frame count" value={result.metadata.frameCount.toLocaleString("en-GB")} hint="Decoded sample frames" />
               <InspectorMetric density={density} label="Duration" value={formatDuration(result.metadata.durationSeconds)} hint="Source duration" />
+              {processingLabel ? <InspectorMetric density={density} label="Processing time" value={processingLabel} hint="Read, decode, and analysis for this run" /> : null}
             </div>
           </section>
 

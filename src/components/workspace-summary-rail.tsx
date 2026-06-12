@@ -24,10 +24,10 @@ interface WorkspaceSummaryRailProps {
 
 function RailMetric({ label, value, hint }: { label: string; value: string; hint: string }) {
   return (
-    <div className="flex h-full min-h-[124px] flex-col justify-between rounded-[20px] border border-[var(--line)]/60 bg-[var(--surface-1)]/50 px-4 py-4">
+    <div className="flex h-full min-h-[96px] flex-col justify-between rounded-[20px] border border-[var(--line)]/60 bg-[var(--surface-1)]/50 px-3 py-3 sm:min-h-[124px] sm:px-4 sm:py-4">
       <div className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">{label}</div>
-      <div className="mt-3 text-lg font-semibold text-[var(--ink)] tabular-nums">{value}</div>
-      <div className="mt-2 text-xs leading-5 text-[var(--muted)]">{hint}</div>
+      <div className="mt-2 break-words text-lg font-semibold text-[var(--ink)] tabular-nums sm:mt-3">{value}</div>
+      <div className="mt-1 text-xs leading-5 text-[var(--muted)] sm:mt-2">{hint}</div>
     </div>
   );
 }
@@ -108,7 +108,7 @@ export function WorkspaceSummaryRail({
   return (
     <div className="rounded-[24px] border border-[var(--line)]/65 bg-[var(--surface-0)]/92 px-4 py-4 sm:px-5">
       <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_minmax(320px,0.84fr)] xl:items-stretch">
-        <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-6">
+        <div className="grid grid-cols-2 gap-3 xl:grid-cols-3 2xl:grid-cols-6">
           <RailMetric label="Queue" value={String(queueCount)} hint="Files in this session" />
           <RailMetric label="Complete" value={String(completedCount)} hint="Ready to inspect" />
           <RailMetric label="Issues" value={String(issueCount)} hint="Failed or canceled" />

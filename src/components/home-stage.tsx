@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { useState, type ReactNode } from "react";
 import {
   ChevronDown,
   ChevronUp,
@@ -11,6 +11,7 @@ import {
 } from "lucide-react";
 import { formatLufs, formatPeakDbtp } from "@/lib/format";
 import { cn } from "@/lib/utils";
+import type { ParallelLanesPreference } from "@/lib/workspace-preferences";
 import type { AnalysisMode, DecodePreference, TargetPreset } from "@/types/audio";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -26,6 +27,8 @@ interface HomeStageProps {
   uiMode: "simple" | "advanced";
   analysisMode: AnalysisMode;
   decodePreference: DecodePreference;
+  parallelPreference: ParallelLanesPreference;
+  resolvedParallelLimit: number;
   currentTarget: TargetPreset | null;
   currentModeLabel: string;
   supportedFormats: string[];
@@ -35,10 +38,16 @@ interface HomeStageProps {
   onSetUiMode: (mode: "simple" | "advanced") => void;
   onSetAnalysisMode: (mode: AnalysisMode) => void;
   onSetDecodePreference: (preference: DecodePreference) => void;
+  onSetParallelPreference: (preference: ParallelLanesPreference) => void;
   onOpenPresetLibrary: () => void;
-  onDropFiles: (files: FileList | null) => void;
-  onDragStateChange: (dragging: boolean) => void;
 }
+
+const PARALLEL_OPTIONS: Array<{ id: ParallelLanesPreference; label: string }> = [
+  { id: "auto", label: "Auto (recommended)" },
+  { id: "1", label: "1 file at a time" },
+  { id: "2", label: "2 files at once" },
+  { id: "4", label: "4 files at once" },
+];
 
 function ToggleButton({
   active,
@@ -104,6 +113,8 @@ export function HomeStage({
   uiMode,
   analysisMode,
   decodePreference,
+  parallelPreference,
+  resolvedParallelLimit,
   currentTarget,
   currentModeLabel,
   supportedFormats,
@@ -113,41 +124,11 @@ export function HomeStage({
   onSetUiMode,
   onSetAnalysisMode,
   onSetDecodePreference,
+  onSetParallelPreference,
   onOpenPresetLibrary,
-  onDropFiles,
-  onDragStateChange,
 }: HomeStageProps) {
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const advancedPanelId = "home-stage-advanced-options";
-  // Drag depth counter: dragenter/dragleave also fire when crossing child
-  // elements, so a simple boolean (or relatedTarget check, which is null in some
-  // browsers) flickers. Counting enters vs leaves keeps the highlight stable and
-  // only clears it when the pointer truly leaves the panel.
-  const dragDepth = useRef(0);
-
-  useEffect(() => {
-    // Reset the highlight if a drag is dropped or canceled anywhere, and stop the
-    // browser from navigating away (losing the session) when a file is dropped
-    // outside the drop zone.
-    const allowDrop = (event: DragEvent) => {
-      if (event.dataTransfer?.types?.includes("Files")) {
-        event.preventDefault();
-      }
-    };
-    const reset = (event?: DragEvent) => {
-      event?.preventDefault();
-      dragDepth.current = 0;
-      onDragStateChange(false);
-    };
-    window.addEventListener("dragover", allowDrop);
-    window.addEventListener("drop", reset);
-    window.addEventListener("dragend", reset);
-    return () => {
-      window.removeEventListener("dragover", allowDrop);
-      window.removeEventListener("drop", reset);
-      window.removeEventListener("dragend", reset);
-    };
-  }, [onDragStateChange]);
   const decodeOption =
     decodeOptions.find((option) => option.id === decodePreference) ?? decodeOptions[0];
 
@@ -195,28 +176,7 @@ export function HomeStage({
           <div className="mt-7 rounded-[30px] border border-[var(--line)]/72 bg-[var(--surface-1)]/52 px-6 py-6 sm:px-7 sm:py-7">
             <div className="grid gap-6 xl:grid-cols-[minmax(0,1.1fr)_minmax(320px,0.9fr)] xl:items-stretch">
               <section
-                aria-label="Drag audio files here"
-                onDragEnter={(event) => {
-                  event.preventDefault();
-                  dragDepth.current += 1;
-                  onDragStateChange(true);
-                }}
-                onDragOver={(event) => {
-                  event.preventDefault();
-                }}
-                onDragLeave={(event) => {
-                  event.preventDefault();
-                  dragDepth.current = Math.max(0, dragDepth.current - 1);
-                  if (dragDepth.current === 0) {
-                    onDragStateChange(false);
-                  }
-                }}
-                onDrop={(event) => {
-                  event.preventDefault();
-                  dragDepth.current = 0;
-                  onDragStateChange(false);
-                  onDropFiles(event.dataTransfer.files);
-                }}
+                aria-label="Drag and drop area"
                 className={cn(
                   "rounded-[24px] border border-dashed px-5 py-5 transition-[background-color,border-color,box-shadow] duration-200 ease-out",
                   isDragging
@@ -229,14 +189,14 @@ export function HomeStage({
                   Drag and drop
                 </div>
                 <h3 className="mt-3 text-2xl font-semibold text-[var(--ink)] sm:text-3xl">
-                  Drop files onto this panel
+                  Drop files or folders anywhere
                 </h3>
                 <p className="mt-3 max-w-[60ch] text-sm leading-7 text-[var(--muted)] sm:text-base">
-                  Use drag and drop when you want to add a whole batch quickly. The session opens as soon as the files are accepted.
+                  Drag a batch — or a whole album folder — onto any part of the app. Folders are scanned for supported audio, and the session opens as soon as the files are accepted.
                 </p>
                 <div className="mt-5 inline-flex items-center gap-2 rounded-full border border-[var(--line)]/70 bg-[var(--surface-0)]/54 px-3 py-1.5 text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">
                   <span className="h-1.5 w-1.5 rounded-full bg-[var(--accent)]" />
-                  Drop audio anywhere in this area
+                  Works on every screen, folders included
                 </div>
               </section>
 
@@ -360,7 +320,7 @@ export function HomeStage({
             </div>
 
             {advancedOpen ? (
-              <div id={advancedPanelId} className="tp-enter-soft mt-4 grid gap-3 border-t border-[var(--line)]/70 pt-4 lg:grid-cols-[minmax(0,0.92fr)_minmax(0,1.08fr)]">
+              <div id={advancedPanelId} className="tp-enter-soft mt-4 grid gap-3 border-t border-[var(--line)]/70 pt-4 lg:grid-cols-3">
                 <StripSection label="Decode path" className="min-h-[140px]">
                   <div className="flex h-full flex-col justify-between gap-4">
                     <label htmlFor="decode-preference" className="block text-sm text-[var(--muted)]">
@@ -382,6 +342,33 @@ export function HomeStage({
                     </label>
                     <div className="text-sm leading-6 text-[var(--muted)]">
                       Choose a preferred decode route when you want to favour speed, browser codecs, or maximum compatibility.
+                    </div>
+                  </div>
+                </StripSection>
+
+                <StripSection label="Parallel files" className="min-h-[140px]">
+                  <div className="flex h-full flex-col justify-between gap-4">
+                    <label htmlFor="parallel-files" className="block text-sm text-[var(--muted)]">
+                      <span className="sr-only">How many files analyze at once</span>
+                      <select
+                        id="parallel-files"
+                        name="parallel-files"
+                        aria-label="Choose how many files analyze at once"
+                        value={parallelPreference}
+                        onChange={(event) => onSetParallelPreference(event.target.value as ParallelLanesPreference)}
+                        className="h-11 w-full rounded-[18px] border border-[var(--line)] bg-[var(--surface-1)] px-3 text-[var(--ink)] outline-none transition-[border-color,background-color] duration-200 ease-out focus:border-[var(--accent)]"
+                      >
+                        {PARALLEL_OPTIONS.map((option) => (
+                          <option key={option.id} value={option.id}>
+                            {option.label}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                    <div className="text-sm leading-6 text-[var(--muted)]">
+                      {parallelPreference === "auto"
+                        ? `Auto picks ${resolvedParallelLimit} for this device. Lower it if the tab feels heavy with very large files.`
+                        : "Auto matches the lane count to this device's CPU and memory. Very large files always run alone."}
                     </div>
                   </div>
                 </StripSection>
