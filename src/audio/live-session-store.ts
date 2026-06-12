@@ -37,36 +37,42 @@ function openDatabase(): Promise<IDBDatabase | null> {
   });
 }
 
+// Resolves true only when the transaction commits. Callers use the result to
+// retry bookkeeping; a quota-exhausted or aborted write must not be recorded
+// as persisted.
 function runWrite(
   db: IDBDatabase,
   apply: (store: IDBObjectStore) => void,
-): Promise<void> {
+): Promise<boolean> {
   return new Promise((resolve) => {
     try {
       const transaction = db.transaction(STORE_NAME, "readwrite");
       apply(transaction.objectStore(STORE_NAME));
-      transaction.oncomplete = () => resolve();
-      transaction.onerror = () => resolve();
-      transaction.onabort = () => resolve();
+      transaction.oncomplete = () => resolve(true);
+      transaction.onerror = () => resolve(false);
+      transaction.onabort = () => resolve(false);
     } catch {
-      resolve();
+      resolve(false);
     }
   });
 }
 
-export async function persistLiveSessionJobs(jobs: AnalysisJob[]): Promise<void> {
+// Returns whether the write committed. When IndexedDB is unavailable entirely
+// (private browsing modes), reports true: there is nothing to retry against,
+// and restore won't run in that environment either.
+export async function persistLiveSessionJobs(jobs: AnalysisJob[]): Promise<boolean> {
   const withResults = jobs.filter((job) => job.result);
   if (!withResults.length) {
-    return;
+    return true;
   }
 
   const db = await openDatabase();
   if (!db) {
-    return;
+    return true;
   }
 
   try {
-    await runWrite(db, (store) => {
+    return await runWrite(db, (store) => {
       withResults.forEach((job) => {
         store.put({
           id: job.id,
@@ -82,18 +88,18 @@ export async function persistLiveSessionJobs(jobs: AnalysisJob[]): Promise<void>
   }
 }
 
-export async function removeLiveSessionJobs(jobIds: string[]): Promise<void> {
+export async function removeLiveSessionJobs(jobIds: string[]): Promise<boolean> {
   if (!jobIds.length) {
-    return;
+    return true;
   }
 
   const db = await openDatabase();
   if (!db) {
-    return;
+    return true;
   }
 
   try {
-    await runWrite(db, (store) => {
+    return await runWrite(db, (store) => {
       jobIds.forEach((jobId) => store.delete(jobId));
     });
   } finally {

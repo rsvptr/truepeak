@@ -368,7 +368,7 @@ export function HomeStage({
                     <div className="text-sm leading-6 text-[var(--muted)]">
                       {parallelPreference === "auto"
                         ? `Auto picks ${resolvedParallelLimit} for this device. Lower it if the tab feels heavy with very large files.`
-                        : "Auto matches the lane count to this device's CPU and memory. Very large files always run alone."}
+                        : `Fixed at ${resolvedParallelLimit} at once. Switch back to Auto to match this device's CPU and memory. Very large files always run alone.`}
                     </div>
                   </div>
                 </StripSection>
