@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      # npm ci runs the postinstall ffmpeg asset copy, which now verifies the
+      # pinned SHA-256 hashes — a tampered @ffmpeg/core fails the build here.
+      - name: Install (includes ffmpeg integrity check)
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      # DSP reference signals, EBU compliance, session round-trip/rejection,
+      # adversarial robustness, export escaping, and the deterministic fuzz
+      # suite over every untrusted-input parser.
+      - name: Validation suites
+        run: npm test
+
+      - name: Production build
+        run: npm run build
+
+      - name: Dependency audit (fail on high or critical)
+        run: npm audit --audit-level=high
