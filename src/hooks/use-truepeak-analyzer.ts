@@ -758,13 +758,40 @@ export function useTruePeakAnalyzer(
       return;
     }
 
+    // Mark optimistically so concurrent effect runs don't double-write, but
+    // roll the marks back if the transaction fails (e.g. storage quota), so
+    // the next jobs change retries instead of silently dropping the records.
     toSave.forEach((job) => persistedResultsRef.current.set(job.id, job.result!.analyzedAt));
-    toDelete.forEach((jobId) => persistedResultsRef.current.delete(jobId));
     if (toSave.length) {
-      void persistLiveSessionJobs(toSave);
+      void persistLiveSessionJobs(toSave).then((committed) => {
+        if (committed) {
+          return;
+        }
+
+        toSave.forEach((job) => {
+          if (persistedResultsRef.current.get(job.id) === job.result!.analyzedAt) {
+            persistedResultsRef.current.delete(job.id);
+          }
+        });
+      });
     }
+
     if (toDelete.length) {
-      void removeLiveSessionJobs(toDelete);
+      const previousMarks = new Map(
+        toDelete.map((jobId) => [jobId, persistedResultsRef.current.get(jobId)]),
+      );
+      toDelete.forEach((jobId) => persistedResultsRef.current.delete(jobId));
+      void removeLiveSessionJobs(toDelete).then((committed) => {
+        if (committed) {
+          return;
+        }
+
+        previousMarks.forEach((analyzedAt, jobId) => {
+          if (analyzedAt != null && !persistedResultsRef.current.has(jobId)) {
+            persistedResultsRef.current.set(jobId, analyzedAt);
+          }
+        });
+      });
     }
   }, [jobs]);
 

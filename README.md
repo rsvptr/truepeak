@@ -110,7 +110,7 @@ Session saves follow the same pattern (`truepeak-session-YYYYMMDD-HHMMSS.truepea
 
 ## Privacy
 
-Everything happens in the browser. Your files are read locally, decoded locally, and analyzed locally. No audio is uploaded, and there is no backend database or account system. Completed readings are kept in this browser's local storage so a refresh doesn't lose them; clearing the session removes them. The only thing the server does is read the theme cookie so the first paint uses the right colors.
+Everything happens in the browser. Your files are read locally, decoded locally, and analyzed locally. No audio is uploaded, and there is no backend database or account system. Completed readings are kept on this device (in the browser's IndexedDB) so a refresh doesn't lose them; clearing the session removes them. The only thing the server does is read the theme cookie so the first paint uses the right colors.
 
 ## Security
 
@@ -136,7 +136,7 @@ flowchart LR
     G --> K["Optional local history"]
 ```
 
-Decoding and analysis run in Web Workers so the heavy math stays off the main thread and the interface stays responsive — file bytes are even read inside the worker, so the UI thread never holds a copy of a large file. The queue runs several files in parallel: each active file gets its own decoder and analyzer worker pair, with the number of parallel lanes derived from your CPU and memory (up to 4, lower on phones and low-memory devices, and adjustable under Advanced Options on the home screen). Very large files still run one at a time so peak memory stays bounded by a single decoded file. Each file's decoded audio is released as soon as its analysis finishes, and idle workers are torn down after the queue goes quiet.
+Decoding and analysis run in Web Workers so the heavy math stays off the main thread and the interface stays responsive — file bytes are even read inside the worker, so the UI thread never holds a copy of a large file. The queue runs several files in parallel: each active file gets its own decoder and analyzer worker pair, with the number of parallel lanes derived from your CPU and memory (up to 6 on high-memory desktops, lower on phones and low-memory devices, and adjustable under Advanced Options on the home screen). Very large files still run one at a time so peak memory stays bounded by a single decoded file. Each file's decoded audio is released as soon as its analysis finishes, and idle workers are torn down after the queue goes quiet.
 
 ## Tech stack
 
@@ -253,7 +253,7 @@ truepeak/
 
 The app handles a few hundred files and high resolution material, with a couple of things worth knowing.
 
-- Several files run in parallel (up to 4 lanes, derived from your CPU and memory, adjustable in Advanced Options), and each file's decoded audio is freed as soon as it finishes. Memory peaks at a few normal files in flight at once, and finished results keep only compact numbers and a small timeline, so a few hundred of them add up to only tens of megabytes.
+- Several files run in parallel (up to 6 lanes on high-memory desktops, derived from your CPU and memory, adjustable in Advanced Options), and each file's decoded audio is freed as soon as it finishes. Memory peaks at a few normal files in flight at once, and finished results keep only compact numbers and a small timeline, so a few hundred of them add up to only tens of megabytes.
 - Very large files are automatically run one at a time (256 MB and over on a desktop, 96 MB and over on phones and low-memory devices), with the rest of the queue held until they finish. A large high resolution file (for example a 300 MB, 24 bit, 192 kHz track) uses roughly 700 MB to 1 GB of memory for the moment it is being processed, then releases it. That is comfortable on a desktop with 8 GB of RAM or more. On a low memory device or phone it can run the tab out of memory, which loses the batch, so use a desktop for heavy work.
 - WAV and AIFF take the fast direct parser. Large compressed files (a big FLAC or M4A) go through ffmpeg.wasm, which has its own memory ceiling, so for very large high resolution files, WAV or AIFF is the safer choice.
 - A full library still takes a while, but parallel lanes cut the wall-clock time substantially on a desktop. Plan for roughly five to ten seconds per heavy high resolution file (overlapping across lanes) and less for normal songs. While a batch is running the app asks the browser to keep the screen awake (where supported) and warns before the tab closes. If you would rather not risk a long unbroken run, add the files in a few smaller batches and export each one.
