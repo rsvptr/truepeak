@@ -25,6 +25,12 @@ const EXPECTED_HASHES = {
     "ffmpeg-core.js": "b266ab5b952555881dd6310663986994a182acb2b7ff25cf10a25f7a37ac2b21",
     "ffmpeg-core.wasm": "9f57947a5bd530d8f00c5b3f2cb2a3492faa7e5d823315342d6a8656d0a6b7b7",
   },
+  // 0.12.10 ships byte-identical UMD assets to 0.12.9 (verified by hashing a
+  // fresh `npm pack @ffmpeg/core@0.12.10` — packaging-only release).
+  "0.12.10": {
+    "ffmpeg-core.js": "b266ab5b952555881dd6310663986994a182acb2b7ff25cf10a25f7a37ac2b21",
+    "ffmpeg-core.wasm": "9f57947a5bd530d8f00c5b3f2cb2a3492faa7e5d823315342d6a8656d0a6b7b7",
+  },
 };
 
 const printHashesOnly = process.argv.includes("--print-hashes");
