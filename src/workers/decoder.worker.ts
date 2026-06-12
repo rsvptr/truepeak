@@ -192,10 +192,29 @@ ctx.onmessage = async (event: MessageEvent<DecoderRequest>) => {
     postMessageSafe({
       type: "progress",
       jobId: message.jobId,
+      progress: 0.03,
+      label: "Reading local file",
+    });
+    // Read here, off the main thread, so a multi-hundred-MB file never blocks
+    // or balloons the UI thread while other lanes are rendering progress.
+    let buffer: ArrayBuffer;
+    try {
+      buffer = await message.file.arrayBuffer();
+    } catch (readError) {
+      throw new Error(
+        readError instanceof Error && readError.message
+          ? `Could not read this file from disk: ${readError.message}`
+          : "Could not read this file from disk. It may have moved or changed since it was added.",
+      );
+    }
+
+    postMessageSafe({
+      type: "progress",
+      jobId: message.jobId,
       progress: 0.05,
       label: "Inspecting container",
     });
-    const container = sniffContainer(message.buffer);
+    const container = sniffContainer(buffer);
     let asset;
 
     if (container === "wav") {
@@ -206,7 +225,7 @@ ctx.onmessage = async (event: MessageEvent<DecoderRequest>) => {
         label: "Parsing PCM wave file",
       });
       try {
-        asset = parseWavBuffer(message.buffer, message.fileName, message.mimeType);
+        asset = parseWavBuffer(buffer, message.fileName, message.mimeType);
       } catch (nativeError) {
         postMessageSafe({
           type: "progress",
@@ -220,7 +239,7 @@ ctx.onmessage = async (event: MessageEvent<DecoderRequest>) => {
             message.jobId,
             message.fileName,
             message.mimeType,
-            message.buffer,
+            buffer,
           );
           asset.decodeNotes = [
             `Native WAV parser skipped: ${errorMessage(nativeError, "WAV parser failed.")}`,
@@ -240,7 +259,7 @@ ctx.onmessage = async (event: MessageEvent<DecoderRequest>) => {
         label: "Parsing AIFF source",
       });
       try {
-        asset = parseAiffBuffer(message.buffer, message.fileName, message.mimeType);
+        asset = parseAiffBuffer(buffer, message.fileName, message.mimeType);
       } catch (nativeError) {
         postMessageSafe({
           type: "progress",
@@ -254,7 +273,7 @@ ctx.onmessage = async (event: MessageEvent<DecoderRequest>) => {
             message.jobId,
             message.fileName,
             message.mimeType,
-            message.buffer,
+            buffer,
           );
           asset.decodeNotes = [
             `Native AIFF parser skipped: ${errorMessage(nativeError, "AIFF parser failed.")}`,
@@ -271,7 +290,7 @@ ctx.onmessage = async (event: MessageEvent<DecoderRequest>) => {
         message.jobId,
         message.fileName,
         message.mimeType,
-        message.buffer,
+        buffer,
       );
     }
 

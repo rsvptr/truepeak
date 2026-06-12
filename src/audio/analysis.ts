@@ -90,9 +90,14 @@ class KWeightingFilter {
   }
 }
 
+// Reports analysis progress as a 0..1 fraction. Implementations should expect
+// coarse steps (a few percent apart); emission is rate-limited at the source.
+export type AnalysisProgressCallback = (fraction: number) => void;
+
 function calculateSegmentEnergies(
   asset: DecodedAudioAsset,
   stepSamples: number,
+  onProgress?: AnalysisProgressCallback,
 ) {
   const { channels, channelLayout, sampleRate } = asset;
   const frameCount = channels[0]?.length ?? 0;
@@ -121,8 +126,13 @@ function calculateSegmentEnergies(
     filter.processInPlace(filtered);
   }
 
+  const progressStride = Math.max(1, Math.floor(frameCount / 20));
   let segmentEnergy = 0;
   for (let frame = 0; frame < frameCount; frame += 1) {
+    if (onProgress && frame % progressStride === 0) {
+      onProgress(frame / frameCount);
+    }
+
     let frameEnergy = 0;
 
     for (let channelIndex = 0; channelIndex < channels.length; channelIndex += 1) {
@@ -178,17 +188,26 @@ function percentileLinear(sortedValues: number[], percentile: number) {
   return sortedValues[lowerIndex] + (sortedValues[upperIndex] - sortedValues[lowerIndex]) * fraction;
 }
 
-function calculatePeaks(asset: DecodedAudioAsset, stepSamples: number) {
+function calculatePeaks(
+  asset: DecodedAudioAsset,
+  stepSamples: number,
+  onProgress?: AnalysisProgressCallback,
+) {
   const frameCount = asset.channels[0]?.length ?? 0;
   const history = asset.channels.map(() => new Float32Array(24));
   const historyIndex = new Array(asset.channels.length).fill(0);
   const truePeakByStep: number[] = [];
+  const progressStride = Math.max(1, Math.floor(frameCount / 20));
 
   let overallSamplePeak = 0;
   let overallTruePeak = 0;
   let stepPeak = 0;
 
   for (let frame = 0; frame < frameCount; frame += 1) {
+    if (onProgress && frame % progressStride === 0) {
+      onProgress(frame / frameCount);
+    }
+
     for (let channelIndex = 0; channelIndex < asset.channels.length; channelIndex += 1) {
       const sample = asset.channels[channelIndex][frame];
       if (!Number.isFinite(sample)) {
@@ -398,7 +417,11 @@ function maxOrNull(values: Array<number | null>) {
   return filtered.length ? Math.max(...filtered) : null;
 }
 
-export function analyzeDecodedAsset(asset: DecodedAudioAsset, target: TargetPreset | null = null): AnalysisResult {
+export function analyzeDecodedAsset(
+  asset: DecodedAudioAsset,
+  target: TargetPreset | null = null,
+  onProgress?: AnalysisProgressCallback,
+): AnalysisResult {
   if (!Number.isFinite(asset.sampleRate) || asset.sampleRate <= 0) {
     throw new Error("Decoded audio has an invalid sample rate.");
   }
@@ -411,12 +434,23 @@ export function analyzeDecodedAsset(asset: DecodedAudioAsset, target: TargetPres
   const stepSamples = Math.max(1, Math.round(asset.sampleRate * 0.1));
   const stepDurationSeconds = stepSamples / asset.sampleRate;
 
-  const { samplePeakDbfs, truePeakDbtp, truePeakByStep } = calculatePeaks(asset, stepSamples);
+  // The two frame loops dominate runtime roughly 55/35; the gating and range
+  // passes over the (much smaller) segment list make up the tail.
+  const { samplePeakDbfs, truePeakDbtp, truePeakByStep } = calculatePeaks(
+    asset,
+    stepSamples,
+    onProgress ? (fraction) => onProgress(fraction * 0.55) : undefined,
+  );
   const {
     segmentEnergies,
     totalEnergy,
     warnings: analysisWarnings,
-  } = calculateSegmentEnergies(asset, stepSamples);
+  } = calculateSegmentEnergies(
+    asset,
+    stepSamples,
+    onProgress ? (fraction) => onProgress(0.55 + fraction * 0.35) : undefined,
+  );
+  onProgress?.(0.92);
 
   const timeline = buildTimeline(stepDurationSeconds, segmentEnergies, truePeakByStep, asset.sampleRate);
   const ungatedLufs = energyToLufs(totalEnergy / Math.max(totalFrames, 1));
