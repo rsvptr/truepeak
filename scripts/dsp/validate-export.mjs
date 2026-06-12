@@ -140,6 +140,11 @@ console.log("\n[E] File names");
 check("csv extension", getExportFileName("csv").endsWith(".csv"));
 check("json extension", getExportFileName("json").endsWith(".json"));
 check("markdown extension", getExportFileName("markdown").endsWith(".md"));
+check(
+  "filenames embed a timestamp so repeated exports stay unique",
+  /^truepeak-analysis-\d{8}-\d{6}\.csv$/.test(getExportFileName("csv")),
+  getExportFileName("csv"),
+);
 
 console.log(`\n==== Export: ${passed} passed, ${failed} failed ====\n`);
 process.exit(failed ? 1 : 0);

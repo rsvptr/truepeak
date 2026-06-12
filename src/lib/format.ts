@@ -90,6 +90,13 @@ export function formatTimestamp(value: string | number | Date | null | undefined
   return timestampFormatter.format(timestamp);
 }
 
+// Compact local-time stamp for download filenames (YYYYMMDD-HHMMSS), so
+// repeated exports never overwrite or "(1)"-suffix each other.
+export function fileNameTimestamp(now = new Date()) {
+  const pad = (value: number) => String(value).padStart(2, "0");
+  return `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
+}
+
 export function peakToDb(value: number) {
   if (!Number.isFinite(value) || value <= 0) {
     return NEGATIVE_FLOOR;

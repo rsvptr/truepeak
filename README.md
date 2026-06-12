@@ -100,13 +100,13 @@ Three related things, with different jobs.
 
 ## Exports
 
-Completed results export to three formats:
+Completed results export to three formats, each stamped with the export time so repeated exports never overwrite each other:
 
-- `truepeak-analysis.csv`
-- `truepeak-analysis.json`
-- `truepeak-analysis.md`
+- `truepeak-analysis-YYYYMMDD-HHMMSS.csv`
+- `truepeak-analysis-YYYYMMDD-HHMMSS.json`
+- `truepeak-analysis-YYYYMMDD-HHMMSS.md`
 
-The CSV escapes quotes, commas, and line breaks correctly and neutralizes values that a spreadsheet might otherwise treat as a formula. The Markdown file reads like a short technical handoff rather than a raw dump.
+Session saves follow the same pattern (`truepeak-session-YYYYMMDD-HHMMSS.truepeak.json`). The CSV escapes quotes, commas, and line breaks correctly and neutralizes values that a spreadsheet might otherwise treat as a formula. The Markdown file reads like a short technical handoff rather than a raw dump.
 
 ## Privacy
 
@@ -193,13 +193,13 @@ A good first run: leave it in Simple mode, add a few WAV or AIFF files (drop the
 
 ## Testing
 
-`npm test` runs 94 fixed checks plus roughly 1,360 deterministic fuzz cases across six harnesses in `scripts/dsp/`:
+`npm test` runs 96 fixed checks plus roughly 1,360 deterministic fuzz cases across six harnesses in `scripts/dsp/`:
 
 - **DSP (15):** measures known reference signals and confirms the readings against values you can work out by hand. A 1 kHz sine at minus 6 dBFS reads about minus 6 LUFS, an inter sample peak is recovered above the sample peak, a 6 dB step gives an LRA near 6, and so on.
 - **EBU compliance (9):** runs the published test cases from EBU Tech 3341 and 3342 and confirms the meter lands inside the standard's tolerances.
-- **Session files (18):** builds a session file, reads it back, and confirms every field survives. It also confirms that malformed or untrusted files are rejected.
+- **Session files (19):** builds a session file, reads it back, and confirms every field survives. It also confirms that malformed or untrusted files are rejected.
 - **Robustness (28):** feeds garbage to the parser and analyzer (random bytes, truncated headers, zero channels, a huge channel count, NaN samples, mismatched channels, and so on) and confirms each one fails cleanly, with a sane error or finite output, and never hangs.
-- **Export (24):** confirms the CSV escaping and formula neutralization, that only finished jobs are included, and that empty input is handled.
+- **Export (25):** confirms the CSV escaping and formula neutralization, unique timestamped filenames, that only finished jobs are included, and that empty input is handled.
 - **Fuzz (~1,360 cases):** a seeded, reproducible fuzzer mutates valid WAV, AIFF, FLAC, and session files (and feeds raw noise) into every parser that touches untrusted bytes, asserting clean errors, sane outputs, and per-case time budgets. The seed is fixed, so any failure reproduces exactly.
 
 The scripts run the real TypeScript source directly through Node, with a small loader that maps the `@/` path alias. That is why they need Node 24.

@@ -1,3 +1,4 @@
+import { fileNameTimestamp } from "@/lib/format";
 import type {
   AnalysisMode,
   AnalysisJob,
@@ -18,7 +19,12 @@ const SESSION_APP = "truepeak";
 const SESSION_KIND = "session";
 const SESSION_VERSION = 1;
 
-export const SESSION_FILE_NAME = "truepeak-session.truepeak.json";
+// Timestamped so saving twice never overwrites the earlier session file; the
+// double extension keeps the format recognizable while staying importable
+// through the picker's plain `.json` filter.
+export function getSessionFileName() {
+  return `truepeak-session-${fileNameTimestamp()}.truepeak.json`;
+}
 
 // Import limits: session files are untrusted input, so cap what a single file
 // can make the app hold in memory or render.

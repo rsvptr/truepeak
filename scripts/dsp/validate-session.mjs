@@ -9,7 +9,7 @@ register("./alias-loader.mjs", import.meta.url);
 
 const { parseWavBuffer } = await import("../../src/audio/wav.ts");
 const { analyzeDecodedAsset } = await import("../../src/audio/analysis.ts");
-const { buildSessionFile, parseSessionFile } = await import("../../src/audio/session-file.ts");
+const { buildSessionFile, getSessionFileName, parseSessionFile } = await import("../../src/audio/session-file.ts");
 const { DEFAULT_TARGET_PRESET } = await import("../../src/audio/presets.ts");
 
 function encodeWavFloat32(channels, sampleRate) {
@@ -72,6 +72,11 @@ ok(
   "timeline preserved",
   rj.result?.metrics?.timeline?.timeSeconds?.length === result.metrics.timeline.timeSeconds.length &&
     rj.result?.metrics?.timeline?.truePeakDbtp?.length === result.metrics.timeline.truePeakDbtp.length,
+);
+
+ok(
+  "session filename is timestamped and keeps the .truepeak.json suffix",
+  /^truepeak-session-\d{8}-\d{6}\.truepeak\.json$/.test(getSessionFileName()),
 );
 
 console.log("\nRejection (untrusted / malformed input)");
