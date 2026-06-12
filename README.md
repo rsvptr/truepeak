@@ -36,6 +36,7 @@ TruePeak keeps the whole loudness review in one place. Instead of jumping betwee
 - [History and session files](#history-and-session-files)
 - [Exports](#exports)
 - [Privacy](#privacy)
+- [Security](#security)
 - [Architecture](#architecture)
 - [Tech stack](#tech-stack)
 - [Getting started](#getting-started)
@@ -53,6 +54,7 @@ TruePeak keeps the whole loudness review in one place. Instead of jumping betwee
 - True peak (4x oversampled) and sample peak
 - Targeted checks against a delivery preset or your own custom target, with a suggested gain move and a projected true peak after that move
 - A measure only mode that just reports the readings with no target attached
+- Drag and drop that works on every screen, including whole folders (they are scanned for supported audio), with a live batch progress bar and a rough time-remaining estimate while a run is going
 - A compare view for a whole batch: ranked cards, deltas against a reference file, a status board, and a dense table
 - A file inspector with overview, timeline, and technical tabs
 - Light and dark themes
@@ -88,7 +90,9 @@ Light and dark themes are both supported. The choice is stored in a cookie and r
 
 ## History and session files
 
-These are two separate things.
+Three related things, with different jobs.
+
+**Live session restore** is automatic. Completed results are mirrored into this browser's IndexedDB as they finish, so a hard refresh or accidental tab close no longer loses a finished batch — the results come back with a Restored badge, view-only (the source audio cannot survive a reload, so they can't be re-analyzed). Removing files or clearing the session removes the stored copies too. Nothing leaves your machine.
 
 **Local history** is off by default. Turn it on and finished readings are saved as small summary cards in this browser only. It keeps the most recent 20. It is a quick recall list, not a full session restore, and it never leaves your machine.
 
@@ -106,7 +110,11 @@ The CSV escapes quotes, commas, and line breaks correctly and neutralizes values
 
 ## Privacy
 
-Everything happens in the browser. Your files are read locally, decoded locally, and analyzed locally. No audio is uploaded, and there is no backend database or account system. The only thing the server does is read the theme cookie so the first paint uses the right colors.
+Everything happens in the browser. Your files are read locally, decoded locally, and analyzed locally. No audio is uploaded, and there is no backend database or account system. Completed readings are kept in this browser's local storage so a refresh doesn't lose them; clearing the session removes them. The only thing the server does is read the theme cookie so the first paint uses the right colors.
+
+## Security
+
+Untrusted inputs (audio files, imported session files) go through strict, capped, fuzz-tested validation; responses carry a tight Content-Security-Policy and friends; the ffmpeg.wasm runtime is integrity-pinned at build time; and CI fails on high-severity dependency advisories. The full threat model, the protections, the accepted risks, and how to report a vulnerability are documented in [SECURITY.md](./SECURITY.md).
 
 ## Architecture
 
@@ -128,7 +136,7 @@ flowchart LR
     G --> K["Optional local history"]
 ```
 
-Decoding and analysis run in Web Workers so the heavy math stays off the main thread and the interface stays responsive. Files are processed one at a time. The decoded audio for a file is released before the next one starts, so memory use is set by your largest single file, not by the size of the whole batch.
+Decoding and analysis run in Web Workers so the heavy math stays off the main thread and the interface stays responsive — file bytes are even read inside the worker, so the UI thread never holds a copy of a large file. The queue runs several files in parallel: each active file gets its own decoder and analyzer worker pair, with the number of parallel lanes derived from your CPU and memory (up to 4, lower on phones and low-memory devices, and adjustable under Advanced Options on the home screen). Very large files still run one at a time so peak memory stays bounded by a single decoded file. Each file's decoded audio is released as soon as its analysis finishes, and idle workers are torn down after the queue goes quiet.
 
 ## Tech stack
 
@@ -165,7 +173,7 @@ npm run dev
 
 Open http://localhost:3000.
 
-A good first run: leave it in Simple mode, add a few WAV or AIFF files, pick Targeted if you want delivery guidance or Measure only if you just want readings, scan the table, then open a file in the inspector. Switch to Advanced if you want compare and insights.
+A good first run: leave it in Simple mode, add a few WAV or AIFF files (drop them anywhere, folders included), pick Targeted if you want delivery guidance or Measure only if you just want readings, scan the table, then open a file in the inspector. Switch to Advanced if you want compare and insights. Two keyboard shortcuts: `/` focuses the queue search and `Ctrl/Cmd+O` opens the file picker.
 
 ## Scripts
 
@@ -185,13 +193,14 @@ A good first run: leave it in Simple mode, add a few WAV or AIFF files, pick Tar
 
 ## Testing
 
-`npm test` runs 94 checks across five harnesses in `scripts/dsp/`:
+`npm test` runs 94 fixed checks plus roughly 1,360 deterministic fuzz cases across six harnesses in `scripts/dsp/`:
 
 - **DSP (15):** measures known reference signals and confirms the readings against values you can work out by hand. A 1 kHz sine at minus 6 dBFS reads about minus 6 LUFS, an inter sample peak is recovered above the sample peak, a 6 dB step gives an LRA near 6, and so on.
 - **EBU compliance (9):** runs the published test cases from EBU Tech 3341 and 3342 and confirms the meter lands inside the standard's tolerances.
 - **Session files (18):** builds a session file, reads it back, and confirms every field survives. It also confirms that malformed or untrusted files are rejected.
 - **Robustness (28):** feeds garbage to the parser and analyzer (random bytes, truncated headers, zero channels, a huge channel count, NaN samples, mismatched channels, and so on) and confirms each one fails cleanly, with a sane error or finite output, and never hangs.
 - **Export (24):** confirms the CSV escaping and formula neutralization, that only finished jobs are included, and that empty input is handled.
+- **Fuzz (~1,360 cases):** a seeded, reproducible fuzzer mutates valid WAV, AIFF, FLAC, and session files (and feeds raw noise) into every parser that touches untrusted bytes, asserting clean errors, sane outputs, and per-case time budgets. The seed is fixed, so any failure reproduces exactly.
 
 The scripts run the real TypeScript source directly through Node, with a small loader that maps the `@/` path alias. That is why they need Node 24.
 
@@ -244,15 +253,15 @@ truepeak/
 
 The app handles a few hundred files and high resolution material, with a couple of things worth knowing.
 
-- Files run one at a time, and each file's decoded audio is freed before the next starts. So memory is set by your largest single file, not the total. Finished results keep only compact numbers and a small timeline, so a few hundred of them add up to only tens of megabytes.
-- A large high resolution file (for example a 300 MB, 24 bit, 192 kHz track) uses roughly 700 MB to 1 GB of memory for the moment it is being processed, then releases it. That is comfortable on a desktop with 8 GB of RAM or more. On a low memory device or phone it can run the tab out of memory, which loses the batch, so use a desktop for heavy work.
+- Several files run in parallel (up to 4 lanes, derived from your CPU and memory, adjustable in Advanced Options), and each file's decoded audio is freed as soon as it finishes. Memory peaks at a few normal files in flight at once, and finished results keep only compact numbers and a small timeline, so a few hundred of them add up to only tens of megabytes.
+- Very large files are automatically run one at a time (256 MB and over on a desktop, 96 MB and over on phones and low-memory devices), with the rest of the queue held until they finish. A large high resolution file (for example a 300 MB, 24 bit, 192 kHz track) uses roughly 700 MB to 1 GB of memory for the moment it is being processed, then releases it. That is comfortable on a desktop with 8 GB of RAM or more. On a low memory device or phone it can run the tab out of memory, which loses the batch, so use a desktop for heavy work.
 - WAV and AIFF take the fast direct parser. Large compressed files (a big FLAC or M4A) go through ffmpeg.wasm, which has its own memory ceiling, so for very large high resolution files, WAV or AIFF is the safer choice.
-- A full library is a long sequential job. Plan for roughly five to ten seconds per heavy high resolution file and less for normal songs. Keep the tab open and stop the machine from sleeping. If you would rather not risk a long unbroken run, add the files in a few smaller batches and export each one.
+- A full library still takes a while, but parallel lanes cut the wall-clock time substantially on a desktop. Plan for roughly five to ten seconds per heavy high resolution file (overlapping across lanes) and less for normal songs. While a batch is running the app asks the browser to keep the screen awake (where supported) and warns before the tab closes. If you would rather not risk a long unbroken run, add the files in a few smaller batches and export each one.
 
 ## Limitations
 
-- The live queue is held in memory and is not restored after a hard refresh. Use a session file if you want to keep results.
-- Session files store readings and charts, not the source audio, so a reopened session cannot be analyzed again.
+- Completed results are restored automatically after a refresh (marked with a Restored badge), but queued and in-flight files are not: the browser cannot keep file handles across a reload, so unfinished work has to be added again.
+- Restored results and session files store readings and charts, not the source audio, so they cannot be analyzed again.
 - Local history keeps summary cards only, not full sessions.
 - Compressed format behaviour can vary slightly by browser and codec support.
 - Shipping ffmpeg.wasm locally adds some weight, in exchange for not depending on a third party runtime fetch.
