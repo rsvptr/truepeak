@@ -57,7 +57,10 @@ export function TimelineChart({ timeline, density = "default" }: TimelineChartPr
     const truePeak = timeline.truePeakDbtp.map((value) => Number(value.toFixed(2)));
     const loudnessHeight = density === "compact" ? 190 : 250;
     const peakHeight = density === "compact" ? 170 : 220;
-    const minChartWidth = density === "compact" ? 260 : 320;
+    // Keep the floor low enough for narrow phones (the deepest nesting leaves
+    // ~240px of content width at 360px viewports); the container scrolls
+    // horizontally if a chart still can't fit.
+    const minChartWidth = density === "compact" ? 220 : 240;
 
     loudnessPlotRef.current = new uPlot(
       {
@@ -179,13 +182,13 @@ export function TimelineChart({ timeline, density = "default" }: TimelineChartPr
         ref={loudnessContainerRef}
         role="img"
         aria-label="Momentary and short-term loudness chart in LUFS"
-        className={`${compact ? "min-h-[190px] rounded-[18px] p-2" : "min-h-[250px] rounded-[24px] p-3"} w-full overflow-hidden border border-[var(--line)] bg-[var(--surface-1)]`}
+        className={`${compact ? "min-h-[190px] rounded-[18px] p-2" : "min-h-[250px] rounded-[24px] p-3"} w-full overflow-x-auto overflow-y-hidden border border-[var(--line)] bg-[var(--surface-1)]`}
       />
       <div
         ref={peakContainerRef}
         role="img"
         aria-label="True peak chart in dBTP"
-        className={`${compact ? "min-h-[170px] rounded-[18px] p-2" : "min-h-[220px] rounded-[24px] p-3"} w-full overflow-hidden border border-[var(--line)] bg-[var(--surface-1)]`}
+        className={`${compact ? "min-h-[170px] rounded-[18px] p-2" : "min-h-[220px] rounded-[24px] p-3"} w-full overflow-x-auto overflow-y-hidden border border-[var(--line)] bg-[var(--surface-1)]`}
       />
     </div>
   );

@@ -1,15 +1,18 @@
 export type WorkspaceUiMode = "simple" | "advanced";
 export type WorkspaceTheme = "light" | "dark";
+export type ParallelLanesPreference = "auto" | "1" | "2" | "4";
 
 const TRUEPEAK_HISTORY_PREFERENCE_KEY = "truepeak-history-enabled";
 const LEGACY_HISTORY_PREFERENCE_KEYS = ["lufs-history-enabled"];
 const TRUEPEAK_UI_MODE_PREFERENCE_KEY = "truepeak-ui-mode";
 const LEGACY_UI_MODE_PREFERENCE_KEYS = ["lufs-ui-mode"];
 const TRUEPEAK_THEME_PREFERENCE_KEY = "truepeak-theme";
+const TRUEPEAK_PARALLEL_PREFERENCE_KEY = "truepeak-parallel-lanes";
 
 const historyPreferenceListeners = new Set<() => void>();
 const uiModePreferenceListeners = new Set<() => void>();
 const themePreferenceListeners = new Set<() => void>();
+const parallelPreferenceListeners = new Set<() => void>();
 
 function readStorageValue(primaryKey: string, legacyKeys: string[]) {
   if (typeof window === "undefined") {
@@ -134,6 +137,29 @@ export function writeUiModePreference(value: WorkspaceUiMode) {
   uiModePreferenceListeners.forEach((listener) => listener());
 }
 
+export function readParallelPreference(): ParallelLanesPreference {
+  const value = readStorageValue(TRUEPEAK_PARALLEL_PREFERENCE_KEY, []);
+  return value === "1" || value === "2" || value === "4" ? value : "auto";
+}
+
+export function subscribeParallelPreference(listener: () => void) {
+  return subscribePreference(
+    parallelPreferenceListeners,
+    [TRUEPEAK_PARALLEL_PREFERENCE_KEY],
+    listener,
+  );
+}
+
+export function writeParallelPreference(value: ParallelLanesPreference) {
+  if (typeof window !== "undefined") {
+    try {
+      window.localStorage.setItem(TRUEPEAK_PARALLEL_PREFERENCE_KEY, value);
+    } catch {}
+  }
+
+  parallelPreferenceListeners.forEach((listener) => listener());
+}
+
 function systemTheme(): WorkspaceTheme {
   if (typeof window === "undefined" || typeof window.matchMedia !== "function") {
     return "dark";
@@ -188,7 +214,8 @@ export function subscribeThemePreference(listener: () => void) {
 
 export function writeThemePreference(value: WorkspaceTheme) {
   if (typeof document !== "undefined") {
-    document.cookie = `${TRUEPEAK_THEME_PREFERENCE_KEY}=${value}; path=/; max-age=${THEME_COOKIE_MAX_AGE}; samesite=lax`;
+    const secure = window.location.protocol === "https:" ? "; secure" : "";
+    document.cookie = `${TRUEPEAK_THEME_PREFERENCE_KEY}=${value}; path=/; max-age=${THEME_COOKIE_MAX_AGE}; samesite=lax${secure}`;
   }
 
   themePreferenceListeners.forEach((listener) => listener());

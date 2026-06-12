@@ -38,15 +38,23 @@ function completedJobs(jobs: AnalysisJob[]) {
   return jobs.filter((job) => job.result);
 }
 
+// Timestamped so repeated exports land as separate files instead of silently
+// overwriting (or "(1)"-suffixing) the previous download.
+function exportTimestamp(now = new Date()) {
+  const pad = (value: number) => String(value).padStart(2, "0");
+  return `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
+}
+
 export function getExportFileName(format: ExportFormat) {
+  const base = `${EXPORT_BASENAME}-${exportTimestamp()}`;
   switch (format) {
     case "csv":
-      return `${EXPORT_BASENAME}.csv`;
+      return `${base}.csv`;
     case "json":
-      return `${EXPORT_BASENAME}.json`;
+      return `${base}.json`;
     case "markdown":
     default:
-      return `${EXPORT_BASENAME}.md`;
+      return `${base}.md`;
   }
 }
 

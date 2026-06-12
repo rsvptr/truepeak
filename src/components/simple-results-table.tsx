@@ -68,6 +68,7 @@ export const SimpleResultsTable = memo(function SimpleResultsTable({
                 <div className="mt-3 flex flex-wrap gap-2">
                   <Badge className={statusToneClass(job.status)}>{job.status}</Badge>
                   {job.imported ? <Badge className="border-[var(--line)] bg-[var(--surface-0)] text-[var(--muted)]">Imported</Badge> : null}
+                  {job.restored ? <Badge className="border-[var(--line)] bg-[var(--surface-0)] text-[var(--muted)]">Restored</Badge> : null}
                   {compliance ? <Badge className={complianceToneClass(compliance.state)}>{compliance.label}</Badge> : null}
                   {job.result?.target ? <Badge>{job.result.target.label}</Badge> : null}
                   {analysisMode === "measure-only" && job.result ? <Badge>Measure Only</Badge> : null}
@@ -194,6 +195,7 @@ export const SimpleResultsTable = memo(function SimpleResultsTable({
                           <div className="mt-2 flex flex-wrap gap-2">
                             <Badge className={statusToneClass(job.status)}>{job.status}</Badge>
                             {job.imported ? <Badge className="border-[var(--line)] bg-[var(--surface-0)] text-[var(--muted)]">Imported</Badge> : null}
+                  {job.restored ? <Badge className="border-[var(--line)] bg-[var(--surface-0)] text-[var(--muted)]">Restored</Badge> : null}
                             {compliance ? <Badge className={complianceToneClass(compliance.state)}>{compliance.label}</Badge> : null}
                             {job.result?.target ? <Badge>{job.result.target.label}</Badge> : null}
                             {analysisMode === "measure-only" && job.result ? <Badge>Measure Only</Badge> : null}
