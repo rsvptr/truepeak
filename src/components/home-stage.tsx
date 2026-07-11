@@ -192,7 +192,7 @@ export function HomeStage({
                   Drop files or folders anywhere
                 </h3>
                 <p className="mt-3 max-w-[60ch] text-sm leading-7 text-[var(--muted)] sm:text-base">
-                  Drag a batch — or a whole album folder — onto any part of the app. Folders are scanned for supported audio, and the session opens as soon as the files are accepted.
+                  Drag a batch, or a whole album folder, onto any part of the app. Folders are scanned for supported audio, and the session opens as soon as the files are accepted.
                 </p>
                 <div className="mt-5 inline-flex items-center gap-2 rounded-full border border-[var(--line)]/70 bg-[var(--surface-0)]/54 px-3 py-1.5 text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">
                   <span className="h-1.5 w-1.5 rounded-full bg-[var(--accent)]" />

@@ -799,7 +799,7 @@ export function TruePeakWorkbench() {
       policy: customPolicy,
       description:
         customPolicy === "protect-true-peak"
-          ? "Manual target with true-peak protection for safer normalization planning."
+          ? "Manual target with true peak protection for safer normalization planning."
           : "Manual target that prioritizes hitting loudness even if headroom is exceeded.",
     };
   }, [customPolicy, customTargetLufs, customTruePeak, selectedPresetId, targetTolerance]);
@@ -863,16 +863,27 @@ export function TruePeakWorkbench() {
 
   // Screen readers get no signal when a result lands (the row only changes
   // visually), so status transitions are collected and read out as a
-  // debounced batch summary through an always-mounted polite region.
+  // debounced batch summary through an always-mounted polite region. The
+  // announced numbers are session totals: an unchanged text node would not
+  // re-announce, and totals only grow, so every flush produces new text.
   const [completionAnnouncement, setCompletionAnnouncement] = useState("");
   const announcedStatusesRef = useRef(new Map<string, AnalysisJob["status"]>());
-  const pendingAnnouncementRef = useRef({ completed: 0, failed: 0 });
+  const announcedTotalsRef = useRef({ completed: 0, failed: 0 });
   const announcementTimeoutRef = useRef<number | null>(null);
 
   useEffect(() => {
+    if (!jobs.length) {
+      // Fresh session: start the running totals (and the region) over.
+      announcedStatusesRef.current = new Map();
+      announcedTotalsRef.current = { completed: 0, failed: 0 };
+      setCompletionAnnouncement("");
+      return;
+    }
+
     const previous = announcedStatusesRef.current;
     const next = new Map<string, AnalysisJob["status"]>();
-    const pending = pendingAnnouncementRef.current;
+    const totals = announcedTotalsRef.current;
+    let changed = false;
     jobs.forEach((job) => {
       next.set(job.id, job.status);
       const before = previous.get(job.id);
@@ -883,27 +894,28 @@ export function TruePeakWorkbench() {
       }
 
       if (job.status === "complete") {
-        pending.completed += 1;
+        totals.completed += 1;
+        changed = true;
       } else if (job.status === "failed") {
-        pending.failed += 1;
+        totals.failed += 1;
+        changed = true;
       }
     });
     announcedStatusesRef.current = next;
 
-    if ((!pending.completed && !pending.failed) || announcementTimeoutRef.current != null) {
+    if (!changed || announcementTimeoutRef.current != null) {
       return;
     }
 
     announcementTimeoutRef.current = window.setTimeout(() => {
       announcementTimeoutRef.current = null;
-      const { completed, failed } = pendingAnnouncementRef.current;
-      pendingAnnouncementRef.current = { completed: 0, failed: 0 };
+      const { completed, failed } = announcedTotalsRef.current;
       const parts = [
         completed ? `${completed} ${completed === 1 ? "analysis" : "analyses"} finished` : null,
         failed ? `${failed} ${failed === 1 ? "file" : "files"} failed` : null,
       ].filter(Boolean);
       if (parts.length) {
-        setCompletionAnnouncement(`${parts.join(" and ")}.`);
+        setCompletionAnnouncement(`${parts.join(" and ")} in this session.`);
       }
     }, 800);
   }, [jobs]);
@@ -1025,7 +1037,7 @@ export function TruePeakWorkbench() {
       }
     : {
         title: "No files queued yet",
-        body: "Add audio files to start a local loudness and true-peak review.",
+        body: "Add audio files to start a local loudness and true peak review.",
         actionLabel: "Add Files",
       };
   const simpleInlineInspector = activeWorkspaceTab === "queue" && uiMode === "simple" && isLargeScreen;
@@ -1545,7 +1557,7 @@ export function TruePeakWorkbench() {
                 <Waves className="h-3.5 w-3.5" />
                 In-browser loudness analysis
               </div>
-              <h1 className="mt-4"><TruePeakLogo size="lg" subtitle="Loudness and true-peak review" titleClassName="leading-none" /></h1>
+              <h1 className="mt-4"><TruePeakLogo size="lg" subtitle="Loudness and true peak review" titleClassName="leading-none" /></h1>
               <p className="mt-3 max-w-[60rem] text-sm leading-6 text-[var(--muted)] sm:text-base">
                 Load a batch, measure LUFS and true peak, and review delivery targets without sending files anywhere. Use it as a review aid, not a certified compliance meter.
               </p>

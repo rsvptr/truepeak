@@ -197,7 +197,7 @@ export function PresetLibraryDrawer({
                   </div>
                 </div>
                 <p className="mt-3 text-sm leading-6 text-[var(--muted)]">
-                  Use this when you already know the loudness target and true-peak ceiling you need.
+                  Use this when you already know the loudness target and true peak ceiling you need.
                 </p>
               </button>
             </section>

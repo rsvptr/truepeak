@@ -20,7 +20,7 @@ const enableVercelInsights =
   process.env.VERCEL === "1" || process.env.NEXT_PUBLIC_ENABLE_ANALYTICS === "true";
 
 const APP_DESCRIPTION =
-  "Browser-based loudness and true-peak analysis for mastering, delivery checks, and quick file review.";
+  "Loudness and true peak analysis in your browser, for mastering, delivery checks, and quick file review.";
 
 export const metadata: Metadata = {
   metadataBase: new URL("https://true-peak.vercel.app"),

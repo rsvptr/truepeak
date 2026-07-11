@@ -1,11 +1,18 @@
 import type { AnalysisResult, LoudnessMetrics, TargetPreset } from "@/types/audio";
 
 export const TARGET_LIMIT_WARNING =
-  "Target loudness would exceed the selected true-peak ceiling, so the suggested gain is capped.";
+  "Target loudness would exceed the selected true peak ceiling, so the suggested gain is capped.";
+
+// Persisted sessions and IndexedDB records written before the copy update
+// carry the old wording; both spellings must strip when a target is cleared.
+const TARGET_LIMIT_WARNINGS = new Set([
+  TARGET_LIMIT_WARNING,
+  "Target loudness would exceed the selected true-peak ceiling, so the suggested gain is capped.",
+]);
 
 export function clearTargetFromMetrics(metrics: LoudnessMetrics): LoudnessMetrics {
   const warnings = metrics.warnings.filter(
-    (warning) => warning !== TARGET_LIMIT_WARNING,
+    (warning) => !TARGET_LIMIT_WARNINGS.has(warning),
   );
 
   return {

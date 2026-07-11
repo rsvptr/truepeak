@@ -92,11 +92,11 @@ Light and dark themes are both supported. The choice is stored in a cookie and r
 
 Three related things, with different jobs.
 
-**Live session restore** is automatic. Completed results are mirrored into this browser's IndexedDB as they finish, so a hard refresh or an accidental tab close no longer loses a finished batch. The results come back with a Restored badge in a view only state, because the source audio cannot survive a reload, and they cannot be analyzed again. Removing files or clearing the session removes the stored copies too. Nothing leaves your machine.
+**Live session restore** is automatic. Completed results are mirrored into this browser's IndexedDB as they finish, so a hard refresh or an accidental tab close no longer loses a finished batch. The results come back with a Restored badge in a view only state, because the source audio cannot survive a reload, and they cannot be analyzed again. They do pick up whatever target and analysis mode are active when they return, so a preset you switched to before the refresh is still applied after it. Removing files or clearing the session removes the stored copies too. Nothing leaves your machine.
 
 **Local history** is off by default. Turn it on and finished readings are saved as small summary cards in this browser only. It keeps the most recent 20. It is a quick recall list, not a full session restore, and it never leaves your machine.
 
-**Session files** let you save the current results to a `.truepeak.json` file and reopen them later, on this machine or another one. A reopened session shows the readings and the timeline charts in a view only state. The original audio is not stored in the file, so reopened files cannot be analyzed again, retried, or pointed at a new target. Imported entries are marked with a badge. Import is strict: a malformed or untrusted file is rejected with a clear message.
+**Session files** let you save the current results to a `.truepeak.json` file and reopen them later, on this machine or another one. A reopened session shows the readings and the timeline charts in a view only state. The original audio is not stored in the file, so reopened files cannot be analyzed again or retried. The stored readings still follow the target that is active in your session, the same way live results do. Imported entries are marked with a badge. Import is strict: a malformed or untrusted file is rejected with a clear message.
 
 ## Exports
 
@@ -224,9 +224,12 @@ Notes:
 ```text
 truepeak/
 ├── app/
+│   ├── error.tsx             (styled recovery screen for crashes)
 │   ├── globals.css
 │   ├── layout.tsx
 │   ├── manifest.ts
+│   ├── not-found.tsx
+│   ├── opengraph-image.png   (social preview card)
 │   └── page.tsx
 ├── public/
 │   ├── favicon.png

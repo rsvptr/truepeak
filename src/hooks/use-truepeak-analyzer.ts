@@ -606,12 +606,14 @@ export function useTruePeakAnalyzer(
         // browser-decoding). Its runJob has nothing to reject, so end the run
         // here: invalidate the token so the in-flight code bails at its next
         // checkpoint instead of calling into a lane that may belong to another
-        // job by then, and settle the row's visible state directly.
+        // job by then, and settle the row's visible state directly. A job
+        // sitting in "queued" is left alone: it was re-queued by a retry and
+        // belongs to a future run, not to this lane's dying one.
         if (!hadPending) {
           invalidateJobRun(jobId);
           const canceled = isCancellationReason(reason);
           updateJob(jobId, (job) =>
-            isActiveJob(job)
+            isActiveJob(job) && job.status !== "queued"
               ? {
                   ...job,
                   status: canceled ? "canceled" : "failed",
@@ -1003,10 +1005,15 @@ export function useTruePeakAnalyzer(
             { type: "decode", jobId, fileName: file.name, mimeType, file } satisfies DecoderRequest,
           );
         } catch (error) {
-          decoderPendingRef.current.delete(jobId);
           const message = error instanceof Error ? error.message : "Unable to send audio to the decoder worker.";
-          reject(new Error(message));
+          // Reset while the pending resolver is still registered: resetLane
+          // then settles the run through the normal rejection path, so the
+          // caller's fallback decoder still gets its turn. Deleting first
+          // would make resetLane treat this as a between-calls failure and
+          // end the whole run. The local reject below is then a no-op.
           resetLaneRef.current(lane, `Decoder worker post failed: ${message}`);
+          decoderPendingRef.current.delete(jobId);
+          reject(new Error(message));
         }
       }),
     [],
@@ -1024,10 +1031,12 @@ export function useTruePeakAnalyzer(
             target: currentTarget,
           } satisfies AnalyzerRequest, asset.channelBuffers);
         } catch (error) {
-          analyzerPendingRef.current.delete(jobId);
           const message = error instanceof Error ? error.message : "Unable to send audio to the analyzer worker.";
-          reject(new Error(message));
+          // Same ordering as decodeInWorker: reset before touching the
+          // pending so the rejection reaches runJob with a live run token.
           resetLaneRef.current(lane, `Analyzer worker post failed: ${message}`);
+          analyzerPendingRef.current.delete(jobId);
+          reject(new Error(message));
         }
       }),
     [],

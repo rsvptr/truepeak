@@ -5,7 +5,7 @@ export default function manifest(): MetadataRoute.Manifest {
   return {
     name: "TruePeak",
     short_name: "TruePeak",
-    description: "Browser-based loudness and true-peak analysis for mastering, delivery checks, and quick file review.",
+    description: "Loudness and true peak analysis in your browser, for mastering, delivery checks, and quick file review.",
     start_url: "/",
     display: "standalone",
     background_color: "#071412",

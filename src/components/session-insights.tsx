@@ -161,7 +161,7 @@ export function SessionInsightsPanel({
       if (ceilingLimitedJobs.length) {
         items.push({
           title: "Ceiling-limited files need a second look",
-          body: `${ceilingLimitedJobs.length} file${ceilingLimitedJobs.length === 1 ? " is" : "s are"} being gain-capped by the selected true-peak ceiling. Consider a gentler target or inspect crest-factor-heavy material before batch normalization.`,
+          body: `${ceilingLimitedJobs.length} file${ceilingLimitedJobs.length === 1 ? " is" : "s are"} having gain capped by the selected true peak ceiling. Consider a gentler target, or look at material with a high crest factor before batch normalization.`,
           tone: "warn",
         });
       }
