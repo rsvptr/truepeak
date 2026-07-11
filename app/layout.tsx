@@ -19,10 +19,13 @@ const mono = IBM_Plex_Mono({
 const enableVercelInsights =
   process.env.VERCEL === "1" || process.env.NEXT_PUBLIC_ENABLE_ANALYTICS === "true";
 
+const APP_DESCRIPTION =
+  "Browser-based loudness and true-peak analysis for mastering, delivery checks, and quick file review.";
+
 export const metadata: Metadata = {
+  metadataBase: new URL("https://true-peak.vercel.app"),
   title: "TruePeak",
-  description:
-    "Browser-based loudness and true-peak analysis for mastering, delivery checks, and quick file review.",
+  description: APP_DESCRIPTION,
   applicationName: "TruePeak",
   category: "music",
   keywords: ["TruePeak", "LUFS", "loudness", "true peak", "R128", "audio analysis", "mastering"],
@@ -32,6 +35,18 @@ export const metadata: Metadata = {
     apple: [{ url: "/favicon.png", type: "image/png", sizes: "192x192" }],
     shortcut: ["/favicon.png"],
   },
+  openGraph: {
+    title: "TruePeak",
+    description: APP_DESCRIPTION,
+    url: "/",
+    siteName: "TruePeak",
+    type: "website",
+  },
+  twitter: {
+    card: "summary_large_image",
+    title: "TruePeak",
+    description: APP_DESCRIPTION,
+  },
 };
 
 export async function generateViewport(): Promise<Viewport> {
@@ -39,11 +54,26 @@ export async function generateViewport(): Promise<Viewport> {
   // extend the layout into notch/home-indicator areas so the safe-area
   // padding in globals.css can take over.
   const themeCookie = (await cookies()).get("truepeak-theme")?.value;
+  if (themeCookie === "light" || themeCookie === "dark") {
+    return {
+      width: "device-width",
+      initialScale: 1,
+      viewportFit: "cover",
+      themeColor: themeCookie === "light" ? "#f6faf8" : "#071412",
+    };
+  }
+
+  // No stored choice yet: emit both media-qualified colors so first-time
+  // visitors get browser chrome that matches the OS preference the pre-paint
+  // script will apply. The client keeps this meta in sync after any toggle.
   return {
     width: "device-width",
     initialScale: 1,
     viewportFit: "cover",
-    themeColor: themeCookie === "light" ? "#f6faf8" : "#071412",
+    themeColor: [
+      { media: "(prefers-color-scheme: light)", color: "#f6faf8" },
+      { media: "(prefers-color-scheme: dark)", color: "#071412" },
+    ],
   };
 }
 
