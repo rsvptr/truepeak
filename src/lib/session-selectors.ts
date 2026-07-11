@@ -5,12 +5,23 @@ export interface CompletedAnalysisJob extends AnalysisJob {
   result: NonNullable<AnalysisJob["result"]>;
 }
 
+// These run inside memos and render bodies on every progress tick, so they are
+// written as single passes over the queue instead of chained filter/map/sort
+// copies. Sets keep the status checks allocation-free.
+const ACTIVE_STATUSES = new Set<AnalysisJob["status"]>([
+  "queued",
+  "reading",
+  "decoding",
+  "analyzing",
+]);
+const ISSUE_STATUSES = new Set<AnalysisJob["status"]>(["failed", "canceled"]);
+
 export function isActiveJob(job: AnalysisJob) {
-  return ["queued", "reading", "decoding", "analyzing"].includes(job.status);
+  return ACTIVE_STATUSES.has(job.status);
 }
 
 export function isIssueJob(job: AnalysisJob) {
-  return ["failed", "canceled"].includes(job.status);
+  return ISSUE_STATUSES.has(job.status);
 }
 
 export function getCompletedAnalysisJobs(jobs: AnalysisJob[]) {
@@ -18,36 +29,46 @@ export function getCompletedAnalysisJobs(jobs: AnalysisJob[]) {
 }
 
 export function countQueueJobs(jobs: AnalysisJob[]) {
-  return {
-    all: jobs.length,
-    active: jobs.filter(isActiveJob).length,
-    complete: jobs.filter((job) => job.status === "complete").length,
-    issues: jobs.filter(isIssueJob).length,
-  };
+  let active = 0;
+  let complete = 0;
+  let issues = 0;
+  for (const job of jobs) {
+    if (isActiveJob(job)) {
+      active += 1;
+    } else if (job.status === "complete") {
+      complete += 1;
+    } else if (isIssueJob(job)) {
+      issues += 1;
+    }
+  }
+
+  return { all: jobs.length, active, complete, issues };
 }
 
 export function averageIntegratedLufs(jobs: AnalysisJob[]) {
-  const values = jobs
-    .map((job) => job.result?.metrics.integratedLufs)
-    .filter((value): value is number => value != null);
-
-  if (!values.length) {
-    return null;
+  let sum = 0;
+  let count = 0;
+  for (const job of jobs) {
+    const value = job.result?.metrics.integratedLufs;
+    if (value != null) {
+      sum += value;
+      count += 1;
+    }
   }
 
-  return values.reduce((sum, value) => sum + value, 0) / values.length;
+  return count ? sum / count : null;
 }
 
 export function highestTruePeakDbtp(jobs: AnalysisJob[]) {
-  const values = jobs
-    .map((job) => job.result?.metrics.truePeakDbtp)
-    .filter((value): value is number => value != null);
-
-  if (!values.length) {
-    return null;
+  let max: number | null = null;
+  for (const job of jobs) {
+    const value = job.result?.metrics.truePeakDbtp;
+    if (value != null && (max == null || value > max)) {
+      max = value;
+    }
   }
 
-  return Math.max(...values);
+  return max;
 }
 
 export function getAttentionJobs(jobs: CompletedAnalysisJob[]) {
@@ -79,35 +100,51 @@ function sortByMetric<T>(items: T[], getValue: (item: T) => number, direction: "
   });
 }
 
+// Finding one extreme does not need a full sort. Strict comparison keeps the
+// first job among ties, which is what a stable sort's [0] returned before.
+function pickExtreme<T>(items: T[], getValue: (item: T) => number, direction: "asc" | "desc" = "desc") {
+  let best: T | null = null;
+  let bestValue = 0;
+  for (const item of items) {
+    const value = getValue(item);
+    if (best == null || (direction === "asc" ? value < bestValue : value > bestValue)) {
+      best = item;
+      bestValue = value;
+    }
+  }
+
+  return best;
+}
+
 export function getQuietestJob(jobs: CompletedAnalysisJob[]) {
-  return sortByMetric(jobs, (job) => job.result.metrics.integratedLufs, "asc")[0] ?? null;
+  return pickExtreme(jobs, (job) => job.result.metrics.integratedLufs, "asc");
 }
 
 export function getLoudestJob(jobs: CompletedAnalysisJob[]) {
-  return sortByMetric(jobs, (job) => job.result.metrics.integratedLufs)[0] ?? null;
+  return pickExtreme(jobs, (job) => job.result.metrics.integratedLufs);
 }
 
 export function getHottestPeakJob(jobs: CompletedAnalysisJob[]) {
-  return sortByMetric(jobs, (job) => job.result.metrics.truePeakDbtp)[0] ?? null;
+  return pickExtreme(jobs, (job) => job.result.metrics.truePeakDbtp);
 }
 
 export function getWidestRangeJob(jobs: CompletedAnalysisJob[]) {
-  return sortByMetric(jobs, (job) => job.result.metrics.loudnessRange)[0] ?? null;
+  return pickExtreme(jobs, (job) => job.result.metrics.loudnessRange);
 }
 
 export function getLongestJob(jobs: CompletedAnalysisJob[]) {
-  return sortByMetric(jobs, (job) => job.result.metadata.durationSeconds)[0] ?? null;
+  return pickExtreme(jobs, (job) => job.result.metadata.durationSeconds);
 }
 
 export function getHighestProjectedPeakJob(jobs: CompletedAnalysisJob[]) {
-  return sortByMetric(
+  return pickExtreme(
     jobs,
     (job) => job.result.metrics.projectedTruePeakDbtp ?? Number.NEGATIVE_INFINITY,
-  )[0] ?? null;
+  );
 }
 
 export function getLargestMoveJob(jobs: CompletedAnalysisJob[]) {
-  return sortByMetric(jobs, (job) => Math.abs(job.result.metrics.targetDeltaDb ?? 0))[0] ?? null;
+  return pickExtreme(jobs, (job) => Math.abs(job.result.metrics.targetDeltaDb ?? 0));
 }
 
 export function getClosestToTargetJob(jobs: CompletedAnalysisJob[], targetLufs: number | null) {
@@ -115,11 +152,7 @@ export function getClosestToTargetJob(jobs: CompletedAnalysisJob[], targetLufs: 
     return null;
   }
 
-  return [...jobs].sort(
-    (left, right) =>
-      Math.abs(left.result.metrics.integratedLufs - targetLufs) -
-      Math.abs(right.result.metrics.integratedLufs - targetLufs),
-  )[0] ?? null;
+  return pickExtreme(jobs, (job) => Math.abs(job.result.metrics.integratedLufs - targetLufs), "asc");
 }
 
 export function getSessionSampleRates(jobs: CompletedAnalysisJob[]) {
@@ -131,13 +164,23 @@ export function getSessionChannelLayouts(jobs: CompletedAnalysisJob[]) {
 }
 
 export function getTargetedFocusJobs(jobs: CompletedAnalysisJob[]) {
-  const ceilingLimitedJobs = jobs.filter(
-    (job) => getComplianceSummary(job.result)?.state === "ceiling-limited",
-  );
-  const attentionJobs = getAttentionJobs(jobs);
-  const belowTargetJobs = jobs.filter(
-    (job) => getComplianceSummary(job.result)?.state === "below-target",
-  );
+  // One compliance computation per job; the dedupe pass preserves the original
+  // priority order (ceiling-limited, then remaining attention, then below).
+  const ceilingLimitedJobs: CompletedAnalysisJob[] = [];
+  const attentionJobs: CompletedAnalysisJob[] = [];
+  const belowTargetJobs: CompletedAnalysisJob[] = [];
+  for (const job of jobs) {
+    const state = getComplianceSummary(job.result)?.state;
+    if (state === "ceiling-limited") {
+      ceilingLimitedJobs.push(job);
+      attentionJobs.push(job);
+    } else if (state === "above-target") {
+      attentionJobs.push(job);
+    } else if (state === "below-target") {
+      belowTargetJobs.push(job);
+    }
+  }
+
   const seen = new Set<string>();
 
   return [...ceilingLimitedJobs, ...attentionJobs, ...belowTargetJobs].filter((job) => {

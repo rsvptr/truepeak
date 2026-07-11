@@ -14,34 +14,51 @@ const uiModePreferenceListeners = new Set<() => void>();
 const themePreferenceListeners = new Set<() => void>();
 const parallelPreferenceListeners = new Set<() => void>();
 
+// The read functions below back useSyncExternalStore snapshots, so React calls
+// them on every render of the workbench - the hottest path in the app during a
+// batch. Cache each resolved value in module state and drop the cache whenever
+// the value can change (our own writes, cross-tab storage events, and the OS
+// theme media query), so a render costs a variable read instead of synchronous
+// localStorage/cookie work.
+const storageValueCache = new Map<string, string | null>();
+
+function invalidateStorageValue(primaryKey: string) {
+  storageValueCache.delete(primaryKey);
+}
+
 function readStorageValue(primaryKey: string, legacyKeys: string[]) {
   if (typeof window === "undefined") {
     return null;
   }
 
-  try {
-    const currentValue = window.localStorage.getItem(primaryKey);
-    if (currentValue != null) {
-      return currentValue;
-    }
+  if (storageValueCache.has(primaryKey)) {
+    return storageValueCache.get(primaryKey) ?? null;
+  }
 
-    for (const legacyKey of legacyKeys) {
-      const legacyValue = window.localStorage.getItem(legacyKey);
-      if (legacyValue != null) {
-        try {
-          window.localStorage.setItem(primaryKey, legacyValue);
-          window.localStorage.removeItem(legacyKey);
-        } catch {
-          // Storage may be writable-blocked even when old values remain readable.
+  let resolved: string | null = null;
+  try {
+    resolved = window.localStorage.getItem(primaryKey);
+    if (resolved == null) {
+      for (const legacyKey of legacyKeys) {
+        const legacyValue = window.localStorage.getItem(legacyKey);
+        if (legacyValue != null) {
+          try {
+            window.localStorage.setItem(primaryKey, legacyValue);
+            window.localStorage.removeItem(legacyKey);
+          } catch {
+            // Storage may be writable-blocked even when old values remain readable.
+          }
+          resolved = legacyValue;
+          break;
         }
-        return legacyValue;
       }
     }
   } catch {
-    return null;
+    resolved = null;
   }
 
-  return null;
+  storageValueCache.set(primaryKey, resolved);
+  return resolved;
 }
 
 function clearLegacyKeys(legacyKeys: string[]) {
@@ -69,6 +86,7 @@ function subscribePreference(
 
   const handleStorage = (event: StorageEvent) => {
     if (!event.key || keys.includes(event.key)) {
+      invalidateStorageValue(keys[0]);
       listener();
     }
   };
@@ -106,6 +124,7 @@ export function writeHistoryPreference(value: boolean) {
     } catch {}
   }
 
+  invalidateStorageValue(TRUEPEAK_HISTORY_PREFERENCE_KEY);
   historyPreferenceListeners.forEach((listener) => listener());
 }
 
@@ -134,6 +153,7 @@ export function writeUiModePreference(value: WorkspaceUiMode) {
     } catch {}
   }
 
+  invalidateStorageValue(TRUEPEAK_UI_MODE_PREFERENCE_KEY);
   uiModePreferenceListeners.forEach((listener) => listener());
 }
 
@@ -157,6 +177,7 @@ export function writeParallelPreference(value: ParallelLanesPreference) {
     } catch {}
   }
 
+  invalidateStorageValue(TRUEPEAK_PARALLEL_PREFERENCE_KEY);
   parallelPreferenceListeners.forEach((listener) => listener());
 }
 
@@ -169,14 +190,18 @@ function systemTheme(): WorkspaceTheme {
 }
 
 const THEME_COOKIE_MAX_AGE = 60 * 60 * 24 * 365; // one year
+const THEME_COOKIE_PATTERN = new RegExp(
+  `(?:^|;\\s*)${TRUEPEAK_THEME_PREFERENCE_KEY}=(light|dark)(?:;|$)`,
+);
+
+let themeCache: WorkspaceTheme | null = null;
 
 function readThemeCookie(): WorkspaceTheme | null {
   if (typeof document === "undefined") {
     return null;
   }
 
-  const pattern = new RegExp(`(?:^|;\\s*)${TRUEPEAK_THEME_PREFERENCE_KEY}=(light|dark)(?:;|$)`);
-  const match = document.cookie.match(pattern);
+  const match = document.cookie.match(THEME_COOKIE_PATTERN);
   return match ? (match[1] as WorkspaceTheme) : null;
 }
 
@@ -187,7 +212,8 @@ export function readThemePreference(): WorkspaceTheme {
 
   // The theme lives in a cookie so the server can read it and render the correct
   // data-theme on the first byte (no flash). Fall back to the OS preference if unset.
-  return readThemeCookie() ?? systemTheme();
+  themeCache ??= readThemeCookie() ?? systemTheme();
+  return themeCache;
 }
 
 export function subscribeThemePreference(listener: () => void) {
@@ -203,7 +229,10 @@ export function subscribeThemePreference(listener: () => void) {
     typeof window.matchMedia === "function"
       ? window.matchMedia("(prefers-color-scheme: light)")
       : null;
-  const handleMedia = () => listener();
+  const handleMedia = () => {
+    themeCache = null;
+    listener();
+  };
   media?.addEventListener?.("change", handleMedia);
 
   return () => {
@@ -218,5 +247,6 @@ export function writeThemePreference(value: WorkspaceTheme) {
     document.cookie = `${TRUEPEAK_THEME_PREFERENCE_KEY}=${value}; path=/; max-age=${THEME_COOKIE_MAX_AGE}; samesite=lax${secure}`;
   }
 
+  themeCache = null;
   themePreferenceListeners.forEach((listener) => listener());
 }

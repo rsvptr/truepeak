@@ -6,7 +6,6 @@ import type { AnalysisTimeline } from "@/types/audio";
 
 interface TimelineChartProps {
   timeline: AnalysisTimeline;
-  density?: "default" | "compact";
 }
 
 function readThemeToken(name: string, fallback: string) {
@@ -16,12 +15,11 @@ function readThemeToken(name: string, fallback: string) {
   return value || fallback;
 }
 
-export function TimelineChart({ timeline, density = "default" }: TimelineChartProps) {
+export function TimelineChart({ timeline }: TimelineChartProps) {
   const loudnessContainerRef = useRef<HTMLDivElement | null>(null);
   const peakContainerRef = useRef<HTMLDivElement | null>(null);
   const loudnessPlotRef = useRef<uPlot | null>(null);
   const peakPlotRef = useRef<uPlot | null>(null);
-  const compact = density === "compact";
 
   // uPlot reads its axis/series colours from CSS custom properties once, at
   // creation. Watch the document theme so a light/dark toggle restyles the charts.
@@ -55,12 +53,12 @@ export function TimelineChart({ timeline, density = "default" }: TimelineChartPr
       value == null ? null : Number(value.toFixed(2)),
     );
     const truePeak = timeline.truePeakDbtp.map((value) => Number(value.toFixed(2)));
-    const loudnessHeight = density === "compact" ? 190 : 250;
-    const peakHeight = density === "compact" ? 170 : 220;
+    const loudnessHeight = 250;
+    const peakHeight = 220;
     // Keep the floor low enough for narrow phones (the deepest nesting leaves
     // ~240px of content width at 360px viewports); the container scrolls
     // horizontally if a chart still can't fit.
-    const minChartWidth = density === "compact" ? 220 : 240;
+    const minChartWidth = 240;
 
     loudnessPlotRef.current = new uPlot(
       {
@@ -168,7 +166,7 @@ export function TimelineChart({ timeline, density = "default" }: TimelineChartPr
       loudnessPlotRef.current = null;
       peakPlotRef.current = null;
     };
-  }, [density, timeline, themeVersion]);
+  }, [timeline, themeVersion]);
 
   return (
     <div className="space-y-3">
@@ -182,13 +180,13 @@ export function TimelineChart({ timeline, density = "default" }: TimelineChartPr
         ref={loudnessContainerRef}
         role="img"
         aria-label="Momentary and short-term loudness chart in LUFS"
-        className={`${compact ? "min-h-[190px] rounded-[18px] p-2" : "min-h-[250px] rounded-[24px] p-3"} w-full overflow-x-auto overflow-y-hidden border border-[var(--line)] bg-[var(--surface-1)]`}
+        className="min-h-[250px] w-full overflow-x-auto overflow-y-hidden rounded-[24px] border border-[var(--line)] bg-[var(--surface-1)] p-3"
       />
       <div
         ref={peakContainerRef}
         role="img"
         aria-label="True peak chart in dBTP"
-        className={`${compact ? "min-h-[170px] rounded-[18px] p-2" : "min-h-[220px] rounded-[24px] p-3"} w-full overflow-x-auto overflow-y-hidden border border-[var(--line)] bg-[var(--surface-1)]`}
+        className="min-h-[220px] w-full overflow-x-auto overflow-y-hidden rounded-[24px] border border-[var(--line)] bg-[var(--surface-1)] p-3"
       />
     </div>
   );

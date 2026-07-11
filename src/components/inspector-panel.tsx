@@ -1,18 +1,36 @@
 "use client";
 
-import { useRef, type KeyboardEvent, type ReactNode, type Ref } from "react";
+import { useRef, type KeyboardEvent, type Ref } from "react";
+import dynamic from "next/dynamic";
 import { BarChart3, CircleAlert, LoaderCircle, RefreshCcw, Square } from "lucide-react";
 import { getComplianceSummary } from "@/audio/compliance";
 import { formatDb, formatDuration, formatLufs, formatPeakDbtp, formatRelativeDb, formatRelativeLu, formatTimestamp } from "@/lib/format";
 import { getJobErrorDisplay } from "@/lib/job-ui";
 import { complianceToneClass, statusToneClass } from "@/lib/status-tone";
+import { isActiveJob, isIssueJob } from "@/lib/session-selectors";
 import { cn } from "@/lib/utils";
 import type { AnalysisJob, AnalysisMode, SourceFormat } from "@/types/audio";
-import { TimelineChart } from "@/components/timeline-chart";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { Progress } from "@/components/ui/progress";
+
+// uPlot and the chart wiring only matter once someone opens the Timeline tab
+// of a completed result, so keep them out of the initial bundle. The
+// placeholder mirrors the chart layout to avoid a layout shift.
+const TimelineChart = dynamic(
+  () => import("@/components/timeline-chart").then((module) => module.TimelineChart),
+  {
+    ssr: false,
+    loading: () => (
+      <div className="space-y-3" aria-hidden="true">
+        <div className="h-7" />
+        <div className="min-h-[250px] w-full animate-pulse rounded-[24px] border border-[var(--line)] bg-[var(--surface-1)]" />
+        <div className="min-h-[220px] w-full animate-pulse rounded-[24px] border border-[var(--line)] bg-[var(--surface-1)]" />
+      </div>
+    ),
+  },
+);
 
 export type InspectorDetailTab = "overview" | "timeline" | "metadata";
 
@@ -21,10 +39,6 @@ const DETAIL_TABS: Array<{ id: InspectorDetailTab; label: string }> = [
   { id: "timeline", label: "Timeline" },
   { id: "metadata", label: "Technical" },
 ];
-
-function isActive(job: AnalysisJob) {
-  return ["queued", "reading", "decoding", "analyzing"].includes(job.status);
-}
 
 function formatSourceFormatLabel(sourceFormat: SourceFormat) {
   switch (sourceFormat) {
@@ -49,47 +63,24 @@ function InspectorMetric({
   value,
   hint,
   accent = false,
-  density = "default",
 }: {
   label: string;
   value: string;
   hint: string;
   accent?: boolean;
-  density?: "default" | "rail";
 }) {
-  const compact = density === "rail";
-
   return (
     <div
       className={cn(
-        "min-w-0 rounded-[20px] border",
-        compact ? "px-3 py-3" : "px-4 py-4",
+        "min-w-0 rounded-[20px] border px-4 py-4",
         accent
           ? "border-[color:var(--accent)]/18 bg-[color:var(--accent-soft)]"
           : "border-[var(--line)]/80 bg-[var(--surface-1)]",
       )}
     >
       <div className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">{label}</div>
-      <div className={cn("mt-2 break-words font-semibold text-[var(--ink)] tabular-nums", compact ? "text-base" : "text-xl")}>{value}</div>
-      <p className={cn("mt-2 break-words leading-5 text-[var(--muted)]", compact ? "text-[11px]" : "text-xs")}>{hint}</p>
-    </div>
-  );
-}
-
-function MetadataRow({
-  label,
-  value,
-  hint,
-}: {
-  label: string;
-  value: ReactNode;
-  hint?: ReactNode;
-}) {
-  return (
-    <div className="min-w-0 rounded-[16px] border border-[var(--line)]/70 bg-[var(--surface-0)]/54 px-3 py-3">
-      <dt className="text-[10px] uppercase tracking-[0.16em] text-[var(--muted)]">{label}</dt>
-      <dd className="mt-1 break-words text-sm font-semibold leading-6 text-[var(--ink)]">{value}</dd>
-      {hint ? <dd className="mt-1 break-words text-xs leading-5 text-[var(--muted)]">{hint}</dd> : null}
+      <div className="mt-2 break-words text-xl font-semibold text-[var(--ink)] tabular-nums">{value}</div>
+      <p className="mt-2 break-words text-xs leading-5 text-[var(--muted)]">{hint}</p>
     </div>
   );
 }
@@ -98,7 +89,6 @@ interface InspectorPanelProps {
   job: AnalysisJob;
   analysisMode: AnalysisMode;
   detailTab: InspectorDetailTab;
-  density?: "default" | "rail";
   headingId?: string;
   headingRef?: Ref<HTMLHeadingElement>;
   headingTabIndex?: number;
@@ -113,7 +103,6 @@ export function InspectorPanel({
   job,
   analysisMode,
   detailTab,
-  density = "default",
   headingId,
   headingRef,
   headingTabIndex,
@@ -141,7 +130,6 @@ export function InspectorPanel({
     : [];
   const errorDisplay = getJobErrorDisplay(job.error);
   const tabRefs = useRef<Array<HTMLButtonElement | null>>([]);
-  const compact = density === "rail";
 
   const handleDetailTabKeyDown = (
     event: KeyboardEvent<HTMLButtonElement>,
@@ -176,19 +164,16 @@ export function InspectorPanel({
   };
 
   return (
-    <Card className={cn(compact ? "p-4 shadow-none" : "p-5 sm:p-6")}>
-      <div className={cn("flex flex-col border-b border-[var(--line)]/80", compact ? "gap-3 pb-4" : "gap-4 pb-5")}>
-        <div className={cn("flex flex-col gap-4", compact ? "" : "xl:flex-row xl:items-start xl:justify-between")}>
+    <Card className="p-5 sm:p-6">
+      <div className="flex flex-col gap-4 border-b border-[var(--line)]/80 pb-5">
+        <div className="flex flex-col gap-4 xl:flex-row xl:items-start xl:justify-between">
           <div className="min-w-0">
             <div className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">File details</div>
             <h2
               id={headingId}
               ref={headingRef}
               tabIndex={headingTabIndex}
-              className={cn(
-                "mt-2 break-words font-semibold leading-tight text-[var(--ink)] focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)]",
-                compact ? "text-xl" : "text-2xl",
-              )}
+              className="mt-2 break-words text-2xl font-semibold leading-tight text-[var(--ink)] focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)]"
             >
               {job.fileName}
             </h2>
@@ -214,13 +199,13 @@ export function InspectorPanel({
                 Compare
               </Button>
             ) : null}
-            {(job.status === "failed" || job.status === "canceled") ? (
+            {isIssueJob(job) ? (
               <Button type="button" size="sm" variant="secondary" onClick={() => onRetryJob(job.id)} aria-label={`Retry ${job.fileName}`}>
                 <RefreshCcw className="h-4 w-4" />
                 Retry
               </Button>
             ) : null}
-            {isActive(job) ? (
+            {isActiveJob(job) ? (
               <Button type="button" size="sm" variant="ghost" onClick={() => onCancelJob(job.id)} aria-label={`Cancel ${job.fileName}`}>
                 <Square className="h-4 w-4" />
                 Cancel
@@ -230,27 +215,27 @@ export function InspectorPanel({
         </div>
 
         {result ? (
-          <div className={cn("grid gap-3", compact ? "grid-cols-2" : analysisMode === "targeted" ? "md:grid-cols-2 2xl:grid-cols-3" : "md:grid-cols-2 xl:grid-cols-3")}>
-            <InspectorMetric density={density} label="Integrated" value={formatLufs(result.metrics.integratedLufs)} hint={selectedTarget?.label ?? "Measured loudness"} accent />
-            <InspectorMetric density={density} label="True peak" value={formatPeakDbtp(result.metrics.truePeakDbtp)} hint="Measured true peak" />
-            <InspectorMetric density={density} label="LRA" value={formatDb(result.metrics.loudnessRange, "LU")} hint="Loudness range" />
+          <div className={cn("grid gap-3", analysisMode === "targeted" ? "md:grid-cols-2 2xl:grid-cols-3" : "md:grid-cols-2 xl:grid-cols-3")}>
+            <InspectorMetric label="Integrated" value={formatLufs(result.metrics.integratedLufs)} hint={selectedTarget?.label ?? "Measured loudness"} accent />
+            <InspectorMetric label="True peak" value={formatPeakDbtp(result.metrics.truePeakDbtp)} hint="Measured true peak" />
+            <InspectorMetric label="LRA" value={formatDb(result.metrics.loudnessRange, "LU")} hint="Loudness range" />
             {analysisMode === "targeted" ? (
               <>
-                <InspectorMetric density={density} label="Gain move" value={formatRelativeDb(result.metrics.targetDeltaDb)} hint={result.metrics.normalizationLimited ? "Limited by ceiling" : "Planned normalization move"} />
-                <InspectorMetric density={density} label="Projected TP" value={formatPeakDbtp(result.metrics.projectedTruePeakDbtp)} hint="After planned normalization" />
+                <InspectorMetric label="Gain move" value={formatRelativeDb(result.metrics.targetDeltaDb)} hint={result.metrics.normalizationLimited ? "Limited by ceiling" : "Planned normalization move"} />
+                <InspectorMetric label="Projected TP" value={formatPeakDbtp(result.metrics.projectedTruePeakDbtp)} hint="After planned normalization" />
               </>
             ) : (
               <>
-                <InspectorMetric density={density} label="Ungated" value={formatLufs(result.metrics.ungatedLufs)} hint="Reference before gating" />
-                <InspectorMetric density={density} label="Sample peak" value={formatDb(result.metrics.samplePeakDbfs, "dBFS")} hint="Highest sample peak" />
+                <InspectorMetric label="Ungated" value={formatLufs(result.metrics.ungatedLufs)} hint="Reference before gating" />
+                <InspectorMetric label="Sample peak" value={formatDb(result.metrics.samplePeakDbfs, "dBFS")} hint="Highest sample peak" />
               </>
             )}
-            <InspectorMetric density={density} label="Duration" value={formatDuration(result.metadata.durationSeconds)} hint={result.metadata.channelLayout.name} />
+            <InspectorMetric label="Duration" value={formatDuration(result.metadata.durationSeconds)} hint={result.metadata.channelLayout.name} />
           </div>
         ) : null}
       </div>
 
-      <div className={cn("flex flex-wrap gap-2 border-b border-[var(--line)]/80", compact ? "mt-4 pb-4" : "mt-5 pb-5")} role="tablist" aria-label="File detail sections">
+      <div className="mt-5 flex flex-wrap gap-2 border-b border-[var(--line)]/80 pb-5" role="tablist" aria-label="File detail sections">
         {DETAIL_TABS.map((tab, index) => (
           <button
             key={tab.id}
@@ -280,8 +265,12 @@ export function InspectorPanel({
       {!result ? (
         <div className="mt-5 rounded-[24px] border border-[var(--line)] bg-[var(--surface-1)] p-5">
           <div className="flex items-center gap-3 text-[var(--muted)]">
-            {isActive(job) ? (
-              <LoaderCircle className="h-5 w-5 animate-spin text-[var(--accent)]" />
+            {isActiveJob(job) ? (
+              // Spin a wrapper element, not the SVG itself: transforms on SVG
+              // elements are not hardware accelerated in several browsers.
+              <span className="inline-flex animate-spin">
+                <LoaderCircle className="h-5 w-5 text-[var(--accent)]" />
+              </span>
             ) : (
               <CircleAlert className="h-5 w-5 text-[var(--accent)]" />
             )}
@@ -311,20 +300,20 @@ export function InspectorPanel({
           <section className="rounded-[24px] border border-[var(--line)]/80 bg-[var(--surface-1)] p-5">
             <div className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">Loudness</div>
             <div className="mt-4 grid gap-3 md:grid-cols-2">
-              <InspectorMetric density={density} label="Integrated" value={formatLufs(result.metrics.integratedLufs)} hint="Primary LUFS reading" accent />
-              <InspectorMetric density={density} label="Ungated" value={formatLufs(result.metrics.ungatedLufs)} hint="Before gating" />
-              <InspectorMetric density={density} label="Max momentary" value={formatLufs(result.metrics.maxMomentaryLufs)} hint="400 ms window" />
-              <InspectorMetric density={density} label="Max short-term" value={formatLufs(result.metrics.maxShortTermLufs)} hint="3 second window" />
+              <InspectorMetric label="Integrated" value={formatLufs(result.metrics.integratedLufs)} hint="Primary LUFS reading" accent />
+              <InspectorMetric label="Ungated" value={formatLufs(result.metrics.ungatedLufs)} hint="Before gating" />
+              <InspectorMetric label="Max momentary" value={formatLufs(result.metrics.maxMomentaryLufs)} hint="400 ms window" />
+              <InspectorMetric label="Max short-term" value={formatLufs(result.metrics.maxShortTermLufs)} hint="3 second window" />
             </div>
           </section>
 
           <section className="rounded-[24px] border border-[var(--line)]/80 bg-[var(--surface-1)] p-5">
             <div className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">Peaks and dynamics</div>
             <div className="mt-4 grid gap-3 md:grid-cols-2">
-              <InspectorMetric density={density} label="True peak" value={formatPeakDbtp(result.metrics.truePeakDbtp)} hint="Measured true peak" accent />
-              <InspectorMetric density={density} label="Sample peak" value={formatDb(result.metrics.samplePeakDbfs, "dBFS")} hint="Highest sample peak" />
-              <InspectorMetric density={density} label="LRA" value={formatDb(result.metrics.loudnessRange, "LU")} hint="Loudness range" />
-              <InspectorMetric density={density} label="Timeline points" value={String(result.metrics.timeline.timeSeconds.length)} hint="Momentary, short-term, and peak samples" />
+              <InspectorMetric label="True peak" value={formatPeakDbtp(result.metrics.truePeakDbtp)} hint="Measured true peak" accent />
+              <InspectorMetric label="Sample peak" value={formatDb(result.metrics.samplePeakDbfs, "dBFS")} hint="Highest sample peak" />
+              <InspectorMetric label="LRA" value={formatDb(result.metrics.loudnessRange, "LU")} hint="Loudness range" />
+              <InspectorMetric label="Timeline points" value={String(result.metrics.timeline.timeSeconds.length)} hint="Momentary, short-term, and peak samples" />
             </div>
           </section>
 
@@ -332,10 +321,10 @@ export function InspectorPanel({
             <section className="rounded-[24px] border border-[var(--line)]/80 bg-[var(--surface-1)] p-5">
               <div className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">Normalization and delivery</div>
               <div className="mt-4 grid gap-3 md:grid-cols-2">
-                <InspectorMetric density={density} label="Requested move" value={formatRelativeDb(result.metrics.unclampedTargetDeltaDb)} hint="Needed before ceiling protection" />
-                <InspectorMetric density={density} label="Applied move" value={formatRelativeDb(result.metrics.targetDeltaDb)} hint={result.metrics.normalizationLimited ? "Capped to protect projected true peak" : "Move toward target"} accent={result.metrics.normalizationLimited} />
-                <InspectorMetric density={density} label="Projected TP" value={formatPeakDbtp(result.metrics.projectedTruePeakDbtp)} hint="After planned normalization" />
-                <InspectorMetric density={density} label="Policy" value={selectedTarget.policy === "protect-true-peak" ? "Protect ceiling" : "Hit target"} hint="Current normalization strategy" />
+                <InspectorMetric label="Requested move" value={formatRelativeDb(result.metrics.unclampedTargetDeltaDb)} hint="Needed before ceiling protection" />
+                <InspectorMetric label="Applied move" value={formatRelativeDb(result.metrics.targetDeltaDb)} hint={result.metrics.normalizationLimited ? "Capped to protect projected true peak" : "Move toward target"} accent={result.metrics.normalizationLimited} />
+                <InspectorMetric label="Projected TP" value={formatPeakDbtp(result.metrics.projectedTruePeakDbtp)} hint="After planned normalization" />
+                <InspectorMetric label="Policy" value={selectedTarget.policy === "protect-true-peak" ? "Protect ceiling" : "Hit target"} hint="Current normalization strategy" />
               </div>
               <div className="mt-4 flex flex-wrap gap-2">
                 <Badge className="border-[var(--line)] bg-[var(--surface-0)] text-[var(--muted)]">Target {formatLufs(selectedTarget.loudnessTargetLufs)}</Badge>
@@ -359,10 +348,10 @@ export function InspectorPanel({
           <section className="rounded-[24px] border border-[var(--line)]/80 bg-[var(--surface-1)] p-5">
             <div className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">Technical details</div>
             <div className="mt-4 grid gap-3 md:grid-cols-2">
-              <InspectorMetric density={density} label="Decoder" value={result.metadata.decoderLabel} hint={result.metadata.decoderSummary} accent />
-              <InspectorMetric density={density} label="Source" value={formatSourceFormatLabel(result.metadata.sourceFormat)} hint={result.metadata.mimeType || "Audio source"} />
-              <InspectorMetric density={density} label="Sample rate" value={`${result.metadata.sampleRate.toLocaleString("en-GB")} Hz`} hint="Parsed sample rate" />
-              <InspectorMetric density={density} label="Channels" value={String(result.metadata.channelCount)} hint={result.metadata.channelLayout.name} />
+              <InspectorMetric label="Decoder" value={result.metadata.decoderLabel} hint={result.metadata.decoderSummary} accent />
+              <InspectorMetric label="Source" value={formatSourceFormatLabel(result.metadata.sourceFormat)} hint={result.metadata.mimeType || "Audio source"} />
+              <InspectorMetric label="Sample rate" value={`${result.metadata.sampleRate.toLocaleString("en-GB")} Hz`} hint="Parsed sample rate" />
+              <InspectorMetric label="Channels" value={String(result.metadata.channelCount)} hint={result.metadata.channelLayout.name} />
             </div>
           </section>
 
@@ -389,55 +378,29 @@ export function InspectorPanel({
           <section className="rounded-[24px] border border-[var(--line)]/80 bg-[var(--surface-1)] p-5">
             <div className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">Timeline review</div>
             <div className="mt-4">
-              <TimelineChart timeline={result.metrics.timeline} density={compact ? "compact" : "default"} />
+              <TimelineChart timeline={result.metrics.timeline} />
             </div>
           </section>
           <div className="grid gap-3 md:grid-cols-3">
-            <InspectorMetric density={density} label="Timeline step" value={`${result.metrics.timeline.stepDurationSeconds.toFixed(1)} s`} hint="Sampling interval for plotted values" />
-            <InspectorMetric density={density} label="Timeline points" value={String(result.metrics.timeline.timeSeconds.length)} hint="Momentary, short-term, and peak samples" />
-            <InspectorMetric density={density} label="Analysis time" value={formatTimestamp(result.analyzedAt)} hint="When this result was produced" />
+            <InspectorMetric label="Timeline step" value={`${result.metrics.timeline.stepDurationSeconds.toFixed(1)} s`} hint="Sampling interval for plotted values" />
+            <InspectorMetric label="Timeline points" value={String(result.metrics.timeline.timeSeconds.length)} hint="Momentary, short-term, and peak samples" />
+            <InspectorMetric label="Analysis time" value={formatTimestamp(result.analyzedAt)} hint="When this result was produced" />
           </div>
         </div>
       ) : null}
 
       {result && detailTab === "metadata" ? (
-        compact ? (
-          <div id="inspector-panel-metadata" role="tabpanel" aria-labelledby="inspector-tab-metadata" className="mt-5 space-y-4">
-            <section className="rounded-[18px] border border-[var(--line)]/80 bg-[var(--surface-1)] p-4">
-              <div className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">Technical metadata</div>
-              <dl className="mt-4 grid gap-2">
-                <MetadataRow label="Sample rate" value={`${result.metadata.sampleRate.toLocaleString("en-GB")} Hz`} hint="Source sample rate" />
-                <MetadataRow label="Bit depth" value={`${result.metadata.bitDepth}-bit`} hint="Parsed container depth" />
-                <MetadataRow label="Channels" value={String(result.metadata.channelCount)} hint={result.metadata.channelLayout.name} />
-                <MetadataRow label="Layout confidence" value={result.metadata.channelLayout.guessed ? "Guessed" : "Explicit"} hint={result.metadata.channelLayout.labels.join(" / ")} />
-                <MetadataRow label="Frame count" value={result.metadata.frameCount.toLocaleString("en-GB")} hint="Decoded sample frames" />
-                <MetadataRow label="Duration" value={formatDuration(result.metadata.durationSeconds)} hint="Source duration" />
-                {processingLabel ? <MetadataRow label="Processing time" value={processingLabel} hint="Read, decode, and analysis for this run" /> : null}
-              </dl>
-            </section>
-
-            <section className="rounded-[18px] border border-[var(--line)]/80 bg-[var(--surface-1)] p-4">
-              <div className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">Container and decode path</div>
-              <dl className="mt-4 grid gap-2">
-                <MetadataRow label="Container" value={formatSourceFormatLabel(result.metadata.sourceFormat)} hint={result.metadata.mimeType || "Audio source"} />
-                <MetadataRow label="Decoder mode" value={result.metadata.decoderMode} />
-                <MetadataRow label="Decoder summary" value={result.metadata.decoderLabel} hint={result.metadata.decoderSummary} />
-                <MetadataRow label="Policy" value={selectedTarget ? (selectedTarget.policy === "protect-true-peak" ? "Protect ceiling" : "Hit target") : "Measure Only"} />
-              </dl>
-            </section>
-          </div>
-        ) : (
         <div id="inspector-panel-metadata" role="tabpanel" aria-labelledby="inspector-tab-metadata" className="mt-5 grid gap-4 xl:grid-cols-2">
           <section className="rounded-[24px] border border-[var(--line)]/80 bg-[var(--surface-1)] p-5">
             <div className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">Technical metadata</div>
             <div className="mt-4 grid gap-3 md:grid-cols-2">
-              <InspectorMetric density={density} label="Sample rate" value={`${result.metadata.sampleRate.toLocaleString("en-GB")} Hz`} hint="Source sample rate" accent />
-              <InspectorMetric density={density} label="Bit depth" value={`${result.metadata.bitDepth}-bit`} hint="Parsed container depth" />
-              <InspectorMetric density={density} label="Channels" value={String(result.metadata.channelCount)} hint={result.metadata.channelLayout.name} />
-              <InspectorMetric density={density} label="Layout confidence" value={result.metadata.channelLayout.guessed ? "Guessed" : "Explicit"} hint={result.metadata.channelLayout.labels.join(" / ")} />
-              <InspectorMetric density={density} label="Frame count" value={result.metadata.frameCount.toLocaleString("en-GB")} hint="Decoded sample frames" />
-              <InspectorMetric density={density} label="Duration" value={formatDuration(result.metadata.durationSeconds)} hint="Source duration" />
-              {processingLabel ? <InspectorMetric density={density} label="Processing time" value={processingLabel} hint="Read, decode, and analysis for this run" /> : null}
+              <InspectorMetric label="Sample rate" value={`${result.metadata.sampleRate.toLocaleString("en-GB")} Hz`} hint="Source sample rate" accent />
+              <InspectorMetric label="Bit depth" value={`${result.metadata.bitDepth}-bit`} hint="Parsed container depth" />
+              <InspectorMetric label="Channels" value={String(result.metadata.channelCount)} hint={result.metadata.channelLayout.name} />
+              <InspectorMetric label="Layout confidence" value={result.metadata.channelLayout.guessed ? "Guessed" : "Explicit"} hint={result.metadata.channelLayout.labels.join(" / ")} />
+              <InspectorMetric label="Frame count" value={result.metadata.frameCount.toLocaleString("en-GB")} hint="Decoded sample frames" />
+              <InspectorMetric label="Duration" value={formatDuration(result.metadata.durationSeconds)} hint="Source duration" />
+              {processingLabel ? <InspectorMetric label="Processing time" value={processingLabel} hint="Read, decode, and analysis for this run" /> : null}
             </div>
           </section>
 
@@ -459,7 +422,6 @@ export function InspectorPanel({
             </div>
           </section>
         </div>
-        )
       ) : null}
     </Card>
   );
