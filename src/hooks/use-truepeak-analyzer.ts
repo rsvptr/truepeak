@@ -325,12 +325,18 @@ export function useTruePeakAnalyzer(
     target,
   });
   const noticeTimeoutRef = useRef<number | null>(null);
-  settingsRef.current = {
-    analysisBlocked,
-    analysisMode,
-    decodePreference,
-    target,
-  };
+  // Keep the latest settings readable from lane callbacks without retriggering
+  // them. Updated in an effect (never during render) so a discarded render
+  // can't leak its values; this effect is declared before every effect that
+  // reads the ref, so within a commit readers always see the fresh snapshot.
+  useEffect(() => {
+    settingsRef.current = {
+      analysisBlocked,
+      analysisMode,
+      decodePreference,
+      target,
+    };
+  });
 
   const completedJobs = useMemo(() => getCompletedAnalysisJobs(jobs), [jobs]);
   const hasActiveJobs = useMemo(() => jobs.some(isActiveJob), [jobs]);
