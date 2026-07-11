@@ -138,20 +138,30 @@ export async function loadLiveSessionJobs(): Promise<AnalysisJob[]> {
       }
     });
 
-    const jobs: AnalysisJob[] = [];
+    const normalized: AnalysisJob[] = [];
     for (const record of records) {
-      if (jobs.length >= MAX_SESSION_JOBS) {
-        break;
-      }
-
       const job = normalizeSessionJob(record);
       if (!job) continue;
 
-      jobs.push({ ...job, progressLabel: "Restored", restored: true });
+      normalized.push({ ...job, progressLabel: "Restored", restored: true });
     }
 
-    // Newest first, matching how fresh batches sit in the queue.
-    jobs.sort((left, right) => right.createdAt.localeCompare(left.createdAt));
+    // Sort before applying the cap: getAll() returns records in primary-key
+    // order, which is unrelated to recency, so capping first would keep an
+    // arbitrary subset instead of the newest results.
+    normalized.sort((left, right) => right.createdAt.localeCompare(left.createdAt));
+    const jobs = normalized.slice(0, MAX_SESSION_JOBS);
+
+    // Records beyond the cap are unreachable from the app: restore never
+    // surfaces them, so the autosave delete pass never learns their ids.
+    // Trim them here so the store stays bounded to what restore can return.
+    if (normalized.length > jobs.length) {
+      const dropped = normalized.slice(jobs.length);
+      await runWrite(db, (store) => {
+        dropped.forEach((job) => store.delete(job.id));
+      });
+    }
+
     return jobs;
   } finally {
     db.close();

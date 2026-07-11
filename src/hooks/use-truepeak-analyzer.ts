@@ -31,8 +31,9 @@ import {
 } from "@/audio/persistence";
 import { DEFAULT_TARGET_PRESET } from "@/audio/presets";
 import { retargetAnalysisResult } from "@/audio/targeting";
-import { getCompletedAnalysisJobs, isActiveJob } from "@/lib/session-selectors";
+import { getCompletedAnalysisJobs, isActiveJob, isIssueJob } from "@/lib/session-selectors";
 import { makeId } from "@/lib/utils";
+import type { ParallelLanesPreference } from "@/lib/workspace-preferences";
 import type {
   AnalysisJob,
   AnalysisMode,
@@ -62,7 +63,15 @@ interface WorkerLane {
   decoder: Worker;
   analyzer: Worker;
   jobId: string | null;
+  // Consecutive worker failures without a single successful message. Guards
+  // against an unbounded terminate/respawn loop when worker scripts cannot
+  // load at all (stale deploy, offline revisit).
+  failureStreak: number;
 }
+
+// After this many consecutive worker failures the lane is removed instead of
+// re-attached; fresh lanes only appear again on the next queue activity.
+const MAX_LANE_FAILURE_STREAK = 3;
 
 // Where analysis begins on the job's overall progress bar (read+decode owns
 // everything before it). Analyzer worker fractions are mapped above this.
@@ -99,7 +108,7 @@ function isCoarsePointerDevice() {
 // Low-memory and touch-first devices are capped harder: their constraint is
 // RAM, not cores. Machines that report 8 GB+ (Chrome caps the report at 8)
 // and plenty of cores get up to 6 lanes.
-export function resolveLaneLimit(preference: "auto" | "1" | "2" | "4" = "auto") {
+export function resolveLaneLimit(preference: ParallelLanesPreference = "auto") {
   if (preference !== "auto") {
     return Math.min(4, Math.max(1, Number.parseInt(preference, 10) || 1));
   }
@@ -137,12 +146,12 @@ function resolveHeavyFileBytes() {
   return (constrained ? 96 : 256) * 1024 * 1024;
 }
 
-interface UseTruePeakAnalyzerOptions {
+export interface UseTruePeakAnalyzerOptions {
   analysisMode?: AnalysisMode;
   analysisBlocked?: boolean;
   decodePreference?: DecodePreference;
   persistHistory?: boolean;
-  parallelPreference?: "auto" | "1" | "2" | "4";
+  parallelPreference?: ParallelLanesPreference;
 }
 
 interface AnalyzerSettings {
@@ -279,6 +288,13 @@ function describeWorkerFailure(label: string, event: ErrorEvent | MessageEvent) 
   return `${label} worker could not process a message.`;
 }
 
+// Shared by runJob's failure handler and resetLane's direct update so both
+// classify the same reasons as cancellation rather than failure.
+function isCancellationReason(message: string) {
+  const lower = message.toLowerCase();
+  return lower.includes("cancel") || lower.includes("restarted") || lower.includes("removed");
+}
+
 export function useTruePeakAnalyzer(
   target: TargetPreset | null = DEFAULT_TARGET_PRESET,
   options: UseTruePeakAnalyzerOptions = {},
@@ -316,7 +332,12 @@ export function useTruePeakAnalyzer(
   // id -> analyzedAt of results already written to the live-session store.
   const persistedResultsRef = useRef(new Map<string, string>());
   const didRestoreRef = useRef(false);
-  const resetLaneRef = useRef<(lane: WorkerLane, reason?: string) => void>(() => undefined);
+  // Bumped by clearSession so a restore still resolving from IndexedDB cannot
+  // resurrect rows into a session the user just cleared.
+  const restoreGenerationRef = useRef(0);
+  const resetLaneRef = useRef<
+    (lane: WorkerLane, reason?: string, options?: { workerFailure?: boolean }) => void
+  >(() => undefined);
   const fillLanesRef = useRef<() => void>(() => undefined);
   const settingsRef = useRef<AnalyzerSettings>({
     analysisBlocked,
@@ -466,12 +487,13 @@ export function useTruePeakAnalyzer(
 
     decoderWorker.onerror = (event) => {
       event.preventDefault();
-      resetLaneRef.current(lane, describeWorkerFailure("Decoder", event));
+      resetLaneRef.current(lane, describeWorkerFailure("Decoder", event), { workerFailure: true });
     };
     decoderWorker.onmessageerror = (event) => {
-      resetLaneRef.current(lane, describeWorkerFailure("Decoder", event));
+      resetLaneRef.current(lane, describeWorkerFailure("Decoder", event), { workerFailure: true });
     };
     decoderWorker.onmessage = (event: MessageEvent<DecoderResponse>) => {
+      lane.failureStreak = 0;
       const message = event.data;
       if (message.type === "progress") {
         if (!decoderPendingRef.current.has(message.jobId)) {
@@ -508,12 +530,13 @@ export function useTruePeakAnalyzer(
 
     analyzerWorker.onerror = (event) => {
       event.preventDefault();
-      resetLaneRef.current(lane, describeWorkerFailure("Analyzer", event));
+      resetLaneRef.current(lane, describeWorkerFailure("Analyzer", event), { workerFailure: true });
     };
     analyzerWorker.onmessageerror = (event) => {
-      resetLaneRef.current(lane, describeWorkerFailure("Analyzer", event));
+      resetLaneRef.current(lane, describeWorkerFailure("Analyzer", event), { workerFailure: true });
     };
     analyzerWorker.onmessage = (event: MessageEvent<AnalyzerResponse>) => {
+      lane.failureStreak = 0;
       const message = event.data;
       if (message.type === "progress") {
         if (!analyzerPendingRef.current.has(message.jobId)) {
@@ -558,22 +581,47 @@ export function useTruePeakAnalyzer(
   // Terminate and replace one lane's workers, failing only the job that lane
   // was running. Other lanes keep working untouched.
   const resetLane = useCallback(
-    (lane: WorkerLane, reason = "Worker restarted.") => {
+    (lane: WorkerLane, reason = "Worker restarted.", options?: { workerFailure?: boolean }) => {
       lane.decoder.terminate();
       lane.analyzer.terminate();
 
       const jobId = lane.jobId;
       if (jobId) {
+        let hadPending = false;
         const decoderPending = decoderPendingRef.current.get(jobId);
         if (decoderPending) {
+          hadPending = true;
           decoderPendingRef.current.delete(jobId);
           decoderPending.reject(new Error(reason));
         }
 
         const analyzerPending = analyzerPendingRef.current.get(jobId);
         if (analyzerPending) {
+          hadPending = true;
           analyzerPendingRef.current.delete(jobId);
           analyzerPending.reject(new Error(reason));
+        }
+
+        // No pending resolver means the job is between worker calls (usually
+        // browser-decoding). Its runJob has nothing to reject, so end the run
+        // here: invalidate the token so the in-flight code bails at its next
+        // checkpoint instead of calling into a lane that may belong to another
+        // job by then, and settle the row's visible state directly.
+        if (!hadPending) {
+          invalidateJobRun(jobId);
+          const canceled = isCancellationReason(reason);
+          updateJob(jobId, (job) =>
+            isActiveJob(job)
+              ? {
+                  ...job,
+                  status: canceled ? "canceled" : "failed",
+                  error: canceled ? undefined : reason,
+                  progressLabel: canceled ? "Canceled" : "Failed",
+                  progressPercent: 1,
+                  finishedAtMs: Date.now(),
+                }
+              : job,
+          );
         }
 
         laneByJobRef.current.delete(jobId);
@@ -583,9 +631,26 @@ export function useTruePeakAnalyzer(
       }
 
       lane.jobId = null;
+
+      if (options?.workerFailure) {
+        lane.failureStreak += 1;
+        if (lane.failureStreak >= MAX_LANE_FAILURE_STREAK) {
+          // The worker scripts themselves are failing (for example a stale
+          // deploy whose chunks are gone). Re-attaching would just loop, so
+          // drop the lane and tell the user instead of burning CPU.
+          const index = lanesRef.current.indexOf(lane);
+          if (index >= 0) {
+            lanesRef.current.splice(index, 1);
+          }
+
+          pushNotice("The analysis workers keep failing to start. Reload the page and try again.");
+          return;
+        }
+      }
+
       attachLaneWorkers(lane);
     },
-    [attachLaneWorkers],
+    [attachLaneWorkers, invalidateJobRun, pushNotice, updateJob],
   );
 
   useEffect(() => {
@@ -690,11 +755,33 @@ export function useTruePeakAnalyzer(
 
     didRestoreRef.current = true;
     let cancelled = false;
+    const generation = restoreGenerationRef.current;
 
-    void loadLiveSessionJobs().then((restoredJobs) => {
-      if (cancelled || !restoredJobs.length) {
+    void loadLiveSessionJobs().then((loadedJobs) => {
+      if (cancelled || generation !== restoreGenerationRef.current || !loadedJobs.length) {
         return;
       }
+
+      // The stored results carry whatever target was active when they were
+      // computed. Reconcile them to the settings that are active right now,
+      // exactly like a job that finishes after a target switch; otherwise a
+      // preset or mode change made before the refresh silently reverts.
+      const settings = settingsRef.current;
+      const restoredJobs = settings.analysisBlocked
+        ? loadedJobs
+        : loadedJobs.map((job) =>
+            job.result
+              ? {
+                  ...job,
+                  result: retargetAnalysisResult(
+                    job.result,
+                    settings.analysisMode === "targeted"
+                      ? settings.target ?? DEFAULT_TARGET_PRESET
+                      : null,
+                  ),
+                }
+              : job,
+          );
 
       // Mark as already persisted so the autosave diff below doesn't rewrite
       // every record straight back.
@@ -1167,10 +1254,7 @@ export function useTruePeakAnalyzer(
 
         const rawMessage = error instanceof Error ? error.message : "The job failed.";
         const message = normalizeDecodeFailure(rawMessage, currentDecodePreference);
-        const canceled =
-          message.toLowerCase().includes("cancel") ||
-          message.toLowerCase().includes("restarted") ||
-          message.toLowerCase().includes("removed");
+        const canceled = isCancellationReason(message);
         updateJobIfRunCurrent(jobId, runToken, (job) => ({
           ...job,
           status: canceled ? "canceled" : "failed",
@@ -1208,6 +1292,19 @@ export function useTruePeakAnalyzer(
       return;
     }
 
+    // Enforce a lowered lane budget mid-batch. The preference effect can only
+    // dispose lanes that are idle at that moment; lanes that were busy then
+    // must be culled here as they free up, otherwise the queue keeps running
+    // at the old concurrency until it drains.
+    while (lanesRef.current.length > laneLimitRef.current) {
+      const idle = lanesRef.current.find((lane) => lane.jobId === null);
+      if (!idle) {
+        break;
+      }
+
+      disposeIdleLane(idle);
+    }
+
     const acquireLane = (): WorkerLane | null => {
       const idle = lanesRef.current.find((lane) => lane.jobId === null);
       if (idle) {
@@ -1223,6 +1320,7 @@ export function useTruePeakAnalyzer(
         decoder: null as unknown as Worker,
         analyzer: null as unknown as Worker,
         jobId: null,
+        failureStreak: 0,
       };
       attachLaneWorkers(lane);
       lanesRef.current.push(lane);
@@ -1264,7 +1362,7 @@ export function useTruePeakAnalyzer(
       const settings = settingsRef.current;
       void runJob(job.id, lane, settings.target, settings.analysisMode, settings.decodePreference);
     }
-  }, [attachLaneWorkers, runJob]);
+  }, [attachLaneWorkers, disposeIdleLane, runJob]);
 
   useEffect(() => {
     fillLanesRef.current = fillLanes;
@@ -1381,11 +1479,11 @@ export function useTruePeakAnalyzer(
   }, [invalidateJobRun, resetLane, updateJob]);
 
   const cancelActiveJobs = useCallback(() => {
-    const activeIds = jobsRef.current
-      .filter((job) => ["queued", "reading", "decoding", "analyzing"].includes(job.status))
-      .map((job) => job.id);
+    const activeIds = new Set(
+      jobsRef.current.filter(isActiveJob).map((job) => job.id),
+    );
 
-    if (!activeIds.length) {
+    if (!activeIds.size) {
       return;
     }
 
@@ -1398,7 +1496,7 @@ export function useTruePeakAnalyzer(
 
     setJobs((current) => {
       const next: AnalysisJob[] = current.map((job) =>
-        activeIds.includes(job.id)
+        activeIds.has(job.id)
           ? {
               ...job,
               status: "canceled",
@@ -1412,7 +1510,7 @@ export function useTruePeakAnalyzer(
       return next;
     });
     pushNotice(
-      `Canceled ${activeIds.length} active job${activeIds.length === 1 ? "" : "s"}.`,
+      `Canceled ${activeIds.size} active job${activeIds.size === 1 ? "" : "s"}.`,
     );
   }, [invalidateJobRun, resetLane, pushNotice]);
 
@@ -1435,18 +1533,16 @@ export function useTruePeakAnalyzer(
   }, [invalidateJobRun, updateJob]);
 
   const retryIssues = useCallback(() => {
-    const retryIds = jobsRef.current
-      .filter(
-        (job) =>
-          (job.status === "failed" || job.status === "canceled") &&
-          filesRef.current.has(job.id),
-      )
-      .map((job) => job.id);
+    const retryIds = new Set(
+      jobsRef.current
+        .filter((job) => isIssueJob(job) && filesRef.current.has(job.id))
+        .map((job) => job.id),
+    );
 
     retryIds.forEach(invalidateJobRun);
     setJobs((current) => {
       const next: AnalysisJob[] = current.map((job) => {
-        if (retryIds.includes(job.id)) {
+        if (retryIds.has(job.id)) {
           return {
             ...job,
             status: "queued",
@@ -1465,8 +1561,8 @@ export function useTruePeakAnalyzer(
       return next;
     });
 
-    if (retryIds.length) {
-      pushNotice(`Re-queued ${retryIds.length} issue job${retryIds.length === 1 ? "" : "s"}.`);
+    if (retryIds.size) {
+      pushNotice(`Re-queued ${retryIds.size} issue job${retryIds.size === 1 ? "" : "s"}.`);
     }
   }, [invalidateJobRun, pushNotice]);
 
@@ -1488,11 +1584,13 @@ export function useTruePeakAnalyzer(
 
   const clearFinished = useCallback(() => {
     setJobs((current) => {
-      const finishedIds = current
-        .filter((job) => ["complete", "failed", "canceled"].includes(job.status))
-        .map((job) => job.id);
+      const finishedIds = new Set(
+        current
+          .filter((job) => job.status === "complete" || isIssueJob(job))
+          .map((job) => job.id),
+      );
       finishedIds.forEach(dropJobResources);
-      const keep = current.filter((job) => !finishedIds.includes(job.id));
+      const keep = current.filter((job) => !finishedIds.has(job.id));
       jobsRef.current = keep;
       return keep;
     });
@@ -1500,6 +1598,7 @@ export function useTruePeakAnalyzer(
   }, [dropJobResources, pushNotice]);
 
   const clearSession = useCallback(() => {
+    restoreGenerationRef.current += 1;
     jobRunTokensRef.current.clear();
     lanesRef.current.forEach((lane) => {
       if (lane.jobId !== null) {

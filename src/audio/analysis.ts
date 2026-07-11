@@ -412,9 +412,18 @@ function calculateLra(segmentEnergies: number[], stepDurationSeconds: number, sa
   return Math.max(0, hi - lo);
 }
 
+// Single pass, no spread: these arrays hold one entry per 100 ms of audio, and
+// spreading a multi-hour timeline into Math.max() overflows the engine's
+// argument limit and throws after all the analysis work is already done.
 function maxOrNull(values: Array<number | null>) {
-  const filtered = values.filter((value): value is number => value != null);
-  return filtered.length ? Math.max(...filtered) : null;
+  let max: number | null = null;
+  for (const value of values) {
+    if (value != null && (max == null || value > max)) {
+      max = value;
+    }
+  }
+
+  return max;
 }
 
 export function analyzeDecodedAsset(
