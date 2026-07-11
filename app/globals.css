@@ -13,6 +13,10 @@
   --accent: #37d2be;
   --accent-strong: #128d81;
   --accent-soft: rgba(55, 210, 190, 0.14);
+  /* Accent-colored text on --accent-soft chips. Dark theme can use the bright
+     accent, but the light theme needs the deeper shade to reach AA contrast
+     on the tinted background. */
+  --accent-text: #37d2be;
   --danger: #ff7b88;
   --success: #55d59c;
   --warning: #f7b756;
@@ -38,6 +42,7 @@
   --accent: #0f9684;
   --accent-strong: #0c7568;
   --accent-soft: rgba(15, 150, 132, 0.13);
+  --accent-text: #0c7568;
   --danger: #bc2740;
   --success: #11744e;
   --warning: #8a5a00;
@@ -242,6 +247,12 @@ summary,
   input[type="search"],
   input[type="number"] {
     min-height: 44px;
+  }
+
+  /* Icon-only action buttons are otherwise ~40px wide; text buttons already
+     exceed this, so a floor is safe across the board. */
+  button {
+    min-width: 44px;
   }
 
   /* iOS Safari zooms the whole page when a focused control's font-size is

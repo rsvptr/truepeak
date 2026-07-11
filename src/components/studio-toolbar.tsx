@@ -84,8 +84,10 @@ export function StudioToolbar({
   const triggerRef = useRef<HTMLButtonElement | null>(null);
 
   const focusMenuItem = (index: number) => {
+    // Unavailable items stay focusable (aria-disabled, not disabled), so
+    // keyboard and screen reader users can still discover they exist.
     const items = Array.from(menuRef.current?.querySelectorAll<HTMLButtonElement>('[data-menu-item="true"]') ?? [])
-      .filter((item) => item.offsetParent !== null && !item.disabled);
+      .filter((item) => item.offsetParent !== null);
     if (!items?.length) {
       return;
     }
@@ -99,6 +101,18 @@ export function StudioToolbar({
     if (returnFocus) {
       window.setTimeout(() => triggerRef.current?.focus(), 0);
     }
+  };
+
+  // Menu action wrapper: unavailable actions no-op (the item is perceivable
+  // but announced disabled) and available ones close the menu after running.
+  // Called from inside click handlers only, never during render.
+  const runMenuAction = (enabled: boolean, action: () => void) => {
+    if (!enabled) {
+      return;
+    }
+
+    action();
+    closeMenu(true);
   };
 
   useEffect(() => {
@@ -132,7 +146,7 @@ export function StudioToolbar({
 
   const handleMenuKeyDown = (event: ReactKeyboardEvent<HTMLDivElement>) => {
     const items = Array.from(menuRef.current?.querySelectorAll<HTMLButtonElement>('[data-menu-item="true"]') ?? [])
-      .filter((item) => item.offsetParent !== null && !item.disabled);
+      .filter((item) => item.offsetParent !== null);
     if (!items?.length) {
       return;
     }
@@ -262,11 +276,8 @@ export function StudioToolbar({
                       size="sm"
                       variant="secondary"
                       className="md:hidden"
-                      onClick={() => {
-                        onExportCsv();
-                        closeMenu(true);
-                      }}
-                      disabled={!completedCount}
+                      onClick={() => runMenuAction(completedCount > 0, onExportCsv)}
+                      aria-disabled={!completedCount}
                     >
                       <Download className="h-4 w-4" />
                       CSV
@@ -278,11 +289,8 @@ export function StudioToolbar({
                       size="sm"
                       variant="secondary"
                       className="md:hidden"
-                      onClick={() => {
-                        onExportJson();
-                        closeMenu(true);
-                      }}
-                      disabled={!completedCount}
+                      onClick={() => runMenuAction(completedCount > 0, onExportJson)}
+                      aria-disabled={!completedCount}
                     >
                       <Download className="h-4 w-4" />
                       JSON
@@ -294,11 +302,8 @@ export function StudioToolbar({
                       size="sm"
                       variant="secondary"
                       className="md:hidden"
-                      onClick={() => {
-                        onExportMarkdown();
-                        closeMenu(true);
-                      }}
-                      disabled={!completedCount}
+                      onClick={() => runMenuAction(completedCount > 0, onExportMarkdown)}
+                      aria-disabled={!completedCount}
                     >
                       <FileText className="h-4 w-4" />
                       Report
@@ -309,11 +314,8 @@ export function StudioToolbar({
                       type="button"
                       size="sm"
                       variant="secondary"
-                      onClick={() => {
-                        onExportSession();
-                        closeMenu(true);
-                      }}
-                      disabled={!completedCount}
+                      onClick={() => runMenuAction(completedCount > 0, onExportSession)}
+                      aria-disabled={!completedCount}
                     >
                       <Save className="h-4 w-4" />
                       Export Session
@@ -324,10 +326,7 @@ export function StudioToolbar({
                       type="button"
                       size="sm"
                       variant="secondary"
-                      onClick={() => {
-                        onOpenSession();
-                        closeMenu(true);
-                      }}
+                      onClick={() => runMenuAction(true, onOpenSession)}
                     >
                       <FolderOpen className="h-4 w-4" />
                       Open Session
@@ -338,10 +337,7 @@ export function StudioToolbar({
                       type="button"
                       size="sm"
                       variant={historyEnabled ? "secondary" : "primary"}
-                      onClick={() => {
-                        onToggleHistory();
-                        closeMenu(true);
-                      }}
+                      onClick={() => runMenuAction(true, onToggleHistory)}
                     >
                       <History className="h-4 w-4" />
                       {historyEnabled ? "Turn History Off" : "Turn History On"}
@@ -352,11 +348,8 @@ export function StudioToolbar({
                       type="button"
                       size="sm"
                       variant="secondary"
-                      onClick={() => {
-                        onOpenHistory();
-                        closeMenu(true);
-                      }}
-                      disabled={!historyEnabled}
+                      onClick={() => runMenuAction(historyEnabled, onOpenHistory)}
+                      aria-disabled={!historyEnabled}
                     >
                       <History className="h-4 w-4" />
                       Open History
@@ -367,11 +360,8 @@ export function StudioToolbar({
                       type="button"
                       size="sm"
                       variant="secondary"
-                      onClick={() => {
-                        onClearFinished();
-                        closeMenu(true);
-                      }}
-                      disabled={!finishedCount}
+                      onClick={() => runMenuAction(finishedCount > 0, onClearFinished)}
+                      aria-disabled={!finishedCount}
                     >
                       <Trash2 className="h-4 w-4" />
                       Clear Finished
@@ -382,11 +372,8 @@ export function StudioToolbar({
                       type="button"
                       size="sm"
                       variant="secondary"
-                      onClick={() => {
-                        onCancelActive();
-                        closeMenu(true);
-                      }}
-                      disabled={!activeCount}
+                      onClick={() => runMenuAction(activeCount > 0, onCancelActive)}
+                      aria-disabled={!activeCount}
                     >
                       <Square className="h-4 w-4" />
                       Cancel Active
@@ -397,11 +384,8 @@ export function StudioToolbar({
                       type="button"
                       size="sm"
                       variant="danger"
-                      onClick={() => {
-                        onClearSession();
-                        closeMenu(true);
-                      }}
-                      disabled={!jobsCount}
+                      onClick={() => runMenuAction(jobsCount > 0, onClearSession)}
+                      aria-disabled={!jobsCount}
                     >
                       <Trash2 className="h-4 w-4" />
                       Clear Session

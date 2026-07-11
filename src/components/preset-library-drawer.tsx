@@ -134,6 +134,7 @@ export function PresetLibraryDrawer({
                         key={preset.id}
                         type="button"
                         onClick={() => onSelectPreset(preset.id)}
+                        aria-pressed={selected}
                         className={cn(
                           "w-full rounded-[22px] border px-4 py-4 text-left transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)]",
                           selected
@@ -146,7 +147,10 @@ export function PresetLibraryDrawer({
                             <div className="text-base font-semibold text-[var(--ink)]">{preset.label}</div>
                             <div className="mt-1 text-xs leading-5 text-[var(--muted)]">{preset.sourceLabel}</div>
                           </div>
-                          <Badge className={evidenceToneClass(preset.evidence)}>{evidenceLabel(preset.evidence)}</Badge>
+                          <div className="flex shrink-0 flex-wrap justify-end gap-1.5">
+                            {selected ? <Badge className="border-[color:var(--accent)]/30 bg-[color:var(--accent-soft)] text-[var(--accent)]">Selected</Badge> : null}
+                            <Badge className={evidenceToneClass(preset.evidence)}>{evidenceLabel(preset.evidence)}</Badge>
+                          </div>
                         </div>
                         <div className="mt-3 grid gap-3 sm:grid-cols-2">
                           <div className="text-sm text-[var(--muted)]">
@@ -174,6 +178,7 @@ export function PresetLibraryDrawer({
               <button
                 type="button"
                 onClick={() => onSelectPreset(CUSTOM_ID)}
+                aria-pressed={selectedPresetId === CUSTOM_ID}
                 className={cn(
                   "w-full rounded-[22px] border px-4 py-4 text-left transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)]",
                   selectedPresetId === CUSTOM_ID
@@ -186,7 +191,10 @@ export function PresetLibraryDrawer({
                     <div className="text-base font-semibold text-[var(--ink)]">Custom preset</div>
                     <div className="mt-1 text-xs leading-5 text-[var(--muted)]">Manual target</div>
                   </div>
-                  <Badge className={evidenceToneClass("custom")}>Custom</Badge>
+                  <div className="flex shrink-0 flex-wrap justify-end gap-1.5">
+                    {selectedPresetId === CUSTOM_ID ? <Badge className="border-[color:var(--accent)]/30 bg-[color:var(--accent-soft)] text-[var(--accent)]">Selected</Badge> : null}
+                    <Badge className={evidenceToneClass("custom")}>Custom</Badge>
+                  </div>
                 </div>
                 <p className="mt-3 text-sm leading-6 text-[var(--muted)]">
                   Use this when you already know the loudness target and true-peak ceiling you need.

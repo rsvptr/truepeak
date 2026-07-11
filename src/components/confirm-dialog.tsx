@@ -1,7 +1,8 @@
 "use client";
 
-import { useEffect, useId, useRef } from "react";
+import { useId, useRef } from "react";
 import { AlertTriangle } from "lucide-react";
+import { useModalFocus } from "@/hooks/use-modal-focus";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 
@@ -14,18 +15,6 @@ interface ConfirmDialogProps {
   tone?: "danger" | "default";
   onConfirm: () => void;
   onClose: () => void;
-}
-
-function getFocusableElements(container: HTMLElement | null) {
-  if (!container) {
-    return [];
-  }
-
-  return Array.from(
-    container.querySelectorAll<HTMLElement>(
-      'a[href], button:not([disabled]), textarea:not([disabled]), input:not([disabled]):not([type="hidden"]), select:not([disabled]), [tabindex]:not([tabindex="-1"])',
-    ),
-  ).filter((element) => !element.hasAttribute("aria-hidden") && element.offsetParent !== null);
 }
 
 export function ConfirmDialog({
@@ -42,80 +31,14 @@ export function ConfirmDialog({
   const descriptionId = useId();
   const panelRef = useRef<HTMLDivElement | null>(null);
   const cancelButtonRef = useRef<HTMLButtonElement | null>(null);
-  const latestOnCloseRef = useRef(onClose);
-  const previousFocusRef = useRef<HTMLElement | null>(null);
 
-  useEffect(() => {
-    latestOnCloseRef.current = onClose;
-  }, [onClose]);
-
-  useEffect(() => {
-    if (!open) {
-      return;
-    }
-
-    previousFocusRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
-
-    const previousOverflow = document.body.style.overflow;
-    const previousPaddingRight = document.body.style.paddingRight;
-    const scrollbarWidth = window.innerWidth - document.documentElement.clientWidth;
-    document.body.style.overflow = "hidden";
-    if (scrollbarWidth > 0) {
-      document.body.style.paddingRight = `${scrollbarWidth}px`;
-    }
-
-    const focusTimeout = window.setTimeout(() => {
-      cancelButtonRef.current?.focus();
-    }, 0);
-
-    const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") {
-        event.preventDefault();
-        latestOnCloseRef.current();
-        return;
-      }
-
-      if (event.key !== "Tab") {
-        return;
-      }
-
-      const focusable = getFocusableElements(panelRef.current);
-      if (!focusable.length) {
-        event.preventDefault();
-        panelRef.current?.focus();
-        return;
-      }
-
-      const first = focusable[0];
-      const last = focusable[focusable.length - 1];
-      const active = document.activeElement instanceof HTMLElement ? document.activeElement : null;
-      const activeInPanel = active != null && panelRef.current?.contains(active);
-
-      if (!activeInPanel) {
-        // Focus escaped the dialog (e.g. after a backdrop click). Pull it back in.
-        event.preventDefault();
-        (event.shiftKey ? last : first).focus();
-      } else if (event.shiftKey && active === first) {
-        event.preventDefault();
-        last.focus();
-      } else if (!event.shiftKey && active === last) {
-        event.preventDefault();
-        first.focus();
-      }
-    };
-
-    document.addEventListener("keydown", handleKeyDown);
-    return () => {
-      window.clearTimeout(focusTimeout);
-      document.removeEventListener("keydown", handleKeyDown);
-      document.body.style.overflow = previousOverflow;
-      document.body.style.paddingRight = previousPaddingRight;
-      const restoreTarget = previousFocusRef.current;
-      if (restoreTarget && document.contains(restoreTarget)) {
-        restoreTarget.focus();
-      }
-    };
-  }, [open]);
+  useModalFocus({
+    open,
+    panelRef,
+    onClose,
+    // The safe action gets initial focus so Enter cannot destroy anything.
+    getInitialFocus: () => cancelButtonRef.current,
+  });
 
   if (!open) {
     return null;
@@ -143,7 +66,7 @@ export function ConfirmDialog({
               "flex h-11 w-11 shrink-0 items-center justify-center rounded-full border",
               tone === "danger"
                 ? "tone-danger"
-                : "border-[color:var(--accent)]/20 bg-[color:var(--accent-soft)] text-[var(--accent)]",
+                : "border-[color:var(--accent)]/20 bg-[color:var(--accent-soft)] text-[var(--accent-text)]",
             )}
             aria-hidden="true"
           >

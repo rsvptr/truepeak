@@ -150,7 +150,7 @@ export function HomeStage({
               <div className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">
                 Start here
               </div>
-              <h2 className="mt-2 text-3xl font-semibold tracking-tight text-[var(--ink)] sm:text-4xl xl:text-[3.45rem] xl:leading-[1.02]">
+              <h2 className="mt-2 text-balance text-3xl font-semibold tracking-tight text-[var(--ink)] sm:text-4xl xl:text-[3.45rem] xl:leading-[1.02]">
                 Choose your files and start the review
               </h2>
               <p className="mt-4 max-w-[68ch] text-sm leading-7 text-[var(--muted)] sm:text-base">
@@ -188,7 +188,7 @@ export function HomeStage({
                   <Upload className="h-4 w-4 text-[var(--accent)]" aria-hidden="true" />
                   Drag and drop
                 </div>
-                <h3 className="mt-3 text-2xl font-semibold text-[var(--ink)] sm:text-3xl">
+                <h3 className="mt-3 text-balance text-2xl font-semibold text-[var(--ink)] sm:text-3xl">
                   Drop files or folders anywhere
                 </h3>
                 <p className="mt-3 max-w-[60ch] text-sm leading-7 text-[var(--muted)] sm:text-base">

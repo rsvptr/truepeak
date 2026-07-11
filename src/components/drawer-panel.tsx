@@ -1,7 +1,8 @@
 "use client";
 
-import { useEffect, useId, useRef, type ReactNode } from "react";
+import { useId, useRef, type ReactNode } from "react";
 import { X } from "lucide-react";
+import { useModalFocus } from "@/hooks/use-modal-focus";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 
@@ -13,18 +14,6 @@ interface DrawerPanelProps {
   children: ReactNode;
   desktopClassName?: string;
   mobileMode?: "sheet" | "full";
-}
-
-function getFocusableElements(container: HTMLElement | null) {
-  if (!container) {
-    return [];
-  }
-
-  return Array.from(
-    container.querySelectorAll<HTMLElement>(
-      'a[href], button:not([disabled]), textarea:not([disabled]), input:not([disabled]):not([type="hidden"]), select:not([disabled]), [tabindex]:not([tabindex="-1"])',
-    ),
-  ).filter((element) => !element.hasAttribute("aria-hidden") && element.offsetParent !== null);
 }
 
 export function DrawerPanel({
@@ -40,85 +29,13 @@ export function DrawerPanel({
   const descriptionId = useId();
   const panelRef = useRef<HTMLDivElement | null>(null);
   const closeButtonRef = useRef<HTMLButtonElement | null>(null);
-  const latestOnCloseRef = useRef(onClose);
-  const previousFocusRef = useRef<HTMLElement | null>(null);
 
-  useEffect(() => {
-    latestOnCloseRef.current = onClose;
-  }, [onClose]);
-
-  useEffect(() => {
-    if (!open) {
-      return;
-    }
-
-    previousFocusRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
-
-    const previousOverflow = document.body.style.overflow;
-    const previousPaddingRight = document.body.style.paddingRight;
-    const scrollbarWidth = window.innerWidth - document.documentElement.clientWidth;
-    document.body.style.overflow = "hidden";
-    if (scrollbarWidth > 0) {
-      document.body.style.paddingRight = `${scrollbarWidth}px`;
-    }
-
-    const focusInitial = window.setTimeout(() => {
-      const focusable = getFocusableElements(panelRef.current);
-      const target = closeButtonRef.current ?? focusable[0] ?? panelRef.current;
-      target?.focus();
-    }, 0);
-
-    const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") {
-        event.preventDefault();
-        latestOnCloseRef.current();
-        return;
-      }
-
-      if (event.key !== "Tab") {
-        return;
-      }
-
-      const focusable = getFocusableElements(panelRef.current);
-      if (!focusable.length) {
-        event.preventDefault();
-        panelRef.current?.focus();
-        return;
-      }
-
-      const first = focusable[0];
-      const last = focusable[focusable.length - 1];
-      const active = document.activeElement instanceof HTMLElement ? document.activeElement : null;
-      const activeInPanel = active != null && panelRef.current?.contains(active);
-
-      if (!activeInPanel) {
-        // Focus escaped the panel (e.g. after a backdrop click left focus on
-        // <body>). Pull it back in so Tab can't reach the page behind the modal.
-        event.preventDefault();
-        (event.shiftKey ? last : first).focus();
-      } else if (event.shiftKey && active === first) {
-        event.preventDefault();
-        last.focus();
-      } else if (!event.shiftKey && active === last) {
-        event.preventDefault();
-        first.focus();
-      }
-    };
-
-    document.addEventListener("keydown", handleKeyDown);
-    return () => {
-      window.clearTimeout(focusInitial);
-      document.removeEventListener("keydown", handleKeyDown);
-      document.body.style.overflow = previousOverflow;
-      document.body.style.paddingRight = previousPaddingRight;
-      // Only restore focus if the trigger is still in the document; a removed
-      // element (e.g. a deleted row) would otherwise drop focus to <body>.
-      const restoreTarget = previousFocusRef.current;
-      if (restoreTarget && document.contains(restoreTarget)) {
-        restoreTarget.focus();
-      }
-    };
-  }, [open]);
+  useModalFocus({
+    open,
+    panelRef,
+    onClose,
+    getInitialFocus: () => closeButtonRef.current,
+  });
 
   if (!open) {
     return null;
