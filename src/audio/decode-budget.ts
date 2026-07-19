@@ -325,6 +325,66 @@ export function resolveAdaptiveDecodeBudget(
   return resolveDecodeBudget(capable ? { ...LARGE_MEMORY_DECODE_BUDGET } : undefined);
 }
 
+export interface LaneAdmissionInput {
+  fileSizeBytes: number;
+  heavyFileBytes: number;
+  browserFirst: boolean;
+  plan:
+    | { kind: "known"; decodedBytes: number; trustedNative: boolean }
+    | { kind: "unknown" };
+  budget: DecodeBudget;
+}
+
+export interface LaneAdmissionPlan {
+  route: DecodeResidencyRoute;
+  reservationPeakBytes: number;
+  exclusive: boolean;
+}
+
+/**
+ * Decides how a queued job is admitted to a lane. Concurrency is governed by
+ * peak-memory reservations against the aggregate cap, not by decoder route:
+ * - A known footprint (complete PCM WAV/AIFF headers, FLAC STREAMINFO)
+ *   reserves twice its decoded bytes on every route. That models the decode
+ *   peak (browser: AudioBuffer plus the planar copy; native: source buffer
+ *   plus planar output) and the analysis phase (planar PCM plus K-weighting
+ *   scratch), so several high-resolution files can share the aggregate.
+ * - Unknown footprints (MP3, AAC and friends) and compatibility-route jobs
+ *   reserve the full conservative per-job peak: FFmpeg working memory is not
+ *   modeled per file, and opaque codecs give no trustworthy pre-decode
+ *   footprint. On devices whose aggregate holds two conservative routes that
+ *   still allows two at once; constrained devices stay serial.
+ * The hard-exclusive drain barrier applies only to LARGE UNKNOWN sources: a
+ * big opaque file could decode to anything, so it runs alone. Known
+ * footprints do not need the source-size proxy, because their reservation
+ * already bounds the whole decode-and-analyze lifecycle.
+ */
+export function planLaneAdmission(input: LaneAdmissionInput): LaneAdmissionPlan {
+  const { fileSizeBytes, heavyFileBytes, browserFirst, plan, budget } = input;
+  finitePositiveInteger(fileSizeBytes, "Admission file size");
+  finitePositiveInteger(heavyFileBytes, "Heavy-file threshold");
+
+  const trustedNativePrimary =
+    plan.kind === "known" && plan.trustedNative && !browserFirst;
+  const route: DecodeResidencyRoute = trustedNativePrimary
+    ? "native-worker"
+    : browserFirst
+      ? "browser"
+      : "compatibility-worker";
+
+  const knownFootprint =
+    plan.kind === "known" && (trustedNativePrimary || route === "browser");
+  const reservationPeakBytes = knownFootprint
+    ? decodePeakResidentBytes("browser", plan.decodedBytes)
+    : conservativeDecodePeakBytes(budget);
+
+  return {
+    route,
+    reservationPeakBytes,
+    exclusive: !knownFootprint && fileSizeBytes >= heavyFileBytes,
+  };
+}
+
 export function checkedDecodedBytes(frameCount: number, channelCount: number) {
   const samples = checkedMultiply(frameCount, channelCount, "Decoded sample count");
   return checkedMultiply(samples, Float32Array.BYTES_PER_ELEMENT, "Decoded byte count");
@@ -539,7 +599,7 @@ function inspectFlac(view: DataView): AudioContainerPreflight | null {
   return null;
 }
 
-function inspectWave(view: DataView): AudioContainerPreflight | null {
+function inspectWave(view: DataView, totalBytes: number): AudioContainerPreflight | null {
   const signature = readAscii(view, 0, 4);
   if (
     view.byteLength < 12 ||
@@ -577,13 +637,17 @@ function inspectWave(view: DataView): AudioContainerPreflight | null {
       blockAlign = view.getUint16(dataOffset + 12, true);
       bitDepth = view.getUint16(dataOffset + 14, true);
     } else if (chunkId === "data") {
+      // The declared audio payload must fit inside the real file, not inside
+      // the (possibly partial) header slice that was handed to the inspector.
+      // This is what lets a 256 KiB preflight slice of a multi-hundred-MiB
+      // PCM master produce a trusted, bounded plan.
       const resolvedDataBytes = signature === "RF64" && declaredSize === 0xffffffff
         ? rf64DataBytes
         : declaredSize;
       if (
         resolvedDataBytes == null ||
         resolvedDataBytes <= 0 ||
-        resolvedDataBytes > view.byteLength - dataOffset
+        resolvedDataBytes > totalBytes - dataOffset
       ) {
         return null;
       }
@@ -597,11 +661,13 @@ function inspectWave(view: DataView): AudioContainerPreflight | null {
       chunkId === "data" && signature === "RF64" && declaredSize === 0xffffffff
         ? dataBytes
         : declaredSize;
-    if (sizeToSkip == null || sizeToSkip > view.byteLength - dataOffset) {
+    // Structural validity is judged against the real file size; running past
+    // the supplied slice just ends the scan with whatever was found so far.
+    if (sizeToSkip == null || sizeToSkip > totalBytes - dataOffset) {
       return null;
     }
     const paddedSize = sizeToSkip + (sizeToSkip & 1);
-    if (!Number.isSafeInteger(paddedSize) || paddedSize > view.byteLength - dataOffset) {
+    if (!Number.isSafeInteger(paddedSize) || paddedSize > totalBytes - dataOffset) {
       return null;
     }
     offset = dataOffset + paddedSize;
@@ -638,7 +704,7 @@ function inspectWave(view: DataView): AudioContainerPreflight | null {
   };
 }
 
-function inspectAiff(view: DataView): AudioContainerPreflight | null {
+function inspectAiff(view: DataView, totalBytes: number): AudioContainerPreflight | null {
   const formType = readAscii(view, 8, 4);
   if (
     view.byteLength < 12 ||
@@ -662,7 +728,9 @@ function inspectAiff(view: DataView): AudioContainerPreflight | null {
     const declaredSize = view.getUint32(offset + 4, false);
     const dataOffset = offset + 8;
     chunksVisited += 1;
-    if (declaredSize > view.byteLength - dataOffset) {
+    // Chunk payloads must fit the real file; a header slice smaller than the
+    // file is fine as long as the fields actually read stay inside the slice.
+    if (declaredSize > totalBytes - dataOffset) {
       return null;
     }
 
@@ -703,7 +771,7 @@ function inspectAiff(view: DataView): AudioContainerPreflight | null {
     }
 
     const paddedSize = declaredSize + (declaredSize & 1);
-    if (!Number.isSafeInteger(paddedSize) || paddedSize > view.byteLength - dataOffset) {
+    if (!Number.isSafeInteger(paddedSize) || paddedSize > totalBytes - dataOffset) {
       return null;
     }
     offset = dataOffset + paddedSize;
@@ -743,9 +811,23 @@ function inspectAiff(view: DataView): AudioContainerPreflight | null {
   };
 }
 
-export function inspectAudioContainer(buffer: ArrayBuffer): AudioContainerPreflight | null {
+/**
+ * Inspects a container header. `totalBytes` is the size of the complete file
+ * the buffer was sliced from; it defaults to the buffer's own length, which
+ * preserves the strict whole-buffer behavior for callers that hold the full
+ * file (the decode workers and the fail-closed parser fixtures). Passing the
+ * real file size lets a partial header slice of a large PCM WAV/AIFF validate
+ * its declared payload bounds without reading the whole file.
+ */
+export function inspectAudioContainer(
+  buffer: ArrayBuffer,
+  totalBytes = buffer.byteLength,
+): AudioContainerPreflight | null {
   const view = new DataView(buffer);
-  return inspectFlac(view) ?? inspectWave(view) ?? inspectAiff(view);
+  if (!Number.isSafeInteger(totalBytes) || totalBytes < view.byteLength) {
+    return null;
+  }
+  return inspectFlac(view) ?? inspectWave(view, totalBytes) ?? inspectAiff(view, totalBytes);
 }
 
 export function throwIfAborted(signal?: AbortSignal) {

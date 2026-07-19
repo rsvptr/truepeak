@@ -22,6 +22,7 @@ const {
   decodeFailureDetails,
   growDecodePeakReservation,
   inspectAudioContainer,
+  planLaneAdmission,
   resolveAdaptiveDecodeBudget,
   resolveDecodeBudget,
   throwIfAborted,
@@ -477,6 +478,182 @@ try {
       (error.code === "frame-limit-exceeded" || error.code === "decoded-budget-exceeded"),
   );
 }
+
+// ---------------------------------------------------------------------------
+// Parallel admission. Header-slice preflight must classify large PCM masters
+// without reading the whole file, known-footprint FLAC must reserve its exact
+// browser-route peak, unknown formats must reserve the conservative peak, and
+// the aggregate reservation cap must be what actually governs concurrency.
+console.log("\n[I] Parallel admission planning");
+
+function wavHeaderSlice(sampleRate, channelCount, bitDepth, frameCount) {
+  const blockAlign = channelCount * (bitDepth / 8);
+  const dataBytes = frameCount * blockAlign;
+  const buffer = new ArrayBuffer(44);
+  const view = new DataView(buffer);
+  writeAscii(view, 0, "RIFF");
+  view.setUint32(4, 36 + dataBytes, true);
+  writeAscii(view, 8, "WAVE");
+  writeAscii(view, 12, "fmt ");
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, channelCount, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * blockAlign, true);
+  view.setUint16(32, blockAlign, true);
+  view.setUint16(34, bitDepth, true);
+  writeAscii(view, 36, "data");
+  view.setUint32(40, dataBytes, true);
+  return { buffer, totalBytes: 44 + dataBytes };
+}
+
+// The reported real-world file: 24-bit 192 kHz stereo, 46,708,712 frames.
+const hiResFrames = 46_708_712;
+const hiResWav = wavHeaderSlice(192_000, 2, 24, hiResFrames);
+const hiResSliceMeta = inspectAudioContainer(hiResWav.buffer, hiResWav.totalBytes);
+ok(
+  "header slice of a 280 MiB PCM WAV classifies with totalBytes",
+  hiResSliceMeta != null &&
+    hiResSliceMeta.nativeDecodeSafe === true &&
+    hiResSliceMeta.frameCount === hiResFrames &&
+    hiResSliceMeta.sampleRate === 192_000,
+);
+ok(
+  "the same slice without totalBytes stays unknown (strict whole-buffer rule)",
+  inspectAudioContainer(hiResWav.buffer) === null,
+);
+ok(
+  "a declared payload larger than the real file is rejected",
+  inspectAudioContainer(hiResWav.buffer, hiResWav.totalBytes - 1_000) === null,
+);
+ok(
+  "totalBytes smaller than the supplied buffer is rejected as inconsistent",
+  inspectAudioContainer(hiResWav.buffer, 10) === null,
+);
+
+const capable = resolveAdaptiveDecodeBudget(8, false);
+const aggregateCapable = checkedResourceByteSum([
+  conservativeDecodePeakBytes(capable),
+  conservativeDecodePeakBytes(capable),
+]);
+const heavyBytes = 256 * 1024 * 1024;
+const hiResDecodedBytes = checkedDecodedBytes(hiResFrames, 2);
+
+const nativeAdmission = planLaneAdmission({
+  fileSizeBytes: hiResWav.totalBytes,
+  heavyFileBytes: heavyBytes,
+  browserFirst: false,
+  plan: { kind: "known", decodedBytes: hiResDecodedBytes, trustedNative: true },
+  budget: capable,
+});
+ok(
+  "a 280 MiB trusted PCM WAV reserves 2x decoded bytes and is not exclusive",
+  nativeAdmission.route === "native-worker" &&
+    nativeAdmission.reservationPeakBytes ===
+      decodePeakResidentBytes("browser", hiResDecodedBytes) &&
+    nativeAdmission.exclusive === false,
+);
+
+const flacAdmission = planLaneAdmission({
+  fileSizeBytes: 160 * 1024 * 1024,
+  heavyFileBytes: heavyBytes,
+  browserFirst: true,
+  plan: { kind: "known", decodedBytes: hiResDecodedBytes, trustedNative: false },
+  budget: capable,
+});
+ok(
+  "known-footprint FLAC reserves its exact browser peak and is not exclusive",
+  flacAdmission.route === "browser" &&
+    flacAdmission.reservationPeakBytes ===
+      decodePeakResidentBytes("browser", hiResDecodedBytes) &&
+    flacAdmission.exclusive === false,
+);
+
+const mp3Admission = planLaneAdmission({
+  fileSizeBytes: 12 * 1024 * 1024,
+  heavyFileBytes: heavyBytes,
+  browserFirst: true,
+  plan: { kind: "unknown" },
+  budget: capable,
+});
+ok(
+  "unknown MP3 reserves the conservative peak instead of being exclusive",
+  mp3Admission.reservationPeakBytes === conservativeDecodePeakBytes(capable) &&
+    mp3Admission.exclusive === false,
+);
+ok(
+  "large unknown sources remain hard-exclusive",
+  planLaneAdmission({
+    fileSizeBytes: heavyBytes,
+    heavyFileBytes: heavyBytes,
+    browserFirst: true,
+    plan: { kind: "unknown" },
+    budget: capable,
+  }).exclusive === true,
+);
+ok(
+  "large sources with a known footprint are governed by reservations, not the barrier",
+  planLaneAdmission({
+    fileSizeBytes: heavyBytes,
+    heavyFileBytes: heavyBytes,
+    browserFirst: false,
+    plan: { kind: "known", decodedBytes: hiResDecodedBytes, trustedNative: true },
+    budget: capable,
+  }).exclusive === false,
+);
+
+function countAdmissions(reservationBytes, aggregateLimit, attempts) {
+  let total = 0;
+  let admitted = 0;
+  for (let index = 0; index < attempts; index += 1) {
+    try {
+      total = growDecodePeakReservation(total, 0, reservationBytes, aggregateLimit);
+      admitted += 1;
+    } catch {
+      break;
+    }
+  }
+  return admitted;
+}
+
+ok(
+  "five 4-minute 24-bit 192 kHz FLACs run concurrently on a capable device",
+  countAdmissions(flacAdmission.reservationPeakBytes, aggregateCapable, 6) === 5,
+);
+const cdFlacDecoded = checkedDecodedBytes(4 * 60 * 44_100, 2);
+ok(
+  "six 4-minute CD-quality FLACs all run concurrently",
+  countAdmissions(
+    decodePeakResidentBytes("browser", cdFlacDecoded),
+    aggregateCapable,
+    6,
+  ) === 6,
+);
+ok(
+  "five 24-bit 192 kHz PCM WAVs run concurrently on the native route",
+  countAdmissions(nativeAdmission.reservationPeakBytes, aggregateCapable, 6) === 5,
+);
+ok(
+  "six 24-bit 96 kHz PCM WAVs all run concurrently",
+  countAdmissions(
+    decodePeakResidentBytes("browser", checkedDecodedBytes(4 * 60 * 96_000, 2)),
+    aggregateCapable,
+    6,
+  ) === 6,
+);
+ok(
+  "unknown-footprint jobs run two at once on a capable device",
+  countAdmissions(mp3Admission.reservationPeakBytes, aggregateCapable, 3) === 2,
+);
+const constrained = resolveAdaptiveDecodeBudget(4, true);
+ok(
+  "unknown-footprint jobs stay serial on a constrained device",
+  countAdmissions(
+    conservativeDecodePeakBytes(constrained),
+    conservativeDecodePeakBytes(constrained),
+    2,
+  ) === 1,
+);
 
 console.log(`\n==== Runtime safety: ${passed} passed, ${failed} failed ====\n`);
 process.exit(failed ? 1 : 0);

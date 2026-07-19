@@ -16,6 +16,7 @@ import {
   decodeFailureDetails,
   growDecodePeakReservation,
   inspectAudioContainer,
+  planLaneAdmission,
   resolveAdaptiveDecodeBudget,
   resolveDecodeBudget,
   validatePlanarChannels,
@@ -1442,17 +1443,20 @@ export function useTruePeakAnalyzer(
         const budget = decodeBudgetRef.current;
         assertSourceWithinBudget(file.size, budget);
 
-        // FLAC STREAMINFO and AIFF COMM normally live near the start. Small
-        // sources are inspected in full (which also covers compact WAV files),
-        // while large/opaque sources remain deliberately unknown and therefore
-        // run exclusively rather than trusting a size-to-PCM guess.
+        // FLAC STREAMINFO, WAV fmt/data headers, and AIFF COMM/SSND all live
+        // near the start, so a bounded header slice is enough; the inspector
+        // validates declared payload bounds against the real file size. Truly
+        // opaque sources (MP3, AAC and friends) stay unknown and reserve the
+        // conservative per-job peak instead. A header that lies about its
+        // footprint is caught after decode, where the actual buffers exceed
+        // the planned reservation and the job falls back to the conservative
+        // exclusive posture.
         const preflightBytes =
           file.size <= 16 * 1024 * 1024
             ? file.size
             : Math.min(file.size, 256 * 1024);
         const header = await file.slice(0, preflightBytes).arrayBuffer();
-        const metadata = inspectAudioContainer(header);
-        const inspectedWholeFile = preflightBytes === file.size;
+        const metadata = inspectAudioContainer(header, file.size);
         const plan: JobResourcePlan = metadata
           ? {
               kind: "known",
@@ -1461,11 +1465,7 @@ export function useTruePeakAnalyzer(
                 budget,
                 "Container preflight",
               ).decodedBytes,
-              // Only a complete integer-PCM WAV/AIFF shape is admitted as a
-              // bounded native route. FLAC metadata and partial headers can be
-              // contradicted by decoder output, so they stay conservative.
-              trustedNative:
-                inspectedWholeFile && metadata.nativeDecodeSafe,
+              trustedNative: metadata.nativeDecodeSafe,
             }
           : { kind: "unknown" };
 
@@ -1620,8 +1620,17 @@ export function useTruePeakAnalyzer(
               "native-worker",
               footprint.decodedBytes,
             );
+      // A decode that stayed within the reservation it was admitted under
+      // needs no escalation: the aggregate already accounts for it, so other
+      // lanes may keep running. Escalation to the conservative exclusive
+      // posture is reserved for a decode that EXCEEDED its plan, which means
+      // the container header lied about its footprint (or an unplanned route
+      // produced more than the model allowed) and the job can only continue
+      // once it holds the full conservative reservation alone.
+      const exceededPlan =
+        actualPeakBytes > lease.reservation.plannedPeakBytes;
       const conservativeRoute =
-        browserRoute || workerUsage?.outputBytes != null;
+        (browserRoute || workerUsage?.outputBytes != null) && exceededPlan;
       growLeasePeakReservation(
         lane,
         lease,
@@ -2191,12 +2200,21 @@ export function useTruePeakAnalyzer(
       }
 
       const plan = resourcePlansRef.current.get(job.id);
-      if (!plan) {
-        void prepareResourcePlan(job.id, file);
-        break;
-      }
-      if (plan.kind === "preparing") {
-        break;
+      if (!plan || plan.kind === "preparing") {
+        // Preflights are quick (a header slice read), so keep a small pool of
+        // them in flight and keep scanning: a job whose plan is still pending
+        // must not strand idle lanes for already-planned jobs behind it. Each
+        // finished preflight re-runs fillLanes, so pending jobs are retried
+        // promptly and in queue order.
+        if (!plan) {
+          const preparingCount = [...resourcePlansRef.current.values()].filter(
+            (candidate) => candidate.kind === "preparing",
+          ).length;
+          if (preparingCount < 4) {
+            void prepareResourcePlan(job.id, file);
+          }
+        }
+        continue;
       }
       if (plan.kind === "rejected") {
         continue;
@@ -2208,20 +2226,25 @@ export function useTruePeakAnalyzer(
         settings.decodePreference === "browser-first" ||
         (settings.decodePreference === "auto" &&
           shouldPreferBrowserDecoder(file.name, mimeType));
-      const trustedNativePrimary =
-        plan.kind === "known" && plan.trustedNative && !browserFirst;
-      const exclusive =
-        file.size >= heavyFileBytesRef.current || !trustedNativePrimary;
+      const admission = planLaneAdmission({
+        fileSizeBytes: file.size,
+        heavyFileBytes: heavyFileBytesRef.current,
+        browserFirst,
+        plan,
+        budget: decodeBudgetRef.current,
+      });
+      const exclusive = admission.exclusive;
       if (
         exclusive &&
         lanesRef.current.some((lane) => lane.lease !== null)
       ) {
+        // Heavy files drain the batch and run alone. Stopping the scan here is
+        // deliberate: admitting later jobs past a waiting heavy file would
+        // starve it, because lanes might never all be idle at once again.
         break;
       }
 
-      const reservationPeakBytes = trustedNativePrimary
-        ? decodePeakResidentBytes("native-worker", plan.decodedBytes)
-        : conservativeDecodePeakBytes(decodeBudgetRef.current);
+      const reservationPeakBytes = admission.reservationPeakBytes;
       let nextReservedPeakBytes: number;
       try {
         nextReservedPeakBytes = growDecodePeakReservation(
@@ -2231,6 +2254,9 @@ export function useTruePeakAnalyzer(
           aggregatePeakBytesRef.current,
         );
       } catch {
+        // Aggregate capacity is exhausted. Stop rather than skip ahead so the
+        // oldest waiting job gets first claim on capacity as running jobs
+        // release their reservations.
         break;
       }
 
