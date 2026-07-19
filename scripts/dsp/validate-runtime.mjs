@@ -10,6 +10,8 @@ register("./alias-loader.mjs", import.meta.url);
 const {
   DEFAULT_DECODE_BUDGET,
   DecodeResourceError,
+  HARD_DECODE_LIMITS,
+  LARGE_MEMORY_DECODE_BUDGET,
   MAX_DECODE_CHANNELS,
   assertDecodedFootprint,
   assertSourceWithinBudget,
@@ -20,6 +22,7 @@ const {
   decodeFailureDetails,
   growDecodePeakReservation,
   inspectAudioContainer,
+  resolveAdaptiveDecodeBudget,
   resolveDecodeBudget,
   throwIfAborted,
   validatePlanarChannels,
@@ -391,6 +394,89 @@ const depthResult = await collectDroppedFiles(
   { maxFiles: 10, maxEntries: 10, maxDepth: 1, maxDirectoryPages: 10, deadlineMs: 500 },
 );
 ok("directory depth is bounded", depthResult.files.length === 0 && depthResult.truncated);
+
+// ---------------------------------------------------------------------------
+// Adaptive per-job decode budget tiers. A 24-bit 192 kHz stereo master decodes
+// well past the conservative 256 MiB tier (the reported real-world rejection
+// was 373,669,696 bytes, about 4 minutes of stereo 192 kHz as float32), so
+// devices with memory headroom must resolve the larger tier while constrained
+// devices keep the conservative one.
+console.log("\n[H] Adaptive decode-budget tiers");
+
+const capableBudget = resolveAdaptiveDecodeBudget(8, false);
+const constrainedBudget = resolveAdaptiveDecodeBudget(4, true);
+const noSignalDesktopBudget = resolveAdaptiveDecodeBudget(null, false);
+const noSignalPhoneBudget = resolveAdaptiveDecodeBudget(null, true);
+
+ok(
+  "8 GB devices resolve the large decode tier",
+  capableBudget.maxDecodedBytes === LARGE_MEMORY_DECODE_BUDGET.maxDecodedBytes &&
+    capableBudget.maxSourceBytes === LARGE_MEMORY_DECODE_BUDGET.maxSourceBytes &&
+    capableBudget.maxOutputBytes === LARGE_MEMORY_DECODE_BUDGET.maxOutputBytes,
+);
+ok(
+  "4 GB devices keep the conservative default tier",
+  constrainedBudget.maxDecodedBytes === DEFAULT_DECODE_BUDGET.maxDecodedBytes,
+);
+ok(
+  "no memory signal + fine pointer resolves the large tier (matches aggregate rule)",
+  noSignalDesktopBudget.maxDecodedBytes === LARGE_MEMORY_DECODE_BUDGET.maxDecodedBytes,
+);
+ok(
+  "no memory signal + coarse pointer keeps the conservative tier",
+  noSignalPhoneBudget.maxDecodedBytes === DEFAULT_DECODE_BUDGET.maxDecodedBytes,
+);
+ok(
+  "large tier stays within the hard ceilings",
+  LARGE_MEMORY_DECODE_BUDGET.maxDecodedBytes <= HARD_DECODE_LIMITS.maxDecodedBytes &&
+    LARGE_MEMORY_DECODE_BUDGET.maxSourceBytes <= HARD_DECODE_LIMITS.maxSourceBytes &&
+    LARGE_MEMORY_DECODE_BUDGET.maxOutputBytes <= HARD_DECODE_LIMITS.maxOutputBytes &&
+    LARGE_MEMORY_DECODE_BUDGET.maxDecodeMs <= HARD_DECODE_LIMITS.maxDecodeMs,
+);
+
+// The exact real-world rejection: 46,708,712 frames x 2 channels x 4 bytes =
+// 373,669,696 decoded bytes at 192 kHz (about 4:03). Must pass on the large
+// tier and still be rejected on the conservative tier.
+const hiResFootprint = {
+  frameCount: 46_708_712,
+  channelCount: 2,
+  sampleRate: 192_000,
+};
+ok(
+  "hi-res 24-bit 192 kHz footprint (373,669,696 bytes) passes the large tier",
+  assertDecodedFootprint(hiResFootprint, capableBudget).decodedBytes === 373_669_696,
+);
+throwsCode(
+  "same footprint is still rejected on the conservative tier",
+  "decoded-budget-exceeded",
+  () => assertDecodedFootprint(hiResFootprint, constrainedBudget),
+);
+
+// Eleven minutes of stereo 192 kHz fits the large tier; the tier's own cap
+// still rejects an hour-long 192 kHz master rather than allowing unbounded PCM.
+ok(
+  "11 minutes of stereo 192 kHz fits the large tier",
+  assertDecodedFootprint(
+    { frameCount: 660 * 192_000, channelCount: 2, sampleRate: 192_000 },
+    capableBudget,
+  ).decodedBytes <= capableBudget.maxDecodedBytes,
+);
+// An hour of stereo 192 kHz is 691.2 million frames (about 5.5 GB decoded), so
+// the frame ceiling rejects it before the byte ceiling gets a look. Either
+// budget code is a correct fail-closed outcome.
+try {
+  assertDecodedFootprint(
+    { frameCount: 3600 * 192_000, channelCount: 2, sampleRate: 192_000 },
+    capableBudget,
+  );
+  ok("an hour of stereo 192 kHz still exceeds the large tier", false);
+} catch (error) {
+  ok(
+    "an hour of stereo 192 kHz still exceeds the large tier",
+    error instanceof DecodeResourceError &&
+      (error.code === "frame-limit-exceeded" || error.code === "decoded-budget-exceeded"),
+  );
+}
 
 console.log(`\n==== Runtime safety: ${passed} passed, ${failed} failed ====\n`);
 process.exit(failed ? 1 : 0);

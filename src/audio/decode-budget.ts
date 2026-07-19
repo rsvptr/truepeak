@@ -42,6 +42,9 @@ export class DecodeResourceError extends Error {
 /**
  * Defaults are deliberately below the absolute ceilings. A later scheduler can
  * lower these per lane/device, but no caller can raise them past HARD_DECODE_LIMITS.
+ * The default tier protects constrained devices; 256 MiB of float32 PCM is only
+ * about 2.9 minutes of stereo 192 kHz audio, so capable devices resolve the
+ * larger tier below instead.
  */
 export const DEFAULT_DECODE_BUDGET: Readonly<DecodeBudget> = Object.freeze({
   maxSourceBytes: 512 * MEBIBYTE,
@@ -53,10 +56,29 @@ export const DEFAULT_DECODE_BUDGET: Readonly<DecodeBudget> = Object.freeze({
   maxDecodeMs: 2 * 60 * 1000,
 });
 
-export const HARD_DECODE_LIMITS: Readonly<DecodeBudget> = Object.freeze({
+/**
+ * Budget tier for devices that report 8 GB or more of memory (or a fine
+ * pointer with no memory signal, matching the aggregate-capacity rule). One
+ * GiB of decoded float32 PCM covers about 11.6 minutes of stereo 192 kHz or
+ * 23 minutes of stereo 96 kHz, so ordinary high-resolution masters fit. The
+ * decode-time ceiling is doubled because files this large legitimately take
+ * longer through every route. Heavy-file exclusivity and the aggregate
+ * reservation cap still bound the batch-level footprint.
+ */
+export const LARGE_MEMORY_DECODE_BUDGET: Readonly<DecodeBudget> = Object.freeze({
   maxSourceBytes: 1024 * MEBIBYTE,
-  maxDecodedBytes: 512 * MEBIBYTE,
-  maxOutputBytes: 513 * MEBIBYTE,
+  maxDecodedBytes: 1024 * MEBIBYTE,
+  maxOutputBytes: 1025 * MEBIBYTE,
+  maxChannels: MAX_DECODE_CHANNELS,
+  maxFrames: 200_000_000,
+  maxDurationSeconds: 6 * 60 * 60,
+  maxDecodeMs: 4 * 60 * 1000,
+});
+
+export const HARD_DECODE_LIMITS: Readonly<DecodeBudget> = Object.freeze({
+  maxSourceBytes: 2048 * MEBIBYTE,
+  maxDecodedBytes: 1536 * MEBIBYTE,
+  maxOutputBytes: 1537 * MEBIBYTE,
   maxChannels: MAX_DECODE_CHANNELS,
   maxFrames: 250_000_000,
   maxDurationSeconds: 12 * 60 * 60,
@@ -284,6 +306,23 @@ export function resolveDecodeBudget(budget?: DecodeBudget): DecodeBudget {
       "Decode-time budget",
     ),
   };
+}
+
+/**
+ * Picks the per-job decode budget tier from the same device signals the lane
+ * and aggregate schedulers use: 8 GB or more of reported memory gets the large
+ * tier, no memory signal falls back to the pointer heuristic (fine pointer
+ * reads as a desktop), and everything else keeps the conservative default.
+ * Pure so the tier rule is testable outside the DOM; callers supply the
+ * signals.
+ */
+export function resolveAdaptiveDecodeBudget(
+  deviceMemoryGigabytes: number | null,
+  coarsePointer: boolean,
+): DecodeBudget {
+  const capable =
+    deviceMemoryGigabytes != null ? deviceMemoryGigabytes >= 8 : !coarsePointer;
+  return resolveDecodeBudget(capable ? { ...LARGE_MEMORY_DECODE_BUDGET } : undefined);
 }
 
 export function checkedDecodedBytes(frameCount: number, channelCount: number) {

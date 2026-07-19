@@ -16,6 +16,7 @@ import {
   decodeFailureDetails,
   growDecodePeakReservation,
   inspectAudioContainer,
+  resolveAdaptiveDecodeBudget,
   resolveDecodeBudget,
   validatePlanarChannels,
   type DecodeBudget,
@@ -1026,6 +1027,14 @@ export function useTruePeakAnalyzer(
     const limit = resolveLaneLimit(parallelPreference);
     laneLimitRef.current = limit;
     heavyFileBytesRef.current = resolveHeavyFileBytes();
+    // Devices with memory headroom get the larger per-job decode budget, so
+    // high-resolution masters (24-bit 192 kHz runs well past 256 MiB of
+    // decoded PCM) are not turned away on hardware that can hold them. The
+    // aggregate reservation cap below is derived from whichever tier applies.
+    decodeBudgetRef.current = resolveAdaptiveDecodeBudget(
+      deviceMemoryGb(),
+      isCoarsePointerDevice(),
+    );
     aggregatePeakBytesRef.current = resolveAggregatePeakBytes(
       decodeBudgetRef.current,
     );

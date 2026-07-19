@@ -90,9 +90,9 @@ Caps keep a hostile or simply enormous input from becoming a memory problem. The
 | Long strings (notes, descriptions) | 2,000 characters |
 | Notes and warnings per result | 64 entries |
 | Jobs accepted into a running session | 1,000 (whole session, counted across every add, not per add) |
-| Default source / decoded / decoder-output bytes | 512 MiB / 256 MiB / 257 MiB per job (scheduler may lower) |
-| Aggregate modeled decode-route residency | One or two conservative route peaks, selected from device-memory/pointer signals; unknown routes run exclusively |
-| Channels / duration / decode time | 32 / 6 hours / 2 minutes per job by default |
+| Source / decoded / decoder-output bytes per job | 512 MiB / 256 MiB / 257 MiB on constrained devices; 1 GiB / 1 GiB / 1,025 MiB on devices reporting 8 GB or more of memory (so 24-bit 192 kHz masters fit); hard ceilings 2 GiB / 1.5 GiB / 1,537 MiB that no caller can raise |
+| Aggregate modeled decode-route residency | One or two conservative route peaks, selected from device-memory/pointer signals and derived from the active budget tier; unknown routes run exclusively |
+| Channels / duration / decode time | 32 / 6 hours / 2 minutes per job on constrained devices; the large-memory tier allows 4 minutes of decode time |
 | Folder traversal | 2,000 files, 8,000 entries, depth 12, 256 pages, 5 seconds |
 
 One authoritative limit of 1,000 jobs now governs intake, recovery restore, portable export, and portable import. Intake counts every job already in the session, so a sequence of adds can never push the total past 1,000; files beyond the remaining room are turned away and reported, not dropped silently. The app fails an over-limit session export explicitly, rejects over-limit imports rather than truncating, and restores the newest 1,000 records while reporting overflow and leaving the extra stored records in place. The folder-traversal limit of 2,000 files is a separate enumeration safeguard for a dropped folder, not a session cap; intake still caps enqueued jobs at 1,000 regardless. Folder enumeration stops as soon as any traversal dimension is exhausted.
