@@ -2,6 +2,9 @@
   "name": "truepeak",
   "version": "0.1.0",
   "private": true,
+  "engines": {
+    "node": ">=24"
+  },
   "scripts": {
     "prepare:ffmpeg": "node scripts/prepare-ffmpeg-assets.mjs",
     "postinstall": "npm run prepare:ffmpeg",
@@ -16,8 +19,11 @@
     "test:session": "node scripts/dsp/validate-session.mjs",
     "test:robustness": "node scripts/dsp/validate-robustness.mjs",
     "test:export": "node scripts/dsp/validate-export.mjs",
+    "test:presets": "node scripts/dsp/validate-presets.mjs",
+    "test:live-session": "node scripts/dsp/validate-live-session.mjs",
+    "test:runtime": "node scripts/dsp/validate-runtime.mjs",
     "test:fuzz": "node scripts/dsp/validate-fuzz.mjs",
-    "test": "npm run test:dsp && npm run test:ebu && npm run test:session && npm run test:robustness && npm run test:export && npm run test:fuzz"
+    "test": "npm run test:dsp && npm run test:ebu && npm run test:session && npm run test:robustness && npm run test:export && npm run test:presets && npm run test:live-session && npm run test:runtime && npm run test:fuzz"
   },
   "dependencies": {
     "@ffmpeg/core": "^0.12.9",

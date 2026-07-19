@@ -2,7 +2,11 @@
 
 import { History, Trash2 } from "lucide-react";
 import type { RecentSessionEntry } from "@/types/audio";
-import { formatLufs, formatPeakDbtp, formatTimestamp } from "@/lib/format";
+import {
+  formatIntegratedLufs,
+  formatPeakDbtp,
+  formatTimestamp,
+} from "@/lib/format";
 import { cn } from "@/lib/utils";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -34,7 +38,7 @@ export function RecentSessionsPanel({
             Saved summaries from earlier runs
           </h2>
           <p className="mt-2 max-w-2xl text-sm leading-6 text-[var(--muted)]">
-            These cards keep the final readings close at hand. They are local snapshots, not live session restores.
+            These cards hold the final readings from each run. They are local snapshots, not live session restores.
           </p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
@@ -70,11 +74,29 @@ export function RecentSessionsPanel({
                 {session.fileName}
               </div>
               <div className="mt-2 flex flex-wrap items-center gap-2">
-                {session.targetLabel ? <Badge>{session.targetLabel}</Badge> : <Badge>Measure Only</Badge>}
+                {session.analysisMode === "measure-only" ? (
+                  <Badge>Measure Only</Badge>
+                ) : session.targetLabel ? (
+                  <Badge>{session.targetLabel}</Badge>
+                ) : (
+                  <Badge className="tone-warning">Targeted (legacy target unknown)</Badge>
+                )}
+                {session.provenanceKind === "unverified-import" ? (
+                  <Badge className="tone-warning">Unverified import</Badge>
+                ) : null}
+                {session.recordTrust === "legacy-unknown" ? (
+                  <Badge className="tone-warning">Legacy validity/origin unknown</Badge>
+                ) : null}
                 {session.complianceLabel ? (
                   <Badge className="border-[var(--line)] bg-[var(--surface-0)] text-[var(--muted)]">
                     {session.complianceLabel}
                   </Badge>
+                ) : null}
+                {session.integratedValid === false ? (
+                  <Badge className="tone-warning">Integrated unavailable</Badge>
+                ) : null}
+                {session.loudnessRangeUnstable === true ? (
+                  <Badge className="tone-warning">LRA unstable</Badge>
                 ) : null}
               </div>
               <div className="mt-4 grid grid-cols-2 gap-3 text-sm tabular-nums">
@@ -83,7 +105,7 @@ export function RecentSessionsPanel({
                     Integrated
                   </div>
                   <div className="mt-1 font-semibold text-[var(--ink)]">
-                    {formatLufs(session.integratedLufs)}
+                    {formatIntegratedLufs(session)}
                   </div>
                 </div>
                 <div>
@@ -143,14 +165,14 @@ export function HistoryPreferenceCard({
             Save finished readings only when you want to
           </h2>
           <p className="mt-2 max-w-2xl text-sm leading-6 text-[var(--muted)]">
-            History starts off. Turn it on if you want completed readings stored in this browser for later reference.
+            History controls the compact recent-summary list. Full completed results use a separate local recovery session until you choose Clear Session.
           </p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
           <Badge className={historyEnabled ? "tone-success" : "border-[var(--line)] bg-[var(--surface-1)] text-[var(--muted)]"}>
             {historyEnabled ? "History On" : "History Off"}
           </Badge>
-          {historyEnabled ? (
+          {recentCount > 0 ? (
             <Badge className="border-[var(--line)] bg-[var(--surface-1)] text-[var(--muted)]">
               {numberFormatter.format(recentCount)} saved
             </Badge>
@@ -163,8 +185,8 @@ export function HistoryPreferenceCard({
           <History className="h-4 w-4" />
           {historyEnabled ? "Turn History Off" : "Turn History On"}
         </Button>
-        {historyEnabled ? (
-          <Button type="button" size="sm" variant="ghost" onClick={onClear} disabled={!recentCount}>
+        {recentCount > 0 ? (
+          <Button type="button" size="sm" variant="ghost" onClick={onClear}>
             <Trash2 className="h-4 w-4" />
             Clear Saved History
           </Button>
@@ -173,8 +195,10 @@ export function HistoryPreferenceCard({
 
       <div className="mt-4 rounded-[20px] border border-[var(--line)] bg-[var(--surface-1)] px-4 py-3 text-sm leading-6 text-[var(--muted)]">
         {historyEnabled
-          ? "New completed runs will be saved as local summaries on this device. They stay available in the History panel until you clear them."
-          : "Completed files stay in the current session only. Nothing is saved locally unless you turn history on."}
+          ? "New completed runs are also saved as compact local summaries. Clear Saved History removes those summaries; Clear Session removes the full recovery results."
+          : recentCount > 0
+            ? "Recent-summary history is off, so no new summaries are added. Existing saved summaries remain until you use Clear Saved History. Full completed results may also remain in recovery storage until you use Clear Session."
+            : "Recent-summary history is off. Full completed results may still be stored locally for crash/reload recovery until you use Clear Session."}
       </div>
     </Card>
   );

@@ -2,9 +2,9 @@
 
 import { memo } from "react";
 import { RefreshCcw, Square, Trash2 } from "lucide-react";
-import { getComplianceSummary } from "@/audio/compliance";
-import { formatDb, formatDuration, formatLufs, formatPeakDbtp, formatRelativeDb } from "@/lib/format";
-import { getJobErrorDisplay } from "@/lib/job-ui";
+import { getComplianceSummary, type ComplianceSummary } from "@/audio/compliance";
+import { formatDuration, formatIntegratedLufs, formatLoudnessRange, formatPeakDbtp, formatRelativeDb } from "@/lib/format";
+import { getJobErrorDisplay, type JobErrorDisplay } from "@/lib/job-ui";
 import { isActiveJob, isIssueJob } from "@/lib/session-selectors";
 import { complianceToneClass, statusToneClass } from "@/lib/status-tone";
 import { cn } from "@/lib/utils";
@@ -33,6 +33,85 @@ interface SimpleResultsTableProps {
   onRetryJob: (jobId: string) => void;
 }
 
+interface JobBadgeDescriptor {
+  key: string;
+  label: string;
+  className?: string;
+}
+
+interface JobRowModel {
+  compliance: ComplianceSummary | null;
+  errorDisplay: JobErrorDisplay | null;
+  isActive: boolean;
+  isIssue: boolean;
+  badges: JobBadgeDescriptor[];
+  integratedDisplay: string;
+  truePeakDisplay: string;
+  gainDisplay: string;
+  durationDisplay: string;
+  loudnessRangeDisplay: string;
+}
+
+// Single source of truth for a row's derived status/labels, shared by the
+// mobile card and the desktop table row (UX-031). Without this, the two
+// presentations independently re-derive the same job state and can drift -
+// which is exactly how the Integrated column ended up saying "Waiting" for
+// a job that had already terminally failed (UX-015).
+function buildJobRowModel(job: AnalysisJob, analysisMode: AnalysisMode): JobRowModel {
+  const compliance = job.result ? getComplianceSummary(job.result) : null;
+  const errorDisplay = getJobErrorDisplay(job.error);
+  const isActive = isActiveJob(job);
+  const isIssue = isIssueJob(job);
+
+  const badges: JobBadgeDescriptor[] = [
+    { key: "status", label: job.status, className: statusToneClass(job.status) },
+  ];
+  if (job.imported) {
+    badges.push({ key: "imported", label: "Unverified import", className: "tone-warning" });
+  }
+  if (job.restored) {
+    badges.push({
+      key: "restored",
+      label: "Restored",
+      className: "border-[var(--line)] bg-[var(--surface-0)] text-[var(--muted)]",
+    });
+  }
+  if (job.result?.metrics.integratedValid === false) {
+    badges.push({ key: "integrated-unavailable", label: "Integrated unavailable", className: "tone-warning" });
+  }
+  if (compliance) {
+    badges.push({ key: "compliance", label: compliance.label, className: complianceToneClass(compliance.state) });
+  }
+  if (job.result?.target) {
+    badges.push({ key: "target", label: job.result.target.label });
+  }
+  if (analysisMode === "measure-only" && job.result) {
+    badges.push({ key: "measure-only", label: "Measure Only" });
+  }
+
+  // Reserve "Waiting" for work that is actually still queued/active. A
+  // terminal failure or cancellation has no measurement coming - saying
+  // "Waiting" there misrepresents a dead end as pending work.
+  const integratedDisplay = job.result
+    ? formatIntegratedLufs(job.result.metrics)
+    : isIssue
+      ? job.status === "failed" ? "Failed" : "Unavailable"
+      : "Waiting";
+
+  return {
+    compliance,
+    errorDisplay,
+    isActive,
+    isIssue,
+    badges,
+    integratedDisplay,
+    truePeakDisplay: job.result ? formatPeakDbtp(job.result.metrics.truePeakDbtp) : "n/a",
+    gainDisplay: job.result ? formatRelativeDb(job.result.metrics.targetDeltaDb) : "n/a",
+    durationDisplay: job.result ? formatDuration(job.result.metadata.durationSeconds) : "n/a",
+    loudnessRangeDisplay: job.result ? formatLoudnessRange(job.result.metrics) : "n/a",
+  };
+}
+
 // Rows are memoized individually: the jobs array gets a new identity on every
 // progress tick, but updateJob keeps untouched job objects identical, so rows
 // whose job did not change bail out instead of re-rendering the whole list
@@ -47,8 +126,7 @@ const SimpleQueueCard = memo(function SimpleQueueCard({
   onRemoveJob,
   onRetryJob,
 }: SimpleRowProps) {
-  const compliance = job.result ? getComplianceSummary(job.result) : null;
-  const errorDisplay = getJobErrorDisplay(job.error);
+  const model = buildJobRowModel(job, analysisMode);
 
   return (
     <article
@@ -61,13 +139,17 @@ const SimpleQueueCard = memo(function SimpleQueueCard({
       data-selected={selected}
       aria-current={selected ? "true" : undefined}
     >
-      {/* Only the file name is a button. Keeping the card's data outside
-          of it matters for screen readers: a button's aria-label hides
-          every descendant, so badges, metrics, and errors rendered
-          inside would be unreachable. */}
+      {/* The file name is the card's one row-navigation affordance (UX-028):
+          it doubles as the "Inspect" action, so the actions row below only
+          carries Retry/Cancel/Remove instead of repeating an equivalent
+          Inspect button. Keeping the card's data outside of it also matters
+          for screen readers: a button's aria-label hides every descendant,
+          so badges, metrics, and errors rendered inside would be
+          unreachable. */}
       <button
         type="button"
         data-queue-nav="true"
+        data-job-id={job.id}
         onClick={() => onOpenJob(job.id)}
         className="w-full rounded-[18px] text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)]"
         aria-label={`Inspect ${job.fileName}`}
@@ -77,42 +159,33 @@ const SimpleQueueCard = memo(function SimpleQueueCard({
         </div>
       </button>
       <div className="mt-3 flex flex-wrap gap-2">
-        <Badge className={statusToneClass(job.status)}>{job.status}</Badge>
-        {job.imported ? <Badge className="border-[var(--line)] bg-[var(--surface-0)] text-[var(--muted)]">Imported</Badge> : null}
-        {job.restored ? <Badge className="border-[var(--line)] bg-[var(--surface-0)] text-[var(--muted)]">Restored</Badge> : null}
-        {compliance ? <Badge className={complianceToneClass(compliance.state)}>{compliance.label}</Badge> : null}
-        {job.result?.target ? <Badge>{job.result.target.label}</Badge> : null}
-        {analysisMode === "measure-only" && job.result ? <Badge>Measure Only</Badge> : null}
+        {model.badges.map((badge) => (
+          <Badge key={badge.key} className={badge.className}>
+            {badge.label}
+          </Badge>
+        ))}
       </div>
       <div className="mt-4 grid grid-cols-2 gap-3">
         <div>
           <div className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">Integrated</div>
-          <div className="mt-1 font-semibold tabular-nums text-[var(--ink)]">
-            {job.result ? formatLufs(job.result.metrics.integratedLufs) : "Waiting"}
-          </div>
+          <div className="mt-1 font-semibold tabular-nums text-[var(--ink)]">{model.integratedDisplay}</div>
         </div>
         <div>
           <div className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">True peak</div>
-          <div className="mt-1 font-semibold tabular-nums text-[var(--ink)]">
-            {job.result ? formatPeakDbtp(job.result.metrics.truePeakDbtp) : "n/a"}
-          </div>
+          <div className="mt-1 font-semibold tabular-nums text-[var(--ink)]">{model.truePeakDisplay}</div>
         </div>
         {analysisMode === "targeted" ? (
           <div>
             <div className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">Gain</div>
-            <div className="mt-1 font-semibold tabular-nums text-[var(--ink)]">
-              {job.result ? formatRelativeDb(job.result.metrics.targetDeltaDb) : "n/a"}
-            </div>
+            <div className="mt-1 font-semibold tabular-nums text-[var(--ink)]">{model.gainDisplay}</div>
           </div>
         ) : null}
         <div>
           <div className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">Duration</div>
-          <div className="mt-1 font-semibold tabular-nums text-[var(--ink)]">
-            {job.result ? formatDuration(job.result.metadata.durationSeconds) : "n/a"}
-          </div>
+          <div className="mt-1 font-semibold tabular-nums text-[var(--ink)]">{model.durationDisplay}</div>
         </div>
       </div>
-      {isActiveJob(job) ? (
+      {model.isActive ? (
         <div className="mt-4 space-y-2">
           <div className="flex items-center justify-between gap-3 text-xs text-[var(--muted)]">
             <span>{job.progressLabel}</span>
@@ -121,27 +194,27 @@ const SimpleQueueCard = memo(function SimpleQueueCard({
           <Progress value={job.progressPercent * 100} label={`${job.fileName}: ${job.progressLabel}`} />
         </div>
       ) : null}
-      {errorDisplay ? (
+      {model.errorDisplay ? (
         <div className="mt-3 text-xs leading-5 text-[var(--danger)]">
-          {errorDisplay.summary}
+          {model.errorDisplay.summary}
         </div>
       ) : null}
       <div className="mt-4 flex flex-wrap gap-2 border-t border-[var(--line)]/70 pt-4">
-        <Button type="button" size="sm" variant={selected ? "primary" : "secondary"} onClick={() => onOpenJob(job.id)} aria-label={`Inspect ${job.fileName}`}>
-          Inspect
-        </Button>
-        {isIssueJob(job) ? (
+        {model.isIssue ? (
           <Button type="button" size="sm" variant="secondary" onClick={() => onRetryJob(job.id)} aria-label={`Retry ${job.fileName}`}>
             <RefreshCcw className="h-4 w-4" aria-hidden="true" />
+            Retry
           </Button>
         ) : null}
-        {isActiveJob(job) ? (
+        {model.isActive ? (
           <Button type="button" size="sm" variant="ghost" onClick={() => onCancelJob(job.id)} aria-label={`Cancel ${job.fileName}`}>
             <Square className="h-4 w-4" aria-hidden="true" />
+            Cancel
           </Button>
         ) : null}
         <Button type="button" size="sm" variant="ghost" onClick={() => onRemoveJob(job.id)} aria-label={`Remove ${job.fileName}`}>
           <Trash2 className="h-4 w-4" aria-hidden="true" />
+          Remove
         </Button>
       </div>
     </article>
@@ -157,8 +230,7 @@ const SimpleQueueRow = memo(function SimpleQueueRow({
   onRemoveJob,
   onRetryJob,
 }: SimpleRowProps) {
-  const compliance = job.result ? getComplianceSummary(job.result) : null;
-  const errorDisplay = getJobErrorDisplay(job.error);
+  const model = buildJobRowModel(job, analysisMode);
 
   return (
     <tr
@@ -173,13 +245,17 @@ const SimpleQueueRow = memo(function SimpleQueueRow({
         <div className="flex gap-3">
           <div className={cn("mt-1 h-auto min-h-[54px] w-1.5 rounded-full transition-[background-color] duration-200 ease-out", selected ? "bg-[var(--accent)]" : "bg-transparent")} />
           <div className="min-w-0 flex-1">
-            {/* The button holds only the file name. Badges, progress,
-                and the failure disclosure are siblings: a <details>
-                inside a <button> is invalid HTML, and expanding it
-                also used to bubble into row navigation. */}
+            {/* The file name is this row's one row-navigation affordance
+                (UX-028): it doubles as "Inspect", so the actions cell only
+                repeats Retry/Cancel/Remove instead of an equivalent Inspect
+                button. Badges, progress, and the failure disclosure are
+                siblings of the button rather than children: a <details>
+                inside a <button> is invalid HTML, and expanding it also
+                used to bubble into row navigation. */}
             <button
               type="button"
               data-queue-nav="true"
+              data-job-id={job.id}
               onClick={() => onOpenJob(job.id)}
               className="w-full rounded-[10px] text-left transition-[color] duration-200 ease-out focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)]"
               aria-label={`Inspect ${job.fileName}`}
@@ -189,14 +265,13 @@ const SimpleQueueRow = memo(function SimpleQueueRow({
               </div>
             </button>
             <div className="mt-2 flex flex-wrap gap-2">
-              <Badge className={statusToneClass(job.status)}>{job.status}</Badge>
-              {job.imported ? <Badge className="border-[var(--line)] bg-[var(--surface-0)] text-[var(--muted)]">Imported</Badge> : null}
-              {job.restored ? <Badge className="border-[var(--line)] bg-[var(--surface-0)] text-[var(--muted)]">Restored</Badge> : null}
-              {compliance ? <Badge className={complianceToneClass(compliance.state)}>{compliance.label}</Badge> : null}
-              {job.result?.target ? <Badge>{job.result.target.label}</Badge> : null}
-              {analysisMode === "measure-only" && job.result ? <Badge>Measure Only</Badge> : null}
+              {model.badges.map((badge) => (
+                <Badge key={badge.key} className={badge.className}>
+                  {badge.label}
+                </Badge>
+              ))}
             </div>
-            {isActiveJob(job) ? (
+            {model.isActive ? (
               <div className="mt-3 space-y-2">
                 <div className="flex items-center justify-between gap-3 text-xs text-[var(--muted)]">
                   <span>{job.progressLabel}</span>
@@ -205,15 +280,15 @@ const SimpleQueueRow = memo(function SimpleQueueRow({
                 <Progress value={job.progressPercent * 100} label={`${job.fileName}: ${job.progressLabel}`} />
               </div>
             ) : null}
-            {errorDisplay ? (
+            {model.errorDisplay ? (
               <div className="mt-3 text-xs leading-5 text-[var(--danger)]">
-                {errorDisplay.summary}
-                {errorDisplay.detail ? (
+                {model.errorDisplay.summary}
+                {model.errorDisplay.detail ? (
                   <details className="mt-2 rounded-[16px] border border-[color:var(--danger)]/20 bg-[color:var(--danger)]/10 px-3 py-2 text-[11px] leading-5 text-[var(--ink)]/85">
                     <summary className="cursor-pointer font-semibold uppercase tracking-[0.14em] text-[var(--danger)]">
                       Why it failed
                     </summary>
-                    <p className="mt-2 normal-case tracking-normal text-[var(--ink)]/75">{errorDisplay.detail}</p>
+                    <p className="mt-2 normal-case tracking-normal text-[var(--ink)]/75">{model.errorDisplay.detail}</p>
                   </details>
                 ) : null}
               </div>
@@ -222,30 +297,27 @@ const SimpleQueueRow = memo(function SimpleQueueRow({
         </div>
       </td>
       <td className="px-4 py-4 align-top whitespace-nowrap text-base font-semibold tabular-nums text-[var(--ink)]">
-        {job.result ? formatLufs(job.result.metrics.integratedLufs) : "Waiting"}
+        {model.integratedDisplay}
       </td>
       {analysisMode === "targeted" ? (
         <td className="hidden px-4 py-4 align-top whitespace-nowrap font-semibold tabular-nums text-[var(--ink)] lg:table-cell">
-          {job.result ? formatRelativeDb(job.result.metrics.targetDeltaDb) : "n/a"}
+          {model.gainDisplay}
         </td>
       ) : null}
       <td className="px-4 py-4 align-top whitespace-nowrap font-semibold tabular-nums text-[var(--ink)]">
-        {job.result ? formatPeakDbtp(job.result.metrics.truePeakDbtp) : "n/a"}
+        {model.truePeakDisplay}
       </td>
       <td className="hidden px-4 py-4 align-top whitespace-nowrap font-semibold tabular-nums text-[var(--ink)] xl:table-cell">
-        {job.result ? formatDb(job.result.metrics.loudnessRange, "LU") : "n/a"}
+        {model.loudnessRangeDisplay}
       </td>
       <td className="px-5 py-4 align-top">
         <div className="flex flex-wrap justify-end gap-1.5">
-          <Button type="button" size="sm" variant={selected ? "primary" : "secondary"} onClick={() => onOpenJob(job.id)} aria-label={`Inspect ${job.fileName}`}>
-            Inspect
-          </Button>
-          {isIssueJob(job) ? (
+          {model.isIssue ? (
             <Button type="button" size="sm" variant="secondary" onClick={() => onRetryJob(job.id)} aria-label={`Retry ${job.fileName}`}>
               <RefreshCcw className="h-4 w-4" aria-hidden="true" />
             </Button>
           ) : null}
-          {isActiveJob(job) ? (
+          {model.isActive ? (
             <Button type="button" size="sm" variant="ghost" onClick={() => onCancelJob(job.id)} aria-label={`Cancel ${job.fileName}`}>
               <Square className="h-4 w-4" aria-hidden="true" />
             </Button>
@@ -286,6 +358,10 @@ export const SimpleResultsTable = memo(function SimpleResultsTable({
       </div>
       <div className="hidden overflow-x-auto md:block">
         <table className="w-full min-w-[640px] table-fixed text-sm lg:min-w-[760px] xl:min-w-[860px]">
+          <caption className="sr-only">
+            Analysis results for {jobs.length} file{jobs.length === 1 ? "" : "s"} in this session,{" "}
+            {analysisMode === "targeted" ? "showing target compliance and gain" : "in measure-only mode"}.
+          </caption>
           <colgroup>
             <col className="w-[48%]" />
             <col className="w-[15%]" />
@@ -294,18 +370,24 @@ export const SimpleResultsTable = memo(function SimpleResultsTable({
             <col className="hidden xl:table-column xl:w-[10%]" />
             <col className="w-[14%]" />
           </colgroup>
+          {/* Sticky offset is a shared CSS variable (UX-012): the global
+              toolbar above this table is itself sticky, and a bare `top-0`
+              header slides underneath it once both are pinned. The toolbar
+              owner is responsible for setting --sticky-toolbar-offset to
+              its rendered height (including when it wraps to more than one
+              row); this table only needs to respect it. */}
           <thead>
             <tr className="border-b border-[var(--line)] text-left text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">
-              <th scope="col" className="sticky top-0 bg-[var(--surface-1)]/96 px-5 py-4 backdrop-blur">File</th>
-              <th scope="col" className="sticky top-0 bg-[var(--surface-1)]/96 px-4 py-4 backdrop-blur">Integrated</th>
+              <th scope="col" className="sticky top-[var(--sticky-toolbar-offset,0px)] bg-[var(--surface-1)]/96 px-5 py-4 backdrop-blur">File</th>
+              <th scope="col" className="sticky top-[var(--sticky-toolbar-offset,0px)] bg-[var(--surface-1)]/96 px-4 py-4 backdrop-blur">Integrated</th>
               {analysisMode === "targeted" ? (
-                <th scope="col" className="sticky top-0 hidden bg-[var(--surface-1)]/96 px-4 py-4 backdrop-blur lg:table-cell">
+                <th scope="col" className="sticky top-[var(--sticky-toolbar-offset,0px)] hidden bg-[var(--surface-1)]/96 px-4 py-4 backdrop-blur lg:table-cell">
                   Gain
                 </th>
               ) : null}
-              <th scope="col" className="sticky top-0 bg-[var(--surface-1)]/96 px-4 py-4 backdrop-blur">True peak</th>
-              <th scope="col" className="sticky top-0 hidden bg-[var(--surface-1)]/96 px-4 py-4 backdrop-blur xl:table-cell">LRA</th>
-              <th scope="col" className="sticky top-0 px-5 py-4 backdrop-blur bg-[var(--surface-1)]/96">Actions</th>
+              <th scope="col" className="sticky top-[var(--sticky-toolbar-offset,0px)] bg-[var(--surface-1)]/96 px-4 py-4 backdrop-blur">True peak</th>
+              <th scope="col" className="sticky top-[var(--sticky-toolbar-offset,0px)] hidden bg-[var(--surface-1)]/96 px-4 py-4 backdrop-blur xl:table-cell">LRA</th>
+              <th scope="col" className="sticky top-[var(--sticky-toolbar-offset,0px)] px-5 py-4 backdrop-blur bg-[var(--surface-1)]/96">Actions</th>
             </tr>
           </thead>
           <tbody>

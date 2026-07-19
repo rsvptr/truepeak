@@ -1,7 +1,7 @@
 <div align="center">
   <img src="./public/logo.png" alt="TruePeak logo" width="120" />
   <h1>TruePeak</h1>
-  <p>A loudness and true peak review tool that runs entirely in your browser. Load your audio, read the numbers, compare a batch, and export the results. Nothing is uploaded anywhere.</p>
+  <p>A loudness and true peak review tool that analyzes audio in your browser. Load your audio, read the numbers, compare a batch, and export the results. TruePeak has no audio-upload path.</p>
 
   <p>
     <a href="https://true-peak.vercel.app/">
@@ -23,7 +23,7 @@
 >
 > TruePeak is a review tool, not a certified broadcast compliance meter. WAV and AIFF are read directly. Compressed formats are decoded by the browser or by a local copy of ffmpeg.wasm, and codec behaviour can vary a little between browsers. Use it to check your work, not to sign off a broadcast deliverable.
 
-TruePeak keeps the whole loudness review in one place. Instead of jumping between a meter, a normalization calculator, a file inspector, and a comparison sheet, you get the batch queue, per file detail, timeline charts, target checks, and exports in the same screen. The measurements follow ITU-R BS.1770 and EBU R128.
+TruePeak keeps the whole loudness review in one place. Instead of jumping between a meter, a normalization calculator, a file inspector, and a comparison sheet, you get the batch queue, per file detail, timeline charts, target checks, and exports in the same screen. The measurement engine implements ITU-R BS.1770/EBU R128-oriented loudness and true-peak processing and is checked against a documented subset of published EBU reference cases.
 
 **Live app:** [true-peak.vercel.app](https://true-peak.vercel.app/)
 
@@ -92,11 +92,11 @@ Light and dark themes are both supported. The choice is stored in a cookie and r
 
 Three related things, with different jobs.
 
-**Live session restore** is automatic. Completed results are mirrored into this browser's IndexedDB as they finish, so a hard refresh or an accidental tab close no longer loses a finished batch. The results come back with a Restored badge in a view only state, because the source audio cannot survive a reload, and they cannot be analyzed again. They do pick up whatever target and analysis mode are active when they return, so a preset you switched to before the refresh is still applied after it. Removing files or clearing the session removes the stored copies too. Nothing leaves your machine.
+**Live session restore** is automatic when IndexedDB is available. Completed results are mirrored into this browser as they finish. Saves, retries, deletes, and Clear Session are serialized; the app reports a persistent warning if the browser blocks storage or a transaction cannot be committed. Restored results are view only because the source audio does not survive a reload. The current target, analysis mode, custom target fields, and decoder preference are restored before results are reconciled. If those settings cannot be committed to localStorage, the app keeps a persistent warning and stops adding new results to recovery so a reload cannot silently combine them with stale settings. Removing a file still updates its existing recovery copy, and Clear Session reports success only after deletion commits.
 
-**Local history** is off by default. Turn it on and finished readings are saved as small summary cards in this browser only. It keeps the most recent 20. It is a quick recall list, not a full session restore, and it never leaves your machine.
+**Local history** is off by default. Turn it on and finished readings are saved as small summary cards in this browser only. It keeps the most recent 20. Turning history off stops new summaries but does not delete existing ones; the count and clear control remain available. Migrated legacy summaries are marked when their original validity/provenance contract is unknown. It is a quick recall list, not a full session restore, and it never leaves your machine.
 
-**Session files** let you save the current results to a `.truepeak.json` file and reopen them later, on this machine or another one. A reopened session shows the readings and the timeline charts in a view only state. The original audio is not stored in the file, so reopened files cannot be analyzed again or retried. The stored readings still follow the target that is active in your session, the same way live results do. Imported entries are marked with a badge. Import is strict: a malformed or untrusted file is rejected with a clear message.
+**Session files** let you save the current results to a versioned `.truepeak.json` file and reopen them later, on this machine or another one. The original audio is not stored, so imported entries are view only and are always labelled as unverified imports; trusted/compliance use requires re-analysis from source audio. The importer hashes the source session, assigns fresh local IDs, retains bounded lineage, validates the entire file in a worker, and rejects a malformed or inconsistent file atomically rather than loading a partial review. Oversized exports fail explicitly, and long timelines are downsampled without changing headline measurements so exported files remain portable.
 
 ## Exports
 
@@ -110,7 +110,7 @@ Session saves follow the same pattern (`truepeak-session-YYYYMMDD-HHMMSS.truepea
 
 ## Privacy
 
-Everything happens in the browser. Your files are read locally, decoded locally, and analyzed locally. No audio is uploaded, and there is no backend database or account system. Completed readings are kept on this device (in the browser's IndexedDB) so a refresh doesn't lose them; clearing the session removes them. The only thing the server does is read the theme cookie so the first paint uses the right colors.
+Audio bytes, decoded PCM, measurements, session recovery data, and optional history remain in your browser; TruePeak has no audio-upload API, account system, or server-side application database. This app does not send usage analytics unless the deployment operator has explicitly enabled them; audio and results are never included, even then. Telemetry is off by default everywhere. Vercel Analytics and Speed Insights mount only when the build runs on Vercel (`VERCEL=1`) and the operator also sets `NEXT_PUBLIC_ENABLE_TELEMETRY=1`; a default Vercel deployment with that flag unset sends nothing. The server reads the theme cookie, which also makes the public route dynamically rendered.
 
 ## Security
 
@@ -136,7 +136,7 @@ flowchart LR
     G --> K["Optional local history"]
 ```
 
-Decoding and analysis run in Web Workers so the heavy math stays off the main thread and the interface stays responsive. File bytes are read inside the worker too, so the page never holds a copy of a large file. The queue runs several files in parallel. Each active file gets its own decoder and analyzer worker pair, and the number of parallel lanes comes from your CPU and memory: up to 6 on a desktop with plenty of memory, fewer on phones and devices with less memory, and adjustable under Advanced Options on the home screen. Very large files still run one at a time so peak memory stays bounded by a single decoded file. Each file's decoded audio is released as soon as its analysis finishes, and idle workers are shut down after the queue goes quiet.
+Direct container decoding, compatibility decoding, and analysis run in Web Workers. The browser-codec route necessarily uses Web Audio on the page's main realm; cancellation becomes visible immediately, but the scheduler retains that file's lane until the browser's uninterruptible `decodeAudioData()` work has actually drained. Every route receives the same source, channel, frame, duration, decoded-byte, output-byte, and execution-time budget. Before admitting work, the queue reserves aggregate modeled route residency: browser decoding counts both the `AudioBuffer` and its planar copy, while compatibility decoding counts both float-WAV output and parsed planar PCM. Unknown-footprint media runs exclusively, capped/truncated decoder output is rejected, and messages from stale worker generations are ignored. Idle workers are shut down after the queue goes quiet.
 
 ## Tech stack
 
@@ -149,13 +149,13 @@ Decoding and analysis run in Web Workers so the heavy math stays off the main th
 | Audio decode | Browser decoder plus `@ffmpeg/ffmpeg` and `@ffmpeg/core` |
 | Workers | Web Workers for decode and analysis |
 | Icons | Lucide |
-| Analytics | Vercel Analytics and Speed Insights, only when deployed on Vercel |
+| Analytics | Vercel Analytics and Speed Insights, off by default, mounted only on Vercel with `NEXT_PUBLIC_ENABLE_TELEMETRY=1` |
 
 ## Getting started
 
 The app is hosted at [true-peak.vercel.app](https://true-peak.vercel.app/), so you can use it without installing anything. To run it locally:
 
-You need Node.js 24 or newer (the build runs on 20+, but the test scripts use Node's native TypeScript support, which needs 24) and npm.
+You need Node.js 24 or newer (`package.json` declares `engines.node >= 24`) and npm. The application build runs on Node 20+, but the test scripts use Node's native TypeScript support, which needs 24.
 
 Install dependencies:
 
@@ -186,21 +186,26 @@ A good first run: leave it in Simple mode, add a few WAV or AIFF files (drop the
 | `npm run prepare:ffmpeg` | Copy the ffmpeg assets into `public/vendor/ffmpeg` |
 | `npm test` | Run the full validation suite (see below) |
 | `npm run test:dsp` | Reference signal checks for the DSP engine |
-| `npm run test:ebu` | EBU Tech 3341 and 3342 compliance checks |
+| `npm run test:ebu` | EBU Tech 3341/3342 reference-subset checks |
 | `npm run test:session` | Session file round trip and rejection checks |
 | `npm run test:robustness` | Bad and adversarial input checks |
 | `npm run test:export` | CSV, JSON, and Markdown export checks |
+| `npm run test:presets` | Delivery preset and custom-target validation checks |
+| `npm run test:fuzz` | Seeded fuzz cases over every untrusted-input parser |
 
 ## Testing
 
-`npm test` runs 96 fixed checks plus roughly 1,360 deterministic fuzz cases across six harnesses in `scripts/dsp/`:
+`npm test` runs more than 440 fixed assertions plus 1,362 deterministic fuzz cases across seven harnesses in `scripts/dsp/`:
 
-- **DSP (15):** measures known reference signals and confirms the readings against values you can work out by hand. A 1 kHz sine at minus 6 dBFS reads about minus 6 LUFS, an inter sample peak is recovered above the sample peak, a 6 dB step gives an LRA near 6, and so on.
-- **EBU compliance (9):** runs the published test cases from EBU Tech 3341 and 3342 and confirms the meter lands inside the standard's tolerances.
-- **Session files (19):** builds a session file, reads it back, and confirms every field survives. It also confirms that malformed or untrusted files are rejected.
-- **Robustness (28):** feeds garbage to the parser and analyzer (random bytes, truncated headers, zero channels, a huge channel count, NaN samples, mismatched channels, and so on) and confirms each one fails cleanly, with a sane error or finite output, and never hangs.
-- **Export (25):** confirms the CSV escaping and formula neutralization, unique timestamped filenames, that only finished jobs are included, and that empty input is handled.
-- **Fuzz (~1,360 cases):** a seeded, reproducible fuzzer mutates valid WAV, AIFF, FLAC, and session files, feeds in raw noise as well, and runs all of it through every parser that touches untrusted bytes. Each case has to fail cleanly or produce sane output inside a time budget. The seed is fixed, so any failure reproduces exactly.
+- **DSP:** measures known reference signals, validity boundaries, channel weighting, peak/timeline invariants, repeatability, and targeting/compliance behavior.
+- **EBU reference subset:** reproduces the published EBU Tech 3341 and 3342 cases that can be synthesized from their documented parameters, and asserts the standards' own expected readings. It runs 17 of the 23 Tech 3341 cases and 4 of the 6 Tech 3342 cases. The rest (Tech 3341 cases 7, 8, and 20 to 23, and Tech 3342 cases 5 and 6) need the EBU reference-audio downloads or 4x-fs synthesis and are not reproduced. Passing this subset is not EBU certification.
+- **Session files:** exercises v2 round trips, v1 compatibility, provenance, full-file atomic rejection, cross-field invariants, aggregate timeline limits, UTF-8 size limits, and portable downsampling.
+- **Robustness:** feeds malformed parser/analyzer inputs, unsupported rates, RF64/AIFC edge cases, and hostile resource declarations through fail-closed paths.
+- **Export:** checks measurement-validity wording, provenance, CSV formula neutralization, Markdown/HTML structure escaping, selectors, and timestamped filenames.
+- **Presets:** checks the delivery presets and the custom-target flow, covering field validation, range boundaries, modified/reset state, and round trips.
+- **Fuzz (1,362 cases):** a seeded, reproducible fuzzer mutates valid WAV, AIFF, FLAC, and session files, feeds in raw noise as well, and runs all of it through every parser that touches untrusted bytes. Each case has to fail cleanly or produce sane output inside a time budget. The seed is fixed, so any failure reproduces exactly.
+
+Additional focused harnesses (`validate-live-session.mjs` and `validate-runtime.mjs`) exercise persistence races, decoded-resource budgets, cancellation draining, and bounded folder traversal; they can be run directly with Node.
 
 The scripts run the real TypeScript source directly through Node, with a small loader that maps the `@/` path alias. That is why they need Node 24.
 
@@ -215,9 +220,10 @@ The current build is live at [true-peak.vercel.app](https://true-peak.vercel.app
 Notes:
 
 - It is a normal Next.js app and needs no special configuration.
-- The only server side work is reading the theme cookie. All analysis runs in the browser.
+- The server reads the theme cookie, so `/` is dynamically rendered; all audio decoding and analysis still runs in the browser.
+- Analytics and Speed Insights are off by default. They mount only when the build runs on Vercel (`VERCEL=1`) and you also set `NEXT_PUBLIC_ENABLE_TELEMETRY=1`. A default Vercel deployment without that flag sends no telemetry.
 - `public/vendor/ffmpeg` is generated by `npm run prepare:ffmpeg`, which runs automatically on install, dev, and build, so it is not committed.
-- No database, auth, environment variables, or custom API are required.
+- No server-side database, auth, environment variables, or custom API are required; browser recovery uses IndexedDB.
 
 ## Project structure
 
@@ -254,18 +260,20 @@ truepeak/
 
 ## Working with large libraries
 
-The app handles a few hundred files and high resolution material, with a couple of things worth knowing.
+The scheduler uses decoded footprint rather than compressed file size. Container metadata is preflighted where it is trustworthy; files without a defensible pre-decode footprint run exclusively. Each decode is bounded by source bytes, decoded bytes, output bytes, channels, frames, duration, and elapsed time, and the compatibility path rejects any capped or inconsistent output instead of analyzing a truncation. The aggregate reservation is reduced on memory-constrained devices.
 
-- Several files run in parallel (up to 6 lanes on a desktop with plenty of memory, based on your CPU and memory, adjustable in Advanced Options), and each file's decoded audio is freed as soon as it finishes. Memory peaks at a few normal files in flight at once, and finished results keep only compact numbers and a small timeline, so a few hundred of them add up to only tens of megabytes.
-- Very large files are automatically run one at a time (256 MB and over on a desktop, 96 MB and over on phones and devices with less memory), with the rest of the queue held until they finish. A large high resolution file (for example a 300 MB, 24 bit, 192 kHz track) uses roughly 700 MB to 1 GB of memory for the moment it is being processed, then releases it. That is comfortable on a desktop with 8 GB of RAM or more. On a low memory device or phone it can run the tab out of memory, which loses the batch, so use a desktop for heavy work.
-- WAV and AIFF take the fast direct parser. Large compressed files (a big FLAC or M4A) go through ffmpeg.wasm, which has its own memory ceiling, so for very large high resolution files, WAV or AIFF is the safer choice.
-- A full library still takes a while, but parallel lanes cut the total time substantially on a desktop. Plan for roughly five to ten seconds per heavy high resolution file (overlapping across lanes) and less for normal songs. While a batch is running the app asks the browser to keep the screen awake (where supported) and warns before the tab closes. If you would rather not risk a long unbroken run, add the files in a few smaller batches and export each one.
+One session holds at most 1,000 jobs, and the same limit applies everywhere: intake, recovery restore, portable export, and portable import. Intake counts every job already in the session, so a run of adds can never push the total past 1,000; files beyond the remaining room are turned away and reported rather than dropped silently. An over-limit session export fails explicitly, an over-limit import is rejected rather than truncated, and recovery restores the newest 1,000 records while leaving any extra stored records in place. Recovery reads IndexedDB schema v2: the restore walks a newest-first index, and a record that fails validation is moved to a quarantine store rather than deleted. Folder drops stop during enumeration at file, entry, depth, page, and time budgets (2,000 files, 8,000 entries, depth 12, 256 pages, 5 seconds); those are a traversal safeguard, separate from the 1,000-job session limit.
+
+Parallel lanes still improve normal desktop batches, but browser codec support and memory behavior vary. On codecs without trustworthy pre-decode metadata, Web Audio can allocate its output before TruePeak can verify the result; that work is isolated to one exclusive lane, validated before copying or analysis, and drained before the lane is reused. For unusually heavy libraries, smaller batches plus regular session exports remain the safest workflow.
 
 ## Limitations
 
 - Completed results are restored automatically after a refresh (marked with a Restored badge), but files that were still queued or running are not: the browser cannot keep file handles across a reload, so unfinished work has to be added again.
 - Restored results and session files store readings and charts, not the source audio, so they cannot be analyzed again.
 - Local history keeps summary cards only, not full sessions.
+- Automatic recovery depends on browser IndexedDB. Storage failures are reported, but a downloaded session file is the portable backup.
 - Compressed format behaviour can vary slightly by browser and codec support.
+- Telemetry is off by default. Analytics and Speed Insights send visit and performance data only when the build runs on Vercel with `NEXT_PUBLIC_ENABLE_TELEMETRY=1`; audio and measurement content are never sent through those integrations.
+- The EBU harness is a reference subset, not certification. The earlier DSP and parser gaps are now handled (WAVE quad-mask weighting, 400 ms validity at odd rates such as 11,025 Hz, trailing-silence LRA, RF64 declared-size handling, and mandatory AIFC conformance). The suite stays a subset because Tech 3341 cases 7, 8, and 20 to 23, and Tech 3342 cases 5 and 6, need EBU reference-audio downloads or 4x-fs synthesis, so passing it is not a standards conformance guarantee.
 - Shipping ffmpeg.wasm locally adds some weight, in exchange for not depending on a third party runtime fetch.
-- This is a review aid. It has been validated against reference signals and the EBU test cases, but it is not a certified compliance meter.
+- This is a review aid. It has been validated against reference signals and a documented subset of EBU cases, but it is not a certified compliance meter.

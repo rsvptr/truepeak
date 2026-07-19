@@ -1,3 +1,6 @@
+import type { AnalysisMode, DecodePreference, TargetPreset } from "@/types/audio";
+import { TARGET_PRESETS } from "@/audio/presets";
+
 export type WorkspaceUiMode = "simple" | "advanced";
 export type WorkspaceTheme = "light" | "dark";
 export type ParallelLanesPreference = "auto" | "1" | "2" | "4";
@@ -8,11 +11,104 @@ const TRUEPEAK_UI_MODE_PREFERENCE_KEY = "truepeak-ui-mode";
 const LEGACY_UI_MODE_PREFERENCE_KEYS = ["lufs-ui-mode"];
 const TRUEPEAK_THEME_PREFERENCE_KEY = "truepeak-theme";
 const TRUEPEAK_PARALLEL_PREFERENCE_KEY = "truepeak-parallel-lanes";
+const TRUEPEAK_ANALYSIS_SETTINGS_KEY = "truepeak-analysis-settings";
+const ANALYSIS_SETTINGS_VERSION = 1;
 
 const historyPreferenceListeners = new Set<() => void>();
 const uiModePreferenceListeners = new Set<() => void>();
 const themePreferenceListeners = new Set<() => void>();
 const parallelPreferenceListeners = new Set<() => void>();
+const analysisSettingsListeners = new Set<() => void>();
+
+export interface WorkspaceAnalysisSettings {
+  analysisMode: AnalysisMode;
+  selectedPresetId: string;
+  customTargetLufs: string;
+  customTruePeak: string;
+  targetTolerance: string;
+  customPolicy: TargetPreset["policy"];
+  decodePreference: DecodePreference;
+}
+
+interface WorkspaceAnalysisSettingsEnvelope {
+  version: typeof ANALYSIS_SETTINGS_VERSION;
+  settings: WorkspaceAnalysisSettings;
+}
+
+function boundedSetting(value: unknown, maxLength = 64) {
+  return typeof value === "string" && value.length <= maxLength ? value : null;
+}
+
+function finiteSettingNumber(value: string) {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return null;
+  }
+  const parsed = Number(trimmed);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function normalizeAnalysisSettings(value: unknown): WorkspaceAnalysisSettings | null {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+
+  const envelope = value as Partial<WorkspaceAnalysisSettingsEnvelope>;
+  if (envelope.version !== ANALYSIS_SETTINGS_VERSION || !envelope.settings) {
+    return null;
+  }
+
+  const settings = envelope.settings as Partial<WorkspaceAnalysisSettings>;
+  const selectedPresetId = boundedSetting(settings.selectedPresetId);
+  const customTargetLufs = boundedSetting(settings.customTargetLufs);
+  const customTruePeak = boundedSetting(settings.customTruePeak);
+  const targetTolerance = boundedSetting(settings.targetTolerance);
+  if (!selectedPresetId || customTargetLufs == null || customTruePeak == null || targetTolerance == null) {
+    return null;
+  }
+
+  if (
+    selectedPresetId !== "custom" &&
+    !TARGET_PRESETS.some((preset) => preset.id === selectedPresetId)
+  ) {
+    return null;
+  }
+  const tolerance = finiteSettingNumber(targetTolerance);
+  if (tolerance == null || tolerance <= 0) {
+    return null;
+  }
+  if (
+    selectedPresetId === "custom" &&
+    (finiteSettingNumber(customTargetLufs) == null ||
+      finiteSettingNumber(customTruePeak) == null)
+  ) {
+    return null;
+  }
+
+  if (settings.analysisMode !== "targeted" && settings.analysisMode !== "measure-only") {
+    return null;
+  }
+  if (settings.customPolicy !== "protect-true-peak" && settings.customPolicy !== "loudness-first") {
+    return null;
+  }
+  if (
+    settings.decodePreference !== "auto" &&
+    settings.decodePreference !== "browser-first" &&
+    settings.decodePreference !== "compatibility-first"
+  ) {
+    return null;
+  }
+
+  return {
+    analysisMode: settings.analysisMode,
+    selectedPresetId,
+    customTargetLufs,
+    customTruePeak,
+    targetTolerance,
+    customPolicy: settings.customPolicy,
+    decodePreference: settings.decodePreference,
+  };
+}
 
 // The read functions below back useSyncExternalStore snapshots, so React calls
 // them on every render of the workbench - the hottest path in the app during a
@@ -179,6 +275,47 @@ export function writeParallelPreference(value: ParallelLanesPreference) {
 
   invalidateStorageValue(TRUEPEAK_PARALLEL_PREFERENCE_KEY);
   parallelPreferenceListeners.forEach((listener) => listener());
+}
+
+export function readAnalysisSettingsPreference(): WorkspaceAnalysisSettings | null {
+  const raw = readStorageValue(TRUEPEAK_ANALYSIS_SETTINGS_KEY, []);
+  if (!raw) {
+    return null;
+  }
+
+  try {
+    return normalizeAnalysisSettings(JSON.parse(raw));
+  } catch {
+    return null;
+  }
+}
+
+export function subscribeAnalysisSettingsPreference(listener: () => void) {
+  return subscribePreference(
+    analysisSettingsListeners,
+    [TRUEPEAK_ANALYSIS_SETTINGS_KEY],
+    listener,
+  );
+}
+
+export function writeAnalysisSettingsPreference(settings: WorkspaceAnalysisSettings) {
+  let committed = false;
+  if (typeof window !== "undefined") {
+    try {
+      const envelope: WorkspaceAnalysisSettingsEnvelope = {
+        version: ANALYSIS_SETTINGS_VERSION,
+        settings,
+      };
+      window.localStorage.setItem(TRUEPEAK_ANALYSIS_SETTINGS_KEY, JSON.stringify(envelope));
+      committed = true;
+    } catch {
+      // Analysis remains available when storage is unavailable.
+    }
+  }
+
+  invalidateStorageValue(TRUEPEAK_ANALYSIS_SETTINGS_KEY);
+  analysisSettingsListeners.forEach((listener) => listener());
+  return committed;
 }
 
 function systemTheme(): WorkspaceTheme {

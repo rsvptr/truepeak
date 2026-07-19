@@ -1,345 +1,309 @@
 "use client";
 
-import { BookOpen, ExternalLink, SlidersHorizontal, Sparkles } from "lucide-react";
-import { TARGET_PRESETS } from "@/audio/presets";
-import { formatLufs, formatPeakDbtp } from "@/lib/format";
-import { evidenceToneClass } from "@/lib/status-tone";
-import { cn } from "@/lib/utils";
-import type { TargetPreset } from "@/types/audio";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { Check, ChevronLeft } from "lucide-react";
+import { CUSTOM_PRESET_ID, TARGET_PRESETS, type TargetDraftErrors } from "@/audio/presets";
 import { DrawerPanel } from "@/components/drawer-panel";
+import { PresetDetailPane } from "@/components/preset-detail-pane";
+import { PresetListPane } from "@/components/preset-list-pane";
+import {
+  formatTargetDbtp,
+  formatTargetLufs,
+  formatToleranceLu,
+} from "@/components/preset-taxonomy";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { cn } from "@/lib/utils";
+import type { TargetPreset } from "@/types/audio";
 
-const CUSTOM_ID = "custom";
-const PRESET_CATEGORY_LABELS: Record<TargetPreset["category"], string> = {
-  platform: "Platform",
-  podcast: "Podcast",
-  broadcast: "Broadcast",
-  hifi: "HiFi",
-  custom: "Custom",
-};
+// Field errors listed in DOM/visual order so the summary and first-error focus
+// walk them the same way the eye does.
+const ERROR_FIELDS: Array<{ key: keyof TargetDraftErrors; name: string; label: string }> = [
+  { key: "customTargetLufs", name: "custom-target-lufs", label: "Loudness Target" },
+  { key: "customTruePeak", name: "custom-true-peak", label: "True Peak Limit" },
+  { key: "toleranceLufs", name: "target-tolerance", label: "Target Tolerance" },
+];
 
-// Group presets in the category order declared above (not in the order they
-// happen to appear in TARGET_PRESETS), and drop empty categories.
-const GROUPED_PRESETS = (Object.keys(PRESET_CATEGORY_LABELS) as TargetPreset["category"][])
-  .map((category) => ({
-    label: PRESET_CATEGORY_LABELS[category],
-    presets: TARGET_PRESETS.filter((preset) => preset.category === category),
-  }))
-  .filter((group) => group.presets.length > 0);
-
-function evidenceLabel(evidence: TargetPreset["evidence"]) {
-  switch (evidence) {
-    case "official":
-      return "Official";
-    case "inferred":
-      return "Inferred";
-    case "custom":
-    default:
-      return "Custom";
-  }
-}
-
+/**
+ * Props for the Preset Library drawer.
+ *
+ * The workbench owns the target state and passes a clean active-vs-draft
+ * interface (UX-004): `activeTarget` is the committed target driving verdicts,
+ * `draftTarget` is the live preview (null while invalid), and the draft flags
+ * gate Apply / Cancel / Reset so an invalid draft never silently takes effect.
+ *
+ * `initialFocusError` lets the workbench force the open-at-first-error behavior
+ * (UX-008). When omitted, the drawer still auto-focuses the first invalid field
+ * whenever it opens with a draft that already has errors.
+ */
 interface PresetLibraryDrawerProps {
   open: boolean;
   onClose: () => void;
-  currentTarget: TargetPreset;
-  fieldErrors?: TargetFieldErrors;
+  activeTarget: TargetPreset;
+  draftTarget: TargetPreset | null;
+  fieldErrors?: TargetDraftErrors;
+  draftStatusMessage: string | null;
+  draftIsValid: boolean;
+  draftIsDirty: boolean;
+  draftIsModified: boolean;
   selectedPresetId: string;
-  targetTolerance: string;
+  toleranceLufs: string;
   customTargetLufs: string;
   customTruePeak: string;
-  customPolicy: TargetPreset["policy"];
+  policy: TargetPreset["policy"];
+  initialFocusError?: boolean;
   onSelectPreset: (presetId: string) => void;
-  onTargetToleranceChange: (value: string) => void;
+  onToleranceChange: (value: string) => void;
   onCustomTargetLufsChange: (value: string) => void;
   onCustomTruePeakChange: (value: string) => void;
-  onCustomPolicyChange: (policy: TargetPreset["policy"]) => void;
-}
-
-export interface TargetFieldErrors {
-  targetTolerance?: string;
-  customTargetLufs?: string;
-  customTruePeak?: string;
+  onPolicyChange: (policy: TargetPreset["policy"]) => void;
+  onApply: () => void;
+  onCancel: () => void;
+  onResetToPublished: () => void;
 }
 
 export function PresetLibraryDrawer({
   open,
   onClose,
-  currentTarget,
+  activeTarget,
+  draftTarget,
   fieldErrors,
+  draftStatusMessage,
+  draftIsValid,
+  draftIsDirty,
+  draftIsModified,
   selectedPresetId,
-  targetTolerance,
+  toleranceLufs,
   customTargetLufs,
   customTruePeak,
-  customPolicy,
+  policy,
+  initialFocusError,
   onSelectPreset,
-  onTargetToleranceChange,
+  onToleranceChange,
   onCustomTargetLufsChange,
   onCustomTruePeakChange,
-  onCustomPolicyChange,
+  onPolicyChange,
+  onApply,
+  onCancel,
+  onResetToPublished,
 }: PresetLibraryDrawerProps) {
-  const targetToleranceError = fieldErrors?.targetTolerance;
-  const customTargetError = fieldErrors?.customTargetLufs;
-  const customTruePeakError = fieldErrors?.customTruePeak;
+  // "list" | "detail" only drives the narrow (mobile) two-step flow; at wide
+  // container widths CSS shows both panes regardless of this value.
+  const [mobileView, setMobileView] = useState<"list" | "detail">("list");
+  const [focusTick, setFocusTick] = useState(0);
+
+  const rootRef = useRef<HTMLDivElement | null>(null);
+  const listScrollRef = useRef<HTMLDivElement | null>(null);
+  const listScrollTopRef = useRef(0);
+  const pendingFocusRef = useRef<string | null>(null);
+
+  const activeErrors = ERROR_FIELDS.filter((field) => fieldErrors?.[field.key]);
+  const hasFieldErrors = activeErrors.length > 0;
+
+  // Keep the newest error/force-focus state in refs so the open effect can read
+  // it while depending only on `open` (it must fire once per open, not per edit).
+  const shouldFocusOnOpenRef = useRef(false);
+  useEffect(() => {
+    shouldFocusOnOpenRef.current = hasFieldErrors || Boolean(initialFocusError);
+  });
+
+  // First-error focus on open (UX-008). The delay clears DrawerPanel's own
+  // initial focus (it focuses Close on a 0ms timer) so the error wins.
+  useEffect(() => {
+    if (!open) {
+      return;
+    }
+    const focusFirstError = shouldFocusOnOpenRef.current;
+    setMobileView(focusFirstError ? "detail" : "list");
+    listScrollTopRef.current = 0;
+    if (!focusFirstError) {
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      const target = rootRef.current?.querySelector<HTMLElement>('[aria-invalid="true"]');
+      if (target && target.offsetParent !== null) {
+        target.focus();
+        target.scrollIntoView({ block: "center" });
+      }
+    }, 80);
+    return () => window.clearTimeout(timer);
+  }, [open]);
+
+  // Restore the preserved list scroll position when returning to it (mobile).
+  useLayoutEffect(() => {
+    if (mobileView === "list" && listScrollRef.current) {
+      listScrollRef.current.scrollTop = listScrollTopRef.current;
+    }
+  }, [mobileView]);
+
+  // Move focus to a specific field on request (error-summary links), switching
+  // to the detail step first on mobile so the field is actually visible.
+  useLayoutEffect(() => {
+    const name = pendingFocusRef.current;
+    if (!name) {
+      return;
+    }
+    const target = rootRef.current?.querySelector<HTMLElement>(`[name="${name}"]`);
+    if (target && target.offsetParent !== null) {
+      target.focus();
+      target.scrollIntoView({ block: "center" });
+      pendingFocusRef.current = null;
+    }
+  }, [focusTick]);
+
+  const requestFieldFocus = (name: string) => {
+    pendingFocusRef.current = name;
+    setMobileView("detail");
+    setFocusTick((tick) => tick + 1);
+  };
+
+  const handleSelect = (presetId: string) => {
+    // Preserve list scroll before the row navigates to detail on mobile.
+    listScrollTopRef.current = listScrollRef.current?.scrollTop ?? 0;
+    onSelectPreset(presetId);
+    setMobileView("detail");
+  };
+
+  const handleBack = () => {
+    setMobileView("list");
+  };
+
+  const selectedPreset = TARGET_PRESETS.find((preset) => preset.id === selectedPresetId);
+  const applyLabel =
+    selectedPresetId === CUSTOM_PRESET_ID ? "Custom Target" : selectedPreset?.label ?? "Preset";
+
+  const previewNote =
+    draftIsDirty && draftIsValid && !hasFieldErrors ? (
+      <p className="rounded-2xl border border-[color:var(--accent)]/25 bg-[var(--surface-0)] px-4 py-3 text-sm text-[var(--muted)]">
+        Previewing unapplied changes. Apply to use them for this session. The active target stays{" "}
+        <span className="font-semibold text-[var(--ink)]">{activeTarget.label}</span>.
+      </p>
+    ) : null;
 
   return (
     <DrawerPanel
       open={open}
       onClose={onClose}
-      title="Preset Library"
-      description="Choose a preset when you need a delivery reference. The main view stays compact until then."
+      title="Loudness Presets"
+      description="Compare published guidance, playback references, and TruePeak recommendations. Apply one to the current session."
       mobileMode="full"
-      desktopClassName="lg:w-[min(680px,94vw)]"
+      desktopClassName="lg:w-[min(960px,96vw)]"
     >
-      <div className="space-y-6">
-        <section className="rounded-[24px] border border-[color:var(--accent)]/18 bg-[color:var(--accent-soft)] px-5 py-5">
-          <div className="flex flex-wrap items-center gap-2">
-            <Badge>{currentTarget.label}</Badge>
-            <Badge className={evidenceToneClass(currentTarget.evidence)}>{evidenceLabel(currentTarget.evidence)}</Badge>
-            <Badge className="border-[var(--line)] bg-[var(--surface-0)] text-[var(--muted)]">
-              {PRESET_CATEGORY_LABELS[currentTarget.category]}
-            </Badge>
+      <div ref={rootRef} className="@container flex h-full min-h-0 flex-col overflow-hidden">
+        {/* Single compact Active Preset summary (UX-007). */}
+        <div className="shrink-0 border-b border-[var(--line)] pb-4">
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5 rounded-2xl border border-[color:var(--accent)]/20 bg-[color:var(--accent-soft)] px-4 py-2.5">
+            <span className="text-[11px] font-semibold uppercase tracking-[0.18em] text-[var(--muted)]">
+              Active
+            </span>
+            <span className="text-sm font-semibold text-[var(--ink)]">{activeTarget.label}</span>
+            <span className="text-sm tabular-nums text-[var(--muted)]">
+              {formatTargetLufs(activeTarget.loudnessTargetLufs)} ·{" "}
+              {formatTargetDbtp(activeTarget.truePeakCeilingDbtp)} ·{" "}
+              {formatToleranceLu(activeTarget.toleranceLufs)}
+            </span>
+            {draftIsDirty ? <Badge className="tone-info">Unapplied draft</Badge> : null}
           </div>
-          <p className="mt-3 max-w-3xl text-sm leading-6 text-[var(--ink)]/84">{currentTarget.description}</p>
-          <div className="mt-4 grid gap-3 sm:grid-cols-3">
-            <div className="rounded-[20px] border border-[var(--line)] bg-[var(--surface-0)] px-4 py-4">
-              <div className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">Target</div>
-              <div className="mt-2 text-xl font-semibold text-[var(--ink)]">{formatLufs(currentTarget.loudnessTargetLufs)}</div>
-            </div>
-            <div className="rounded-[20px] border border-[var(--line)] bg-[var(--surface-0)] px-4 py-4">
-              <div className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">Ceiling</div>
-              <div className="mt-2 text-xl font-semibold text-[var(--ink)]">{formatPeakDbtp(currentTarget.truePeakCeilingDbtp)}</div>
-            </div>
-            <div className="rounded-[20px] border border-[var(--line)] bg-[var(--surface-0)] px-4 py-4">
-              <div className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">Tolerance</div>
-              <div className="mt-2 text-xl font-semibold text-[var(--ink)]">±{currentTarget.toleranceLufs.toFixed(2)} LU</div>
-            </div>
+        </div>
+
+        {/* Error summary near the top (UX-008); role=alert announces the issue. */}
+        {hasFieldErrors ? (
+          <div
+            role="alert"
+            className="mt-4 shrink-0 rounded-2xl border tone-danger px-4 py-3"
+          >
+            <div className="text-sm font-semibold">Fix these settings to apply</div>
+            {draftStatusMessage ? (
+              <p className="mt-1 text-sm leading-6">{draftStatusMessage}</p>
+            ) : null}
+            <ul className="mt-2 space-y-1">
+              {activeErrors.map((field) => (
+                <li key={field.key}>
+                  <button
+                    type="button"
+                    onClick={() => requestFieldFocus(field.name)}
+                    className="text-left text-sm underline underline-offset-2 hover:no-underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--danger)]"
+                  >
+                    {field.label}: {fieldErrors?.[field.key]}
+                  </button>
+                </li>
+              ))}
+            </ul>
           </div>
-        </section>
+        ) : null}
 
-        <div className="grid gap-6 xl:grid-cols-[minmax(0,1.02fr)_minmax(250px,0.74fr)]">
-          <div className="space-y-6 min-w-0">
-            {GROUPED_PRESETS.map((group) => (
-              <section key={group.label} className="space-y-3">
-                <div className="flex items-center gap-3">
-                  <div className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">{group.label}</div>
-                  <div className="h-px flex-1 bg-[var(--line)]" />
-                </div>
-                <div className="space-y-3">
-                  {group.presets.map((preset) => {
-                    const selected = selectedPresetId === preset.id;
-                    return (
-                      <button
-                        key={preset.id}
-                        type="button"
-                        onClick={() => onSelectPreset(preset.id)}
-                        aria-pressed={selected}
-                        className={cn(
-                          "w-full rounded-[22px] border px-4 py-4 text-left transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)]",
-                          selected
-                            ? "border-[color:var(--accent)]/35 bg-[color:var(--accent-soft)]"
-                            : "border-[var(--line)] bg-[var(--surface-1)] hover:border-[color:var(--accent)]/28",
-                        )}
-                      >
-                        <div className="flex items-start justify-between gap-3">
-                          <div className="min-w-0">
-                            <div className="text-base font-semibold text-[var(--ink)]">{preset.label}</div>
-                            <div className="mt-1 text-xs leading-5 text-[var(--muted)]">{preset.sourceLabel}</div>
-                          </div>
-                          <div className="flex shrink-0 flex-wrap justify-end gap-1.5">
-                            {selected ? <Badge className="border-[color:var(--accent)]/30 bg-[color:var(--accent-soft)] text-[var(--accent)]">Selected</Badge> : null}
-                            <Badge className={evidenceToneClass(preset.evidence)}>{evidenceLabel(preset.evidence)}</Badge>
-                          </div>
-                        </div>
-                        <div className="mt-3 grid gap-3 sm:grid-cols-2">
-                          <div className="text-sm text-[var(--muted)]">
-                            <span className="font-semibold text-[var(--ink)]">{formatLufs(preset.loudnessTargetLufs)}</span>
-                            <span className="ml-2">target</span>
-                          </div>
-                          <div className="text-sm text-[var(--muted)]">
-                            <span className="font-semibold text-[var(--ink)]">{formatPeakDbtp(preset.truePeakCeilingDbtp)}</span>
-                            <span className="ml-2">ceiling</span>
-                          </div>
-                        </div>
-                        <p className="mt-3 text-sm leading-6 text-[var(--muted)]">{preset.description}</p>
-                      </button>
-                    );
-                  })}
-                </div>
-              </section>
-            ))}
-
-            <section className="space-y-3">
-              <div className="flex items-center gap-3">
-                <div className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">Custom</div>
-                <div className="h-px flex-1 bg-[var(--line)]" />
-              </div>
-              <button
-                type="button"
-                onClick={() => onSelectPreset(CUSTOM_ID)}
-                aria-pressed={selectedPresetId === CUSTOM_ID}
-                className={cn(
-                  "w-full rounded-[22px] border px-4 py-4 text-left transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)]",
-                  selectedPresetId === CUSTOM_ID
-                    ? "border-[color:var(--accent)]/35 bg-[color:var(--accent-soft)]"
-                    : "border-[var(--line)] bg-[var(--surface-1)] hover:border-[color:var(--accent)]/28",
-                )}
-              >
-                <div className="flex items-start justify-between gap-3">
-                  <div>
-                    <div className="text-base font-semibold text-[var(--ink)]">Custom preset</div>
-                    <div className="mt-1 text-xs leading-5 text-[var(--muted)]">Manual target</div>
-                  </div>
-                  <div className="flex shrink-0 flex-wrap justify-end gap-1.5">
-                    {selectedPresetId === CUSTOM_ID ? <Badge className="border-[color:var(--accent)]/30 bg-[color:var(--accent-soft)] text-[var(--accent)]">Selected</Badge> : null}
-                    <Badge className={evidenceToneClass("custom")}>Custom</Badge>
-                  </div>
-                </div>
-                <p className="mt-3 text-sm leading-6 text-[var(--muted)]">
-                  Use this when you already know the loudness target and true peak ceiling you need.
-                </p>
-              </button>
-            </section>
+        {/* Mobile-only back affordance; hidden once the master/detail layout kicks in. */}
+        {mobileView === "detail" ? (
+          <div className="mt-4 shrink-0 @[46rem]:hidden">
+            <button
+              type="button"
+              onClick={handleBack}
+              className="-ml-2 inline-flex min-h-11 items-center gap-1.5 rounded-full px-2 py-1 text-sm font-semibold text-[var(--accent)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)]"
+            >
+              <ChevronLeft className="h-4 w-4" aria-hidden="true" />
+              All presets
+            </button>
           </div>
+        ) : null}
 
-          <aside className="space-y-4 xl:sticky xl:top-0 self-start">
-            <section className="rounded-[22px] border border-[var(--line)] bg-[var(--surface-1)] p-4">
-              <div className="flex items-center gap-2 text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">
-                <Sparkles className="h-4 w-4 text-[var(--accent)]" />
-                Current preset
-              </div>
-              <h3 className="mt-3 text-lg font-semibold text-[var(--ink)]">{currentTarget.label}</h3>
-              <div className="mt-3 flex flex-wrap gap-2">
-                {currentTarget.highlights.map((highlight) => (
-                  <Badge key={highlight} className="border-[var(--line)] bg-[var(--surface-0)] text-[var(--muted)]">
-                    {highlight}
-                  </Badge>
-                ))}
-              </div>
-            </section>
+        {/* Master / detail. Container-query driven, never viewport (UX-002). */}
+        <div className="mt-4 flex min-h-0 flex-1 flex-col @[46rem]:flex-row @[46rem]:gap-5">
+          <PresetListPane
+            selectedPresetId={selectedPresetId}
+            onSelect={handleSelect}
+            scrollRef={listScrollRef}
+            className={cn(
+              "min-h-0 flex-1 @[46rem]:w-80 @[46rem]:flex-none",
+              mobileView === "detail" ? "hidden @[46rem]:block" : "block",
+            )}
+          />
+          <PresetDetailPane
+            selectedPresetId={selectedPresetId}
+            toleranceLufs={toleranceLufs}
+            customTargetLufs={customTargetLufs}
+            customTruePeak={customTruePeak}
+            policy={policy}
+            fieldErrors={fieldErrors}
+            draftIsModified={draftIsModified}
+            onToleranceChange={onToleranceChange}
+            onCustomTargetLufsChange={onCustomTargetLufsChange}
+            onCustomTruePeakChange={onCustomTruePeakChange}
+            onPolicyChange={onPolicyChange}
+            onResetToPublished={onResetToPublished}
+            className={cn(
+              "min-h-0 flex-1",
+              mobileView === "list" ? "hidden @[46rem]:block" : "block",
+            )}
+          />
+        </div>
 
-            <section className="rounded-[22px] border border-[var(--line)] bg-[var(--surface-1)] p-4">
-              <div className="flex items-center gap-2 text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">
-                <BookOpen className="h-4 w-4 text-[var(--accent)]" />
-                Reference note
-              </div>
-              <div className="mt-3 text-sm leading-6 text-[var(--muted)]">{currentTarget.referenceNote}</div>
-              {currentTarget.referenceUrl ? (
-                <a
-                  href={currentTarget.referenceUrl}
-                  target="_blank"
-                  rel="noreferrer"
-                  className="mt-4 inline-flex items-center gap-2 rounded-full border border-[var(--line)] bg-[var(--surface-0)] px-4 py-2 text-sm font-semibold text-[var(--ink)] transition hover:border-[var(--accent)] hover:text-[var(--accent)]"
-                >
-                  Open Reference
-                  <ExternalLink className="h-4 w-4" />
-                </a>
-              ) : null}
-            </section>
+        {/* Polite status region for the valid-but-unapplied preview (UX-004). */}
+        <div aria-live="polite" className="shrink-0 empty:hidden">
+          {previewNote ? <div className="mt-4">{previewNote}</div> : null}
+        </div>
 
-            <section className="rounded-[22px] border border-[var(--line)] bg-[var(--surface-1)] p-4">
-              <div className="flex items-center gap-2 text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">
-                <SlidersHorizontal className="h-4 w-4 text-[var(--accent)]" />
-                Session settings
-              </div>
-              <label className="mt-4 block text-sm text-[var(--muted)]">
-                <span className="mb-2 block text-[11px] uppercase tracking-[0.18em]">Tolerance</span>
-                <input
-                  aria-label="Tolerance window in LU"
-                  aria-describedby={targetToleranceError ? "target-tolerance-error" : undefined}
-                  aria-invalid={!!targetToleranceError}
-                  value={targetTolerance}
-                  onChange={(event) => onTargetToleranceChange(event.target.value)}
-                  type="number"
-                  step="0.1"
-                  min="0.1"
-                  className={cn(
-                    "w-full rounded-2xl border bg-[var(--surface-0)] px-4 py-3 text-[var(--ink)] outline-none transition focus:border-[var(--accent)]",
-                    targetToleranceError ? "border-[var(--danger)]" : "border-[var(--line)]",
-                  )}
-                />
-                {targetToleranceError ? (
-                  <span id="target-tolerance-error" className="mt-2 block text-xs leading-5 text-[var(--danger)]">
-                    {targetToleranceError}
-                  </span>
-                ) : null}
-              </label>
-              {selectedPresetId === CUSTOM_ID ? (
-                <div className="mt-4 space-y-4 rounded-[20px] border border-[var(--line)] bg-[var(--surface-0)] p-4">
-                  <label className="block text-sm text-[var(--muted)]">
-                    <span className="mb-2 block text-[11px] uppercase tracking-[0.18em]">Target loudness</span>
-                    <input
-                      aria-label="Custom target loudness in LUFS"
-                      aria-describedby={customTargetError ? "custom-target-lufs-error" : undefined}
-                      aria-invalid={!!customTargetError}
-                      value={customTargetLufs}
-                      onChange={(event) => onCustomTargetLufsChange(event.target.value)}
-                      type="number"
-                      step="0.1"
-                      className={cn(
-                        "w-full rounded-2xl border bg-[var(--surface-1)] px-4 py-3 text-[var(--ink)] outline-none transition focus:border-[var(--accent)]",
-                        customTargetError ? "border-[var(--danger)]" : "border-[var(--line)]",
-                      )}
-                    />
-                    {customTargetError ? (
-                      <span id="custom-target-lufs-error" className="mt-2 block text-xs leading-5 text-[var(--danger)]">
-                        {customTargetError}
-                      </span>
-                    ) : null}
-                  </label>
-                  <label className="block text-sm text-[var(--muted)]">
-                    <span className="mb-2 block text-[11px] uppercase tracking-[0.18em]">True-peak ceiling</span>
-                    <input
-                      aria-label="Custom true peak ceiling in dBTP"
-                      aria-describedby={customTruePeakError ? "custom-true-peak-error" : undefined}
-                      aria-invalid={!!customTruePeakError}
-                      value={customTruePeak}
-                      onChange={(event) => onCustomTruePeakChange(event.target.value)}
-                      type="number"
-                      step="0.1"
-                      className={cn(
-                        "w-full rounded-2xl border bg-[var(--surface-1)] px-4 py-3 text-[var(--ink)] outline-none transition focus:border-[var(--accent)]",
-                        customTruePeakError ? "border-[var(--danger)]" : "border-[var(--line)]",
-                      )}
-                    />
-                    {customTruePeakError ? (
-                      <span id="custom-true-peak-error" className="mt-2 block text-xs leading-5 text-[var(--danger)]">
-                        {customTruePeakError}
-                      </span>
-                    ) : null}
-                  </label>
-                  <div className="grid gap-2 sm:grid-cols-2">
-                    <Button type="button" size="sm" variant={customPolicy === "protect-true-peak" ? "primary" : "secondary"} aria-pressed={customPolicy === "protect-true-peak"} onClick={() => onCustomPolicyChange("protect-true-peak")}>
-                      Protect ceiling
-                    </Button>
-                    <Button type="button" size="sm" variant={customPolicy === "loudness-first" ? "primary" : "secondary"} aria-pressed={customPolicy === "loudness-first"} onClick={() => onCustomPolicyChange("loudness-first")}>
-                      Hit target
-                    </Button>
-                  </div>
-                </div>
-              ) : null}
-            </section>
-          </aside>
+        {/* Sticky action footer with safe-area padding (UX redesign). */}
+        <div className="mt-4 flex shrink-0 items-center gap-2 border-t border-[var(--line)] pt-4 pb-[max(0px,env(safe-area-inset-bottom))] @[30rem]:justify-end">
+          <Button
+            type="button"
+            variant="secondary"
+            onClick={onCancel}
+            disabled={!draftIsDirty}
+            className="flex-1 @[30rem]:flex-none"
+          >
+            Cancel
+          </Button>
+          <Button
+            type="button"
+            onClick={onApply}
+            disabled={!draftIsDirty || !draftIsValid}
+            className="flex-1 @[30rem]:flex-none"
+          >
+            <Check className="h-4 w-4" aria-hidden="true" />
+            Apply {applyLabel}
+          </Button>
         </div>
       </div>
     </DrawerPanel>
   );
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

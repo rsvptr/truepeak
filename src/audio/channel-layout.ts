@@ -1,23 +1,50 @@
 import type { ChannelLabel, ChannelLayout } from "@/types/audio";
 
+// WAVE speaker-position mask bits (Microsoft WAVEFORMATEXTENSIBLE dwChannelMask).
+// Kept in ascending bit order — that is the order channels are interleaved in the
+// stream, so filtering this table by set bits reproduces the channel order.
+const SPEAKER_FRONT_LEFT = 0x1;
+const SPEAKER_FRONT_RIGHT = 0x2;
+const SPEAKER_FRONT_CENTER = 0x4;
+const SPEAKER_LOW_FREQUENCY = 0x8;
+const SPEAKER_BACK_LEFT = 0x10;
+const SPEAKER_BACK_RIGHT = 0x20;
+const SPEAKER_FRONT_LEFT_OF_CENTER = 0x40;
+const SPEAKER_FRONT_RIGHT_OF_CENTER = 0x80;
+const SPEAKER_BACK_CENTER = 0x100;
+const SPEAKER_SIDE_LEFT = 0x200;
+const SPEAKER_SIDE_RIGHT = 0x400;
+const SPEAKER_TOP_CENTER = 0x800;
+const SPEAKER_TOP_FRONT_LEFT = 0x1000;
+const SPEAKER_TOP_FRONT_CENTER = 0x2000;
+const SPEAKER_TOP_FRONT_RIGHT = 0x4000;
+const SPEAKER_TOP_BACK_LEFT = 0x8000;
+const SPEAKER_TOP_BACK_CENTER = 0x10000;
+const SPEAKER_TOP_BACK_RIGHT = 0x20000;
+
+// Default label per bit. BACK_LEFT/BACK_RIGHT default to true rears (Lb/Rb); they
+// are re-interpreted as ~110 degree surrounds (Ls/Rs) only in the ITU 5.1-style
+// case (a front-centre present and no dedicated side channels) — see
+// resolveMaskLabel, backBitsAreSurroundChannels, and deriveChannelLayout.
 const SPEAKER_MASK_BITS: Array<[number, ChannelLabel]> = [
-  [0x1, "L"],
-  [0x2, "R"],
-  [0x4, "C"],
-  [0x8, "LFE"],
-  [0x10, "Lb"],
-  [0x20, "Rb"],
-  [0x40, "Lc"],
-  [0x80, "Rc"],
-  [0x100, "Cs"],
-  [0x200, "Ls"],
-  [0x400, "Rs"],
-  [0x1000, "Tfl"],
-  [0x2000, "Tfc"],
-  [0x4000, "Tfr"],
-  [0x8000, "Tbl"],
-  [0x10000, "Tbc"],
-  [0x20000, "Tbr"],
+  [SPEAKER_FRONT_LEFT, "L"],
+  [SPEAKER_FRONT_RIGHT, "R"],
+  [SPEAKER_FRONT_CENTER, "C"],
+  [SPEAKER_LOW_FREQUENCY, "LFE"],
+  [SPEAKER_BACK_LEFT, "Lb"],
+  [SPEAKER_BACK_RIGHT, "Rb"],
+  [SPEAKER_FRONT_LEFT_OF_CENTER, "Lc"],
+  [SPEAKER_FRONT_RIGHT_OF_CENTER, "Rc"],
+  [SPEAKER_BACK_CENTER, "Cs"],
+  [SPEAKER_SIDE_LEFT, "Ls"],
+  [SPEAKER_SIDE_RIGHT, "Rs"],
+  [SPEAKER_TOP_CENTER, "Tc"],
+  [SPEAKER_TOP_FRONT_LEFT, "Tfl"],
+  [SPEAKER_TOP_FRONT_CENTER, "Tfc"],
+  [SPEAKER_TOP_FRONT_RIGHT, "Tfr"],
+  [SPEAKER_TOP_BACK_LEFT, "Tbl"],
+  [SPEAKER_TOP_BACK_CENTER, "Tbc"],
+  [SPEAKER_TOP_BACK_RIGHT, "Tbr"],
 ];
 
 const FALLBACK_LAYOUTS: Record<number, ChannelLabel[]> = {
@@ -35,9 +62,57 @@ function labelsToName(labels: ChannelLabel[]) {
   return labels.join(" / ");
 }
 
+function maskHas(speakerMask: number, bit: number) {
+  return (speakerMask & bit) === bit;
+}
+
+function maskHasSideChannels(speakerMask: number) {
+  return maskHas(speakerMask, SPEAKER_SIDE_LEFT) || maskHas(speakerMask, SPEAKER_SIDE_RIGHT);
+}
+
+// Whether the mask's BACK_LEFT/BACK_RIGHT bits denote the ITU ~110 degree surrounds
+// (Ls/Rs, +1.5 dB) rather than genuine true rears (Lb/Rb, 1.0). WAVE canonically
+// encodes ITU 5.1 (L/R/C/LFE + two ~110 degree surrounds) with the BACK bits, so
+// the surround re-interpretation applies ONLY to that 5.1-style family: a front
+// centre present AND no dedicated SIDE channels. Two masks that must NOT remap:
+//   - 0x33 (FL|FR|BL|BR) — quadraphonic, no centre; the back pair is true rears.
+//   - 0x63F (FL|FR|FC|LFE|BL|BR|SL|SR) — 7.1 with real side channels present.
+// A centre-present, side-absent mask such as 0x3F (5.1) does remap to Ls/Rs.
+function backBitsAreSurroundChannels(speakerMask: number) {
+  return maskHas(speakerMask, SPEAKER_FRONT_CENTER) && !maskHasSideChannels(speakerMask);
+}
+
+// True when BACK bits are present AND we re-interpret them as ~110 degree surrounds
+// (Ls/Rs). The bit name alone cannot pin the exact position, so callers surface a
+// layout note. Quad-style masks (back bits kept as true rears) are unambiguous and
+// get no note.
+function maskHasAmbiguousBackChannels(speakerMask: number) {
+  const hasBack = maskHas(speakerMask, SPEAKER_BACK_LEFT) || maskHas(speakerMask, SPEAKER_BACK_RIGHT);
+  return hasBack && backBitsAreSurroundChannels(speakerMask);
+}
+
+// Resolve a set mask bit to its channel label. Only the BACK bits are layout
+// dependent: in a 5.1-style mask (front centre present, no side channels) they are
+// the ~110 degree surrounds Ls/Rs; otherwise they keep their default true-rear
+// labels Lb/Rb (quad, 7.1, or any centre-absent layout).
+function resolveMaskLabel(bit: number, defaultLabel: ChannelLabel, remapBackToSurround: boolean): ChannelLabel {
+  if (remapBackToSurround) {
+    if (bit === SPEAKER_BACK_LEFT) {
+      return "Ls";
+    }
+    if (bit === SPEAKER_BACK_RIGHT) {
+      return "Rs";
+    }
+  }
+  return defaultLabel;
+}
+
 export function deriveChannelLayout(channelCount: number, speakerMask?: number | null): ChannelLayout {
   if (speakerMask != null && speakerMask > 0) {
-    const labels = SPEAKER_MASK_BITS.filter(([bit]) => (speakerMask & bit) === bit).map(([, label]) => label);
+    const remapBackToSurround = backBitsAreSurroundChannels(speakerMask);
+    const labels = SPEAKER_MASK_BITS.filter(([bit]) => maskHas(speakerMask, bit)).map(([bit, label]) =>
+      resolveMaskLabel(bit, label, remapBackToSurround),
+    );
     if (labels.length === channelCount) {
       return {
         name: labelsToName(labels),
@@ -57,19 +132,18 @@ export function deriveChannelLayout(channelCount: number, speakerMask?: number |
   };
 }
 
+// ITU-R BS.1770-5 Annex 3 channel weighting (Rec. tables 4-5). Only low-elevation
+// channels in the 60-120 degree azimuth region take the +1.5 dB (sqrt(2) power)
+// surround boost — in this label set that is exactly Ls/Rs. Every elevated channel
+// (all T*, including Tc), the true rears Lb/Rb (+/-135 degrees), back centre Cs
+// (180 degrees), the front-of-centre pair Lc/Rc, and L/R/C are weighted 1.0. LFE
+// is excluded from the loudness measurement. Reference: ITU-R BS.1770-5, Annex 3.
 export function getLoudnessWeight(label: ChannelLabel) {
   if (label === "LFE") {
     return 0;
   }
 
-  if (
-    label === "Ls" ||
-    label === "Rs" ||
-    label === "Lb" ||
-    label === "Rb" ||
-    label === "Cs" ||
-    label.startsWith("T")
-  ) {
+  if (label === "Ls" || label === "Rs") {
     return Math.sqrt(2);
   }
 
@@ -77,9 +151,22 @@ export function getLoudnessWeight(label: ChannelLabel) {
 }
 
 export function describeLayoutRisk(layout: ChannelLayout) {
-  if (!layout.guessed || layout.labels.length <= 2) {
-    return null;
+  if (layout.guessed) {
+    if (layout.labels.length <= 2) {
+      return null;
+    }
+
+    return "Channel layout was inferred from channel count because the source metadata did not provide a speaker map.";
   }
 
-  return "Channel layout was inferred from channel count because the source metadata did not provide a speaker map.";
+  // Mask-derived layout: note when BACK bits were interpreted as ~110 degree
+  // surrounds (Ls/Rs) because the mask is ITU 5.1-style (front centre present, no
+  // dedicated side channels). The loudness weighting is standard-correct; the note
+  // flags the position guess. Quad-style masks (e.g. 0x33) keep true rears and get
+  // no note.
+  if (layout.speakerMask != null && maskHasAmbiguousBackChannels(layout.speakerMask)) {
+    return "WAVE back-left/right speaker bits were interpreted as ~110 degree surround channels (Ls/Rs) because the speaker mask pairs them with a front centre but declares no dedicated side channels (the ITU 5.1 convention); confirm this matches the source layout.";
+  }
+
+  return null;
 }

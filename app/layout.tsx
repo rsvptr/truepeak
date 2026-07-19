@@ -16,8 +16,11 @@ const mono = IBM_Plex_Mono({
   weight: ["400", "500", "600"],
 });
 
+// Telemetry defaults to off. A deployment operator must both deploy on Vercel
+// and explicitly opt in with NEXT_PUBLIC_ENABLE_TELEMETRY=1; without that flag,
+// no Analytics or Speed Insights script loads, hosted or not.
 const enableVercelInsights =
-  process.env.VERCEL === "1" || process.env.NEXT_PUBLIC_ENABLE_ANALYTICS === "true";
+  process.env.VERCEL === "1" && process.env.NEXT_PUBLIC_ENABLE_TELEMETRY === "1";
 
 const APP_DESCRIPTION =
   "Loudness and true peak analysis in your browser, for mastering, delivery checks, and quick file review.";
@@ -79,7 +82,7 @@ export async function generateViewport(): Promise<Viewport> {
 
 export default async function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {
   // Read the theme from the cookie so the server renders the correct data-theme on the
-  // first byte — no flash of the default theme for users who chose light mode.
+  // first byte, with no flash of the default theme for users who chose light mode.
   const themeCookie = (await cookies()).get("truepeak-theme")?.value;
   const theme = themeCookie === "light" || themeCookie === "dark" ? themeCookie : "dark";
   return (

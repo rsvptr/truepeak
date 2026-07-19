@@ -19,13 +19,14 @@ export default function ErrorPage({
   }, [error]);
 
   return (
-    <div className="mx-auto flex min-h-screen w-full max-w-[2048px] items-center justify-center px-4 py-6 sm:px-6 xl:px-10 2xl:px-12">
+    <main className="tp-min-h-viewport mx-auto flex w-full max-w-[2048px] items-center justify-center px-4 py-6 sm:px-6 xl:px-10 2xl:px-12">
       <div className="w-full max-w-[520px] rounded-[28px] border border-[var(--line)] bg-[var(--surface-1)] px-6 py-6 shadow-[var(--shadow-elevated)]">
+        <h1 className="sr-only">Something went wrong</h1>
         <TruePeakLogo size="sm" subtitle="Something went wrong" />
         <p className="mt-4 text-sm leading-6 text-[var(--muted)]">
-          The workspace hit an unexpected error and stopped. Your completed results are
-          saved in this browser and come back after a reload. You can try again right
-          away, or reload the page if it keeps happening.
+          The workspace hit an unexpected error and stopped. If local recovery storage
+          was available and its latest write completed, finished results should return
+          after a reload. You can try again now, or reload the page if it keeps happening.
         </p>
         <div className="mt-5 flex flex-wrap gap-2">
           <Button type="button" size="sm" onClick={reset}>
@@ -36,6 +37,6 @@ export default function ErrorPage({
           </Button>
         </div>
       </div>
-    </div>
+    </main>
   );
 }

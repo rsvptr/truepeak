@@ -27,12 +27,14 @@ export function DrawerPanel({
 }: DrawerPanelProps) {
   const titleId = useId();
   const descriptionId = useId();
+  const containerRef = useRef<HTMLDivElement | null>(null);
   const panelRef = useRef<HTMLDivElement | null>(null);
   const closeButtonRef = useRef<HTMLButtonElement | null>(null);
 
   useModalFocus({
     open,
     panelRef,
+    containerRef,
     onClose,
     getInitialFocus: () => closeButtonRef.current,
   });
@@ -42,7 +44,7 @@ export function DrawerPanel({
   }
 
   return (
-    <div className="fixed inset-0 z-50" aria-hidden={false}>
+    <div ref={containerRef} className="fixed inset-0 z-50" aria-hidden={false}>
       <div
         aria-hidden="true"
         className="tp-fade-in absolute inset-0 bg-black/55 backdrop-blur-sm"
@@ -65,12 +67,19 @@ export function DrawerPanel({
             desktopClassName,
           )}
         >
-          <div className="flex items-start justify-between gap-4 border-b border-[var(--line)] px-5 py-4 sm:px-6">
-            <div className="min-w-0">
+          <div className="flex items-start justify-between gap-4 border-b border-[var(--line)] pl-[max(1.25rem,env(safe-area-inset-left))] pr-[max(1.25rem,env(safe-area-inset-right))] pt-[max(1rem,env(safe-area-inset-top))] pb-4 sm:pl-[max(1.5rem,env(safe-area-inset-left))] sm:pr-[max(1.5rem,env(safe-area-inset-right))]">
+            {/* min-w-0 lets the title shrink and wrap instead of pushing
+                Close off-screen; line-clamp-2 plus a shrink-0 Close button
+                keep a filename-length title from ever hiding the control
+                behind it (UX-034). */}
+            <div className="min-w-0 flex-1">
               <div className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">
                 Studio panel
               </div>
-              <h2 id={titleId} className="mt-2 text-xl font-semibold text-[var(--ink)] sm:text-2xl">
+              <h2
+                id={titleId}
+                className="mt-2 line-clamp-2 wrap-anywhere text-xl font-semibold text-[var(--ink)] sm:text-2xl"
+              >
                 {title}
               </h2>
               {description ? (
@@ -91,7 +100,7 @@ export function DrawerPanel({
               Close
             </Button>
           </div>
-          <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-4 py-4 sm:px-6 sm:py-5">
+          <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain pl-[max(1rem,env(safe-area-inset-left))] pr-[max(1rem,env(safe-area-inset-right))] pt-4 pb-[max(1rem,env(safe-area-inset-bottom))] sm:pl-[max(1.5rem,env(safe-area-inset-left))] sm:pr-[max(1.5rem,env(safe-area-inset-right))] sm:pt-5 sm:pb-[max(1.25rem,env(safe-area-inset-bottom))]">
             {children}
           </div>
         </div>

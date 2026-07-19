@@ -8,7 +8,19 @@ import { register } from "node:module";
 register("./alias-loader.mjs", import.meta.url);
 
 const { parseWavBuffer } = await import("../../src/audio/wav.ts");
-const { analyzeDecodedAsset } = await import("../../src/audio/analysis.ts");
+const {
+  analyzeDecodedAsset,
+  INVALID_INTEGRATED_TOO_SHORT_WARNING,
+  INVALID_INTEGRATED_BELOW_GATE_WARNING,
+  LRA_UNSTABLE_WARNING,
+} = await import("../../src/audio/analysis.ts");
+const { deriveChannelLayout, getLoudnessWeight, describeLayoutRisk } = await import(
+  "../../src/audio/channel-layout.ts"
+);
+const { applyTargetToMetrics, clearTargetFromMetrics, TARGET_LIMIT_WARNING } = await import(
+  "../../src/audio/targeting.ts"
+);
+const { getComplianceSummary } = await import("../../src/audio/compliance.ts");
 
 // ---- tiny float32 WAV encoder (IEEE float, interleaved) ----
 function encodeWavFloat32(channels, sampleRate) {
@@ -78,7 +90,37 @@ function checkCmp(name, actual, op, bound) {
   ok ? (passed += 1) : (failed += 1);
 }
 
+// Boolean assertion (validity flags, nulls, warning membership, layout labels).
+function assertOk(name, cond, detail = "") {
+  console.log(`  ${cond ? "PASS" : "FAIL"}  ${name}${detail ? ` — ${detail}` : ""}`);
+  cond ? (passed += 1) : (failed += 1);
+}
+
+// Build a decoded asset straight from channel data (bypasses the WAV encoder so
+// tests can set exact frame counts, silence, sample rates, and channel layouts).
+function makeAsset(channels, { sampleRate = 48000, layout } = {}) {
+  const frameCount = channels[0]?.length ?? 0;
+  return {
+    fileName: "dsp.wav",
+    mimeType: "audio/wav",
+    sourceFormat: "wav",
+    sampleRate,
+    bitDepth: 32,
+    durationSeconds: sampleRate > 0 ? frameCount / sampleRate : 0,
+    frameCount,
+    channelCount: channels.length,
+    channelLayout: layout ?? deriveChannelLayout(channels.length, null),
+    decoderMode: "native-parser",
+    decoderLabel: "test",
+    decoderSummary: "",
+    decodeNotes: [],
+    warnings: [],
+    channels,
+  };
+}
+
 const dbfs = (amp) => 20 * Math.log10(amp);
+const ampForDbfs = (db) => 10 ** (db / 20);
 
 console.log("\n[1] Stereo 1 kHz sine @ -6 dBFS (amp 0.5), 48k, 4s");
 const m1 = analyzeChannels(sine({ freq: 1000, amp: 0.5, seconds: 4 }));
@@ -86,7 +128,14 @@ console.log(`     integrated=${m1.integratedLufs.toFixed(2)} LUFS  TP=${m1.trueP
 check("sample peak", m1.samplePeakDbfs, dbfs(0.5), 0.05);
 checkCmp("true peak >= sample peak", m1.truePeakDbtp, ">=", m1.samplePeakDbfs - 0.02);
 checkCmp("true peak within 0.3 dB of sample peak (low freq)", m1.truePeakDbtp, "<", m1.samplePeakDbfs + 0.3);
-checkCmp("LRA ~0 for steady tone", m1.loudnessRange, "<", 1.0);
+// LRA ~0 for a steady tone. EBU Tech 3342 (2023) §5 mandates >=1.5 s of
+// trailing-silence padding for the file-based LRA procedure; on a very short clip
+// that padding leaves a small artefact (the clip is also flagged
+// loudnessRangeUnstable, and the spec itself notes short programmes can read
+// "misleadingly high" LRA). Assert steadiness on a 20 s tone, where the reference
+// procedure settles to ~0.
+const steadyToneLra = analyzeChannels(sine({ freq: 1000, amp: 0.5, seconds: 20 })).loudnessRange;
+checkCmp("LRA ~0 for steady tone (20 s, EBU Tech 3342 reference procedure)", steadyToneLra, "<", 1.0);
 
 console.log("\n[2] Same tone at -12 dBFS (amp 0.25) — expect ~6 dB/LU drop vs [1]");
 const m2 = analyzeChannels(sine({ freq: 1000, amp: 0.25, seconds: 4 }));
@@ -128,6 +177,329 @@ const monoM = analyzeChannels(sine({ freq: 1000, amp: 0.5, seconds: 4, channels:
 const stereoM = m1;
 console.log(`     mono=${monoM.integratedLufs.toFixed(2)}  stereo=${stereoM.integratedLufs.toFixed(2)}`);
 check("stereo is ~3.01 LU louder than mono (2x energy)", stereoM.integratedLufs - monoM.integratedLufs, 3.01, 0.1);
+
+console.log("\n[7] H-02 integrated-loudness validity (too-short / below-gate / boundary)");
+const short300 = analyzeDecodedAsset(makeAsset(sine({ freq: 1000, amp: 0.5, seconds: 0.3 })), null).metrics;
+assertOk("300 ms clip: integratedValid === false", short300.integratedValid === false, `got ${short300.integratedValid}`);
+assertOk("300 ms clip: reason === 'too-short'", short300.integratedInvalidReason === "too-short", `got ${short300.integratedInvalidReason}`);
+assertOk("300 ms clip: integratedLufs keeps -70 sentinel", short300.integratedLufs === -70, `got ${short300.integratedLufs}`);
+assertOk("300 ms clip: maxMomentaryLufs === null", short300.maxMomentaryLufs === null, `got ${short300.maxMomentaryLufs}`);
+assertOk("300 ms clip: too-short warning pushed", short300.warnings.includes(INVALID_INTEGRATED_TOO_SHORT_WARNING));
+assertOk("300 ms clip: loudnessRangeUnstable === true", short300.loudnessRangeUnstable === true);
+
+const exact400 = analyzeDecodedAsset(makeAsset(sine({ freq: 1000, amp: 0.5, seconds: 0.4 })), null).metrics;
+assertOk("exact 400 ms clip: integratedValid === true (boundary)", exact400.integratedValid === true, `got ${exact400.integratedValid}`);
+assertOk("exact 400 ms clip: no integratedInvalidReason key", !("integratedInvalidReason" in exact400));
+assertOk("exact 400 ms clip: maxMomentaryLufs finite", Number.isFinite(exact400.maxMomentaryLufs), `got ${exact400.maxMomentaryLufs}`);
+assertOk("exact 400 ms clip: no too-short warning", !exact400.warnings.includes(INVALID_INTEGRATED_TOO_SHORT_WARNING));
+
+const short399 = analyzeDecodedAsset(makeAsset(sine({ freq: 1000, amp: 0.5, seconds: 0.399 })), null).metrics;
+assertOk("399 ms clip: integratedValid === false (just under 400 ms boundary)", short399.integratedValid === false, `got ${short399.integratedValid}`);
+assertOk("399 ms clip: reason === 'too-short'", short399.integratedInvalidReason === "too-short");
+
+const silence1s = analyzeDecodedAsset(makeAsset([new Float32Array(48000), new Float32Array(48000)]), null).metrics;
+assertOk("1 s digital silence: integratedValid === false", silence1s.integratedValid === false);
+assertOk("1 s digital silence: reason === 'below-gate'", silence1s.integratedInvalidReason === "below-gate", `got ${silence1s.integratedInvalidReason}`);
+assertOk("1 s digital silence: integratedLufs keeps -70 sentinel", silence1s.integratedLufs === -70);
+assertOk("1 s digital silence: below-gate warning pushed", silence1s.warnings.includes(INVALID_INTEGRATED_BELOW_GATE_WARNING));
+
+// Sub-gate noise: 2 s of ~-80 dBFS noise. Complete 400 ms blocks exist, but none
+// clears the -70 LUFS absolute gate -> below-gate (distinct from too-short).
+{
+  const n = 96000;
+  const amp = ampForDbfs(-80);
+  const chL = new Float32Array(n);
+  const chR = new Float32Array(n);
+  let seed = 22222;
+  const rnd = () => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed / 0x7fffffff - 0.5; };
+  for (let i = 0; i < n; i += 1) { chL[i] = amp * rnd(); chR[i] = amp * rnd(); }
+  const subgate = analyzeDecodedAsset(makeAsset([chL, chR]), null).metrics;
+  assertOk("2 s sub-gate noise: integratedValid === false", subgate.integratedValid === false);
+  assertOk("2 s sub-gate noise: reason === 'below-gate'", subgate.integratedInvalidReason === "below-gate", `got ${subgate.integratedInvalidReason}`);
+}
+
+const valid10s = analyzeDecodedAsset(makeAsset(sine({ freq: 1000, amp: 0.5, seconds: 10 })), null).metrics;
+assertOk("10 s tone: integratedValid === true", valid10s.integratedValid === true);
+assertOk("10 s tone: no integratedInvalidReason key", !("integratedInvalidReason" in valid10s));
+assertOk(
+  "10 s tone: no invalid-integrated warning",
+  !valid10s.warnings.includes(INVALID_INTEGRATED_TOO_SHORT_WARNING) &&
+    !valid10s.warnings.includes(INVALID_INTEGRATED_BELOW_GATE_WARNING),
+);
+assertOk("10 s tone (<60 s): loudnessRangeUnstable === true", valid10s.loudnessRangeUnstable === true);
+assertOk("10 s tone (<60 s): LRA-unstable warning pushed", valid10s.warnings.includes(LRA_UNSTABLE_WARNING));
+
+const valid60s = analyzeDecodedAsset(makeAsset(sine({ freq: 1000, amp: 0.5, seconds: 60 })), null).metrics;
+assertOk("60 s tone (>=60 s): loudnessRangeUnstable === false", valid60s.loudnessRangeUnstable === false);
+assertOk("60 s tone (>=60 s): no LRA-unstable warning", !valid60s.warnings.includes(LRA_UNSTABLE_WARNING));
+
+// H-02/H-01 boundary alignment at 11025 Hz. The high-res Max-M window is now
+// 4 * round(0.1 * SR) frames = the integrated gating-block length. At 11025 Hz that
+// is 4 * 1103 = 4412 frames, whereas round(0.4 * SR) = 4410 — the previous mismatch
+// let a 4410/4411-frame clip report a valid Max M while integrated was (correctly)
+// flagged too-short. Max M must now be null exactly when no complete integrated
+// block exists, at every sample rate.
+{
+  const boundarySr = 11025;
+  const boundaryTone = (frames) => {
+    const c = new Float32Array(frames);
+    const amp = ampForDbfs(-10); // well above the -70 LUFS absolute gate
+    for (let i = 0; i < frames; i += 1) c[i] = amp * Math.sin((2 * Math.PI * 1000 * i) / boundarySr);
+    return [c, c.slice()];
+  };
+  for (const frames of [4410, 4411]) {
+    const m = analyzeDecodedAsset(makeAsset(boundaryTone(frames), { sampleRate: boundarySr }), null).metrics;
+    assertOk(`11025 Hz / ${frames} frames: maxMomentaryLufs === null`, m.maxMomentaryLufs === null, `got ${m.maxMomentaryLufs}`);
+    assertOk(
+      `11025 Hz / ${frames} frames: integratedValid === false (too-short)`,
+      m.integratedValid === false && m.integratedInvalidReason === "too-short",
+      `valid=${m.integratedValid} reason=${m.integratedInvalidReason}`,
+    );
+  }
+  const m4412 = analyzeDecodedAsset(makeAsset(boundaryTone(4412), { sampleRate: boundarySr }), null).metrics;
+  assertOk("11025 Hz / 4412 frames: maxMomentaryLufs finite (one complete block)", Number.isFinite(m4412.maxMomentaryLufs), `got ${m4412.maxMomentaryLufs}`);
+  assertOk(
+    "11025 Hz / 4412 frames: integratedValid === true",
+    m4412.integratedValid === true,
+    `valid=${m4412.integratedValid} reason=${m4412.integratedInvalidReason}`,
+  );
+}
+
+console.log("\n[8] Targeting & compliance (H-02 validity gating, M-12 tolerance-before-ceiling)");
+function baseMetricsFixture(overrides = {}) {
+  return {
+    integratedLufs: -14.05,
+    ungatedLufs: -14.05,
+    loudnessRange: 5,
+    maxMomentaryLufs: -13,
+    maxShortTermLufs: -13.5,
+    samplePeakDbfs: -1,
+    truePeakDbtp: -1,
+    unclampedTargetDeltaDb: null,
+    targetDeltaDb: null,
+    projectedTruePeakDbtp: null,
+    normalizationLimited: false,
+    timeline: { stepDurationSeconds: 0.1, timeSeconds: [], momentaryLufs: [], shortTermLufs: [], truePeakDbtp: [] },
+    warnings: [],
+    ...overrides,
+  };
+}
+function targetPresetFixture(overrides = {}) {
+  return {
+    id: "test",
+    label: "Test",
+    category: "custom",
+    evidence: "custom",
+    sourceLabel: "s",
+    referenceNote: "n",
+    highlights: [],
+    loudnessTargetLufs: -14,
+    truePeakCeilingDbtp: -1,
+    toleranceLufs: 0.5,
+    policy: "protect-true-peak",
+    description: "d",
+    ...overrides,
+  };
+}
+function fakeResult(metrics, target) {
+  return {
+    metadata: {},
+    metrics,
+    analysisMode: target ? "targeted" : "measure-only",
+    target: target ?? null,
+    analyzedAt: "2026-01-01T00:00:00.000Z",
+  };
+}
+
+// M-12: source already inside tolerance, optional residual move capped by the ceiling.
+{
+  const target = targetPresetFixture();
+  const applied = applyTargetToMetrics(baseMetricsFixture({ integratedLufs: -14.05, truePeakDbtp: -1 }), target);
+  const summary = getComplianceSummary(fakeResult(applied, target));
+  assertOk("M-12: residual move at ceiling -> normalizationLimited === true", applied.normalizationLimited === true);
+  assertOk(
+    "M-12: in-tolerance-at-ceiling reports 'on-target' (not 'ceiling-limited')",
+    summary != null && summary.state === "on-target",
+    summary ? summary.state : "null",
+  );
+}
+// Genuinely out-of-tolerance quiet source with a capped upward move -> still ceiling-limited.
+{
+  const target = targetPresetFixture();
+  const applied = applyTargetToMetrics(baseMetricsFixture({ integratedLufs: -20, truePeakDbtp: -1 }), target);
+  const summary = getComplianceSummary(fakeResult(applied, target));
+  assertOk(
+    "out-of-tolerance + capped move -> 'ceiling-limited'",
+    summary != null && summary.state === "ceiling-limited",
+    summary ? summary.state : "null",
+  );
+}
+// integratedValid === false -> all gain/projection fields null, no cap warning, compliance null.
+{
+  const target = targetPresetFixture();
+  const invalid = baseMetricsFixture({
+    integratedLufs: -70,
+    integratedValid: false,
+    integratedInvalidReason: "too-short",
+    truePeakDbtp: -6,
+  });
+  const applied = applyTargetToMetrics(invalid, target);
+  assertOk("invalid integrated: unclampedTargetDeltaDb === null", applied.unclampedTargetDeltaDb === null);
+  assertOk("invalid integrated: targetDeltaDb === null", applied.targetDeltaDb === null);
+  assertOk("invalid integrated: projectedTruePeakDbtp === null", applied.projectedTruePeakDbtp === null);
+  assertOk("invalid integrated: normalizationLimited === false", applied.normalizationLimited === false);
+  assertOk("invalid integrated: no TARGET_LIMIT_WARNING pushed", !applied.warnings.includes(TARGET_LIMIT_WARNING));
+  assertOk("invalid integrated: getComplianceSummary === null", getComplianceSummary(fakeResult(applied, target)) === null);
+}
+// Legacy metrics (integratedValid key absent) -> targeting math unchanged from pre-Phase-1.
+{
+  const target = targetPresetFixture();
+  const legacyIn = baseMetricsFixture({ integratedLufs: -20, truePeakDbtp: -3 });
+  delete legacyIn.integratedValid;
+  const applied = applyTargetToMetrics(legacyIn, target);
+  const cleared = clearTargetFromMetrics(legacyIn);
+  const unclamped = target.loudnessTargetLufs - cleared.integratedLufs;
+  const maxAllowed = target.truePeakCeilingDbtp - cleared.truePeakDbtp;
+  const delta = Math.min(unclamped, maxAllowed);
+  assertOk("legacy: unclampedTargetDeltaDb matches pre-Phase-1", applied.unclampedTargetDeltaDb === unclamped);
+  assertOk("legacy: targetDeltaDb matches pre-Phase-1", applied.targetDeltaDb === delta);
+  assertOk("legacy: projectedTruePeakDbtp matches pre-Phase-1", applied.projectedTruePeakDbtp === cleared.truePeakDbtp + delta);
+  assertOk("legacy: getComplianceSummary is non-null (measurement present)", getComplianceSummary(fakeResult(applied, target)) !== null);
+}
+
+console.log("\n[9] M-09 true-peak timeline invariant (headline == max plotted, within 1e-6)");
+function maxArr(arr) {
+  let m = -Infinity;
+  for (const v of arr) if (v > m) m = v;
+  return m;
+}
+// Partial final bin: 1.05 s (50400 frames, not a multiple of 4800); only non-zero sample is the final 0.9.
+{
+  const n = Math.round(1.05 * 48000);
+  const l = new Float32Array(n);
+  const r = new Float32Array(n);
+  l[n - 1] = 0.9;
+  r[n - 1] = 0.9;
+  const m = analyzeDecodedAsset(makeAsset([l, r]), null).metrics;
+  const plotted = maxArr(m.timeline.truePeakDbtp);
+  assertOk(
+    "partial-final-bin: headline TP == max(timeline.truePeakDbtp)",
+    Math.abs(m.truePeakDbtp - plotted) <= 1e-6,
+    `headline ${m.truePeakDbtp.toFixed(6)} vs max ${plotted.toFixed(6)}`,
+  );
+  assertOk(
+    "partial-final-bin: truePeak series length == timeSeconds length",
+    m.timeline.truePeakDbtp.length === m.timeline.timeSeconds.length,
+  );
+}
+// End-of-file transient (M-09 probe #2): full-scale burst in the last 20 samples; FIR tail folds into last bin.
+{
+  const n = 48000;
+  const l = new Float32Array(n);
+  const r = new Float32Array(n);
+  for (let i = n - 20; i < n; i += 1) { l[i] = (i % 2 === 0 ? 1 : -1) * 0.98; r[i] = l[i]; }
+  const m = analyzeDecodedAsset(makeAsset([l, r]), null).metrics;
+  const plotted = maxArr(m.timeline.truePeakDbtp);
+  assertOk(
+    "end-transient: headline TP == max(timeline.truePeakDbtp)",
+    Math.abs(m.truePeakDbtp - plotted) <= 1e-6,
+    `headline ${m.truePeakDbtp.toFixed(6)} vs max ${plotted.toFixed(6)}`,
+  );
+}
+// Mid-file transient: invariant must still hold when the hottest peak is not at the edges.
+{
+  const n = Math.round(2.05 * 48000);
+  const l = new Float32Array(n);
+  const r = new Float32Array(n);
+  for (let i = 48000; i < 48020; i += 1) { l[i] = (i % 2 === 0 ? 1 : -1) * 0.95; r[i] = l[i]; }
+  const m = analyzeDecodedAsset(makeAsset([l, r]), null).metrics;
+  const plotted = maxArr(m.timeline.truePeakDbtp);
+  assertOk("mid-file transient: headline TP == max(timeline.truePeakDbtp)", Math.abs(m.truePeakDbtp - plotted) <= 1e-6);
+}
+
+console.log("\n[10] M-11 determinism + caller PCM not mutated");
+{
+  const amp = 0.5;
+  const n = 4 * 48000;
+  const l = new Float32Array(n);
+  const r = new Float32Array(n);
+  for (let i = 0; i < n; i += 1) { l[i] = amp * Math.sin((2 * Math.PI * 100 * i) / 48000); r[i] = l[i]; }
+  const lCopy = Float32Array.from(l);
+  const rCopy = Float32Array.from(r);
+  const asset = makeAsset([l, r]);
+  const m1 = analyzeDecodedAsset(asset, null).metrics;
+  let mutated = false;
+  for (let i = 0; i < n; i += 1) { if (l[i] !== lCopy[i] || r[i] !== rCopy[i]) { mutated = true; break; } }
+  assertOk("caller PCM byte-identical after analysis", !mutated);
+  const m2 = analyzeDecodedAsset(asset, null).metrics;
+  const fields = ["integratedLufs", "ungatedLufs", "loudnessRange", "maxMomentaryLufs", "maxShortTermLufs", "samplePeakDbfs", "truePeakDbtp"];
+  let identical = true;
+  let diff = "";
+  for (const f of fields) { if (m1[f] !== m2[f]) { identical = false; diff = `${f}: ${m1[f]} vs ${m2[f]}`; break; } }
+  assertOk("repeat analysis returns identical metrics", identical, diff);
+}
+
+console.log("\n[11] H-03 channel weighting (ITU-R BS.1770-5) + WAVE speaker-mask layouts");
+const SQRT2 = Math.sqrt(2);
+const weightTable = {
+  L: 1, R: 1, C: 1, LFE: 0, Ls: SQRT2, Rs: SQRT2, Lb: 1, Rb: 1, Cs: 1, Lc: 1, Rc: 1,
+  Tfl: 1, Tfc: 1, Tfr: 1, Tc: 1, Tsl: 1, Tsr: 1, Tbl: 1, Tbc: 1, Tbr: 1, Unknown: 1,
+};
+for (const [label, exp] of Object.entries(weightTable)) {
+  assertOk(`weight(${label}) === ${exp === SQRT2 ? "sqrt(2)" : exp}`, getLoudnessWeight(label) === exp, `got ${getLoudnessWeight(label)}`);
+}
+{
+  // Top-centre mask bit 0x800 -> Tc (H-03 addition); L/R/C/Tc, not guessed, no risk note.
+  const layout = deriveChannelLayout(4, 0x807);
+  assertOk("mask 0x807 -> labels L,R,C,Tc", layout.labels.join(",") === "L,R,C,Tc", layout.labels.join(","));
+  assertOk("mask 0x807 -> not guessed", layout.guessed === false);
+  assertOk("mask 0x807 -> no layout risk note", describeLayoutRisk(layout) === null);
+}
+{
+  // Quad mask 0x33 = FL|FR|BL|BR (4ch, no centre, no side bits). The back pair are
+  // GENUINE rears Lb/Rb at weight 1.0 — NOT the 5.1 ~110 degree surrounds. This is
+  // the H-03 regression the reviewer caught: back-without-side must only remap to
+  // Ls/Rs when a front centre is present (the ITU 5.1 convention). No ambiguity note.
+  const layout = deriveChannelLayout(4, 0x33);
+  assertOk("mask 0x33 (quad) -> labels L,R,Lb,Rb", layout.labels.join(",") === "L,R,Lb,Rb", layout.labels.join(","));
+  assertOk("mask 0x33 (quad) -> not guessed", layout.guessed === false);
+  const quadWeights = layout.labels.map((label) => getLoudnessWeight(label));
+  assertOk("mask 0x33 (quad) -> weights [1,1,1,1] (true rears, not surrounds)", JSON.stringify(quadWeights) === JSON.stringify([1, 1, 1, 1]), JSON.stringify(quadWeights));
+  assertOk("mask 0x33 (quad) -> no ambiguity note (no back->surround remap)", describeLayoutRisk(layout) === null);
+}
+{
+  // 5.1-style mask (front centre + back bits, no side bits) -> back remapped to Ls/Rs, ambiguity note.
+  const layout = deriveChannelLayout(6, 0x3f);
+  assertOk("mask 0x3F -> labels L,R,C,LFE,Ls,Rs", layout.labels.join(",") === "L,R,C,LFE,Ls,Rs", layout.labels.join(","));
+  const weights = layout.labels.map((label) => getLoudnessWeight(label));
+  assertOk("mask 0x3F -> weights [1,1,1,0,sqrt2,sqrt2] (5.1 unchanged)", JSON.stringify(weights) === JSON.stringify([1, 1, 1, 0, SQRT2, SQRT2]));
+  assertOk("mask 0x3F -> ambiguous-back note mentions 'side channels'", (describeLayoutRisk(layout) || "").includes("side channels"));
+}
+{
+  // 7.1-style mask (side bits present) -> back bits are true rears Lb/Rb (1.0), no note.
+  const layout = deriveChannelLayout(8, 0x63f);
+  assertOk("mask 0x63F -> labels L,R,C,LFE,Lb,Rb,Ls,Rs", layout.labels.join(",") === "L,R,C,LFE,Lb,Rb,Ls,Rs", layout.labels.join(","));
+  const weights = layout.labels.map((label) => getLoudnessWeight(label));
+  assertOk("mask 0x63F -> weights [1,1,1,0,1,1,sqrt2,sqrt2] (rears 1.0)", JSON.stringify(weights) === JSON.stringify([1, 1, 1, 0, 1, 1, SQRT2, SQRT2]));
+  assertOk("mask 0x63F -> no ambiguity note (side bits disambiguate)", describeLayoutRisk(layout) === null);
+}
+{
+  // Real-analyzer mono equivalence: identical mono reads identical LUFS for C/Tfl/Tc/Lb/Cs (weight 1.0),
+  // and +1.505 LU for Ls (surround weight sqrt 2). Guards the H-03 fix through the full pipeline.
+  const monoCh = sine({ freq: 1000, amp: 0.5, seconds: 4, channels: 1 })[0];
+  const readAs = (label) =>
+    analyzeDecodedAsset(
+      makeAsset([monoCh.slice()], { layout: { name: label, labels: [label], guessed: false, speakerMask: null } }),
+      null,
+    ).metrics.integratedLufs;
+  const cLufs = readAs("C");
+  for (const label of ["Tfl", "Tc", "Lb", "Cs"]) {
+    const v = readAs(label);
+    assertOk(`mono '${label}' reads identical to 'C' (weight 1.0)`, Math.abs(v - cLufs) < 1e-9, `delta ${(v - cLufs).toExponential(2)}`);
+  }
+  const lsLufs = readAs("Ls");
+  assertOk("mono 'Ls' reads +1.505 LU above 'C' (surround weight sqrt 2)", Math.abs(lsLufs - cLufs - 1.505) < 0.01, `delta ${(lsLufs - cLufs).toFixed(4)} LU`);
+}
 
 console.log(`\n==== DSP validation: ${passed} passed, ${failed} failed ====\n`);
 process.exit(failed ? 1 : 0);

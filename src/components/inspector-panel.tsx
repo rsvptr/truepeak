@@ -4,7 +4,7 @@ import { useRef, type KeyboardEvent, type Ref } from "react";
 import dynamic from "next/dynamic";
 import { BarChart3, CircleAlert, LoaderCircle, RefreshCcw, Square } from "lucide-react";
 import { getComplianceSummary } from "@/audio/compliance";
-import { formatDb, formatDuration, formatLufs, formatPeakDbtp, formatRelativeDb, formatRelativeLu, formatTimestamp } from "@/lib/format";
+import { describeIntegratedInvalidReason, formatDb, formatDuration, formatIntegratedLufs, formatLoudnessRange, formatLufs, formatPeakDbtp, formatRelativeDb, formatRelativeLu, formatTimestamp } from "@/lib/format";
 import { getJobErrorDisplay } from "@/lib/job-ui";
 import { complianceToneClass, statusToneClass } from "@/lib/status-tone";
 import { isActiveJob, isIssueJob } from "@/lib/session-selectors";
@@ -179,14 +179,23 @@ export function InspectorPanel({
             </h2>
             <div className="mt-3 flex flex-wrap gap-2">
               <Badge className={statusToneClass(job.status)}>{job.status}</Badge>
+              {job.imported ? (
+                <Badge className="tone-warning">Unverified import</Badge>
+              ) : null}
+              {job.restored ? (
+                <Badge className="border-[var(--line)] bg-[var(--surface-0)] text-[var(--muted)]">
+                  Restored
+                </Badge>
+              ) : null}
               {selectedCompliance ? <Badge className={complianceToneClass(selectedCompliance.state)}>{selectedCompliance.label}</Badge> : null}
+              {result?.metrics.integratedValid === false ? <Badge className="tone-warning">Integrated unavailable</Badge> : null}
               {selectedTarget ? <Badge>{selectedTarget.label}</Badge> : null}
               {result?.metadata.decoderLabel ? (
                 <Badge className="max-w-full break-words border-[var(--line)] bg-[var(--surface-0)] text-[var(--muted)]">
                   {result.metadata.decoderLabel}
                 </Badge>
               ) : null}
-              {!selectedCompliance && result ? (
+              {!selectedCompliance && result && analysisMode === "measure-only" ? (
                 <Badge className="border-[var(--line)] bg-[var(--surface-0)] text-[var(--muted)]">Measure Only</Badge>
               ) : null}
             </div>
@@ -216,9 +225,9 @@ export function InspectorPanel({
 
         {result ? (
           <div className={cn("grid gap-3", analysisMode === "targeted" ? "md:grid-cols-2 2xl:grid-cols-3" : "md:grid-cols-2 xl:grid-cols-3")}>
-            <InspectorMetric label="Integrated" value={formatLufs(result.metrics.integratedLufs)} hint={selectedTarget?.label ?? "Measured loudness"} accent />
+            <InspectorMetric label="Integrated" value={formatIntegratedLufs(result.metrics)} hint={result.metrics.integratedValid === false ? describeIntegratedInvalidReason(result.metrics.integratedInvalidReason) : selectedTarget?.label ?? "Measured loudness"} accent />
             <InspectorMetric label="True peak" value={formatPeakDbtp(result.metrics.truePeakDbtp)} hint="Measured true peak" />
-            <InspectorMetric label="LRA" value={formatDb(result.metrics.loudnessRange, "LU")} hint="Loudness range" />
+            <InspectorMetric label="LRA" value={formatLoudnessRange(result.metrics)} hint={result.metrics.loudnessRangeUnstable === true ? "Programme is under 60 seconds; LRA is not statistically stable" : "Loudness range"} />
             {analysisMode === "targeted" ? (
               <>
                 <InspectorMetric label="Gain move" value={formatRelativeDb(result.metrics.targetDeltaDb)} hint={result.metrics.normalizationLimited ? "Limited by ceiling" : "Planned normalization move"} />
@@ -300,7 +309,7 @@ export function InspectorPanel({
           <section className="rounded-[24px] border border-[var(--line)]/80 bg-[var(--surface-1)] p-5">
             <div className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">Loudness</div>
             <div className="mt-4 grid gap-3 md:grid-cols-2">
-              <InspectorMetric label="Integrated" value={formatLufs(result.metrics.integratedLufs)} hint="Primary LUFS reading" accent />
+              <InspectorMetric label="Integrated" value={formatIntegratedLufs(result.metrics)} hint={result.metrics.integratedValid === false ? describeIntegratedInvalidReason(result.metrics.integratedInvalidReason) : "Primary LUFS reading"} accent />
               <InspectorMetric label="Ungated" value={formatLufs(result.metrics.ungatedLufs)} hint="Before gating" />
               <InspectorMetric label="Max momentary" value={formatLufs(result.metrics.maxMomentaryLufs)} hint="400 ms window" />
               <InspectorMetric label="Max short-term" value={formatLufs(result.metrics.maxShortTermLufs)} hint="3 second window" />
@@ -312,7 +321,7 @@ export function InspectorPanel({
             <div className="mt-4 grid gap-3 md:grid-cols-2">
               <InspectorMetric label="True peak" value={formatPeakDbtp(result.metrics.truePeakDbtp)} hint="Measured true peak" accent />
               <InspectorMetric label="Sample peak" value={formatDb(result.metrics.samplePeakDbfs, "dBFS")} hint="Highest sample peak" />
-              <InspectorMetric label="LRA" value={formatDb(result.metrics.loudnessRange, "LU")} hint="Loudness range" />
+              <InspectorMetric label="LRA" value={formatLoudnessRange(result.metrics)} hint={result.metrics.loudnessRangeUnstable === true ? "Programme is under 60 seconds; LRA is not statistically stable" : "Loudness range"} />
               <InspectorMetric label="Timeline points" value={String(result.metrics.timeline.timeSeconds.length)} hint="Momentary, short-term, and peak samples" />
             </div>
           </section>

@@ -113,6 +113,10 @@ export function parseWavBuffer(
     throw new Error("Not a RIFF/RF64 wave file.");
   }
 
+  if (view.byteLength < 12) {
+    throw new Error("WAV file header is truncated.");
+  }
+
   if (readAscii(view, 8, 4) !== "WAVE") {
     throw new Error("Missing WAVE signature.");
   }
@@ -124,19 +128,48 @@ export function parseWavBuffer(
   const chunks = new Map<string, ChunkInfo>();
   let offset = 12;
   let dataSizeFromDs64: number | null = null;
+  let ds64Resolved = false;
 
   while (offset + 8 <= view.byteLength) {
     const id = readAscii(view, offset, 4);
     const chunkSize = view.getUint32(offset + 4, true);
     const dataOffset = offset + 8;
+
+    if (id === "ds64") {
+      // ds64 must carry a readable 64-bit dataSize field (riffSize + dataSize
+      // + sampleCount + tableLength = 28 bytes minimum); bound the read to
+      // the actual buffer so a truncated ds64 can't be misread as valid.
+      const ds64Readable = chunkSize >= 28 && dataOffset + 16 <= view.byteLength;
+      if (sourceFormat === "rf64" && !ds64Readable) {
+        throw new Error("RF64 ds64 chunk is truncated or malformed.");
+      }
+      if (ds64Readable) {
+        const resolvedDataSize = readUint64LE(view, dataOffset + 8);
+        const resolvedValid = Number.isSafeInteger(resolvedDataSize) && resolvedDataSize >= 0;
+        if (sourceFormat === "rf64" && !resolvedValid) {
+          throw new Error("RF64 ds64 chunk declares an invalid or unresolved data size.");
+        }
+        if (resolvedValid) {
+          dataSizeFromDs64 = resolvedDataSize;
+          ds64Resolved = true;
+        }
+      }
+    }
+
+    // RF64 requires ds64, and it must precede data — reject unresolved
+    // 0xFFFFFFFF sentinel data sizes rather than clamping them to whatever
+    // bytes happen to remain in the buffer (that previously turned trailing
+    // chunk headers/padding into fabricated audio frames).
+    if (id === "data" && sourceFormat === "rf64" && !ds64Resolved) {
+      throw new Error(
+        "RF64 file is missing the required ds64 chunk, or it does not precede the data chunk.",
+      );
+    }
+
     const size =
       chunkSize === 0xffffffff && id === "data" && dataSizeFromDs64 != null
         ? dataSizeFromDs64
         : chunkSize;
-
-    if (id === "ds64" && chunkSize >= 28 && dataOffset + 16 <= view.byteLength) {
-      dataSizeFromDs64 = readUint64LE(view, dataOffset + 8);
-    }
 
     if (id === "fmt " || id === "data" || id === "ds64") {
       chunks.set(id, { offset: dataOffset, size });
@@ -192,10 +225,24 @@ export function parseWavBuffer(
     throw new Error(`Unsupported wave format tag: 0x${formatTag.toString(16)}`);
   }
 
+  // M-10: for RF64 the ds64-resolved (or explicit) data size is authoritative. If it
+  // claims more bytes than the file physically holds, the file is corrupt or hostile
+  // — fail closed rather than clamp. Clamping fabricates audio frames from whatever
+  // trailing chunk headers/padding happen to remain (the audit's exact repro: a ds64
+  // declaring 400 bytes over 4 physical PCM bytes parsed as two real frames). Plain
+  // RIFF/WAV keeps the best-effort clamp below, because an oversized 32-bit data size
+  // is a common benign streaming/authoring artifact rather than a 64-bit size lie.
+  const availableDataBytes = view.byteLength - data.offset;
+  if (sourceFormat === "rf64" && data.size > availableDataBytes) {
+    throw new Error(
+      `RF64 declares a data size of ${data.size} bytes but only ${availableDataBytes} bytes are physically present; refusing to fabricate audio from truncated data.`,
+    );
+  }
+
   const decoded = decodePcmToPlanar(
     view,
     data.offset,
-    Math.min(data.size, view.byteLength - data.offset),
+    Math.min(data.size, availableDataBytes),
     channelCount,
     bitsPerSample,
     formatTag,

@@ -1,6 +1,14 @@
 "use client";
 
-import { useEffect, useId, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type ReactNode } from "react";
+import {
+  useEffect,
+  useId,
+  useLayoutEffect,
+  useRef,
+  useState,
+  type KeyboardEvent as ReactKeyboardEvent,
+  type ReactNode,
+} from "react";
 import {
   ArrowLeft,
   Download,
@@ -14,6 +22,7 @@ import {
   Trash2,
 } from "lucide-react";
 import { formatDuration } from "@/lib/format";
+import { cn } from "@/lib/utils";
 import { TruePeakLogo } from "@/components/truepeak-logo";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -53,6 +62,12 @@ interface StudioToolbarProps {
   onClearSession: () => void;
 }
 
+// Minimum vertical room (px) the More menu needs before we flip it to open
+// upward instead of downward on short viewports.
+const MENU_MIN_COMFORTABLE_HEIGHT = 200;
+const MENU_VIEWPORT_MARGIN = 16;
+const MENU_TRIGGER_GAP = 10;
+
 export function StudioToolbar({
   currentModeLabel,
   uiMode,
@@ -79,9 +94,13 @@ export function StudioToolbar({
   onClearSession,
 }: StudioToolbarProps) {
   const [menuOpen, setMenuOpen] = useState(false);
+  const [isCompactMenu, setIsCompactMenu] = useState(false);
+  const [menuPlacement, setMenuPlacement] = useState<"below" | "above">("below");
+  const [menuMaxHeight, setMenuMaxHeight] = useState<number | null>(null);
   const menuId = useId();
   const menuRef = useRef<HTMLDivElement | null>(null);
   const triggerRef = useRef<HTMLButtonElement | null>(null);
+  const wrapperRef = useRef<HTMLDivElement | null>(null);
 
   const focusMenuItem = (index: number) => {
     // Unavailable items stay focusable (aria-disabled, not disabled), so
@@ -114,6 +133,78 @@ export function StudioToolbar({
     action();
     closeMenu(true);
   };
+
+  // Publish the toolbar's actual rendered footprint (its sticky "top" offset
+  // plus its own height) as a shared CSS variable so other sticky elements
+  // (e.g. table headers) can dock immediately below it instead of guessing a
+  // fixed offset that breaks once the toolbar wraps to more rows.
+  useEffect(() => {
+    const element = wrapperRef.current;
+    if (!element || typeof ResizeObserver === "undefined") {
+      return;
+    }
+
+    const updateOffset = () => {
+      const topOffset = Number.parseFloat(window.getComputedStyle(element).top) || 0;
+      const offset = Math.ceil(topOffset + element.offsetHeight);
+      document.documentElement.style.setProperty("--sticky-toolbar-offset", `${offset}px`);
+    };
+
+    updateOffset();
+    const observer = new ResizeObserver(updateOffset);
+    observer.observe(element);
+    window.addEventListener("resize", updateOffset);
+    return () => {
+      observer.disconnect();
+      window.removeEventListener("resize", updateOffset);
+    };
+  }, []);
+
+  // Below this width, the More menu renders as a bottom sheet instead of an
+  // anchored dropdown so it never has to fight for horizontal room.
+  useEffect(() => {
+    if (typeof window === "undefined" || !window.matchMedia) {
+      return;
+    }
+    const query = window.matchMedia("(max-width: 640px)");
+    setIsCompactMenu(query.matches);
+    const handleChange = (event: MediaQueryListEvent) => setIsCompactMenu(event.matches);
+    query.addEventListener("change", handleChange);
+    return () => query.removeEventListener("change", handleChange);
+  }, []);
+
+  // Collision-aware placement for the anchored (non-compact) dropdown: flip
+  // above the trigger when there isn't comfortable room below, and always
+  // cap the menu to whatever room actually exists so it never runs off the
+  // bottom of a short viewport. Runs before paint to avoid a flash of the
+  // wrong placement.
+  useLayoutEffect(() => {
+    if (!menuOpen || isCompactMenu) {
+      return;
+    }
+
+    const updatePlacement = () => {
+      const trigger = triggerRef.current;
+      if (!trigger) {
+        return;
+      }
+      const rect = trigger.getBoundingClientRect();
+      const spaceBelow = window.innerHeight - rect.bottom - MENU_TRIGGER_GAP - MENU_VIEWPORT_MARGIN;
+      const spaceAbove = rect.top - MENU_TRIGGER_GAP - MENU_VIEWPORT_MARGIN;
+
+      if (spaceBelow < MENU_MIN_COMFORTABLE_HEIGHT && spaceAbove > spaceBelow) {
+        setMenuPlacement("above");
+        setMenuMaxHeight(Math.max(160, Math.floor(spaceAbove)));
+      } else {
+        setMenuPlacement("below");
+        setMenuMaxHeight(Math.max(160, Math.floor(spaceBelow)));
+      }
+    };
+
+    updatePlacement();
+    window.addEventListener("resize", updatePlacement);
+    return () => window.removeEventListener("resize", updatePlacement);
+  }, [menuOpen, isCompactMenu]);
 
   useEffect(() => {
     if (!menuOpen) {
@@ -181,8 +272,134 @@ export function StudioToolbar({
     }
   };
 
+  const menuItems = (
+    <div className="grid gap-2">
+      <Button
+        data-menu-item="true"
+        role="menuitem"
+        type="button"
+        size="sm"
+        variant="secondary"
+        className="md:hidden"
+        onClick={() => runMenuAction(completedCount > 0, onExportCsv)}
+        aria-disabled={!completedCount}
+      >
+        <Download className="h-4 w-4" />
+        CSV
+      </Button>
+      <Button
+        data-menu-item="true"
+        role="menuitem"
+        type="button"
+        size="sm"
+        variant="secondary"
+        className="md:hidden"
+        onClick={() => runMenuAction(completedCount > 0, onExportJson)}
+        aria-disabled={!completedCount}
+      >
+        <Download className="h-4 w-4" />
+        JSON
+      </Button>
+      <Button
+        data-menu-item="true"
+        role="menuitem"
+        type="button"
+        size="sm"
+        variant="secondary"
+        className="md:hidden"
+        onClick={() => runMenuAction(completedCount > 0, onExportMarkdown)}
+        aria-disabled={!completedCount}
+      >
+        <FileText className="h-4 w-4" />
+        Report
+      </Button>
+      <Button
+        data-menu-item="true"
+        role="menuitem"
+        type="button"
+        size="sm"
+        variant="secondary"
+        onClick={() => runMenuAction(completedCount > 0, onExportSession)}
+        aria-disabled={!completedCount}
+      >
+        <Save className="h-4 w-4" />
+        Export Session
+      </Button>
+      <Button
+        data-menu-item="true"
+        role="menuitem"
+        type="button"
+        size="sm"
+        variant="secondary"
+        onClick={() => runMenuAction(true, onOpenSession)}
+      >
+        <FolderOpen className="h-4 w-4" />
+        Open Session
+      </Button>
+      <Button
+        data-menu-item="true"
+        role="menuitem"
+        type="button"
+        size="sm"
+        variant={historyEnabled ? "secondary" : "primary"}
+        onClick={() => runMenuAction(true, onToggleHistory)}
+      >
+        <History className="h-4 w-4" />
+        {historyEnabled ? "Turn History Off" : "Turn History On"}
+      </Button>
+      <Button
+        data-menu-item="true"
+        role="menuitem"
+        type="button"
+        size="sm"
+        variant="secondary"
+        onClick={() => runMenuAction(historyEnabled, onOpenHistory)}
+        aria-disabled={!historyEnabled}
+      >
+        <History className="h-4 w-4" />
+        Open History
+      </Button>
+      <Button
+        data-menu-item="true"
+        role="menuitem"
+        type="button"
+        size="sm"
+        variant="secondary"
+        onClick={() => runMenuAction(finishedCount > 0, onClearFinished)}
+        aria-disabled={!finishedCount}
+      >
+        <Trash2 className="h-4 w-4" />
+        Clear Finished
+      </Button>
+      <Button
+        data-menu-item="true"
+        role="menuitem"
+        type="button"
+        size="sm"
+        variant="secondary"
+        onClick={() => runMenuAction(activeCount > 0, onCancelActive)}
+        aria-disabled={!activeCount}
+      >
+        <Square className="h-4 w-4" />
+        Cancel Active
+      </Button>
+      <Button
+        data-menu-item="true"
+        role="menuitem"
+        type="button"
+        size="sm"
+        variant="danger"
+        onClick={() => runMenuAction(jobsCount > 0, onClearSession)}
+        aria-disabled={!jobsCount}
+      >
+        <Trash2 className="h-4 w-4" />
+        Clear Session
+      </Button>
+    </div>
+  );
+
   return (
-    <div className="sticky top-2 z-30 sm:top-4">
+    <div ref={wrapperRef} className="sticky top-2 z-30 sm:top-4">
       <Card className="border-[var(--line)]/65 bg-[color:var(--surface-0)]/94 px-3 py-3 shadow-[0_14px_34px_rgba(0,0,0,0.14)] sm:px-5 sm:py-4">
         <div className="flex flex-col gap-3 sm:gap-4 xl:flex-row xl:items-center xl:justify-between">
           <div className="min-w-0">
@@ -192,9 +409,11 @@ export function StudioToolbar({
                 Home
               </Button>
               <span className="hidden h-6 w-px rounded-full bg-[var(--line)] sm:block" aria-hidden="true" />
-              <TruePeakLogo size="sm" subtitle="Review session" />
-              {/* Badge chips are context, not controls — drop them on phones so
-                  the sticky toolbar stays a thin strip above the queue. */}
+              {/* Branding is redundant chrome once a session is open; drop it
+                  on phones so the sticky bar stays Home/status/Add/More. */}
+              <TruePeakLogo size="sm" subtitle="Review session" className="hidden sm:inline-flex" />
+              {/* Badge chips are context, not controls, so drop them on phones
+                  to keep the sticky toolbar a thin strip above the queue. */}
               <Badge className="hidden md:inline-flex">{currentModeLabel}</Badge>
               <Badge className="hidden border-[var(--line)]/80 bg-[var(--surface-1)]/70 text-[var(--muted)] md:inline-flex">
                 {uiMode === "simple" ? "Simple view" : "Advanced view"}
@@ -204,8 +423,13 @@ export function StudioToolbar({
               </Badge>
             </div>
             <div className="mt-2 text-xs leading-5 text-[var(--muted)] sm:mt-3 sm:text-sm sm:leading-6">
-              {jobsCount} file{jobsCount === 1 ? "" : "s"} in this session, {activeCount} in progress, {completedCount} ready to review.
-              {parallelLimit && parallelLimit > 1 ? ` Runs up to ${parallelLimit} files at once.` : ""}
+              <span className="sm:hidden">
+                {completedCount}/{jobsCount} ready{activeCount > 0 ? ` · ${activeCount} active` : ""}
+              </span>
+              <span className="hidden sm:inline">
+                {jobsCount} file{jobsCount === 1 ? "" : "s"} in this session, {activeCount} in progress, {completedCount} ready to review.
+                {parallelLimit && parallelLimit > 1 ? ` Runs up to ${parallelLimit} files at once.` : ""}
+              </span>
             </div>
             {batchProgress ? (
               <div className="mt-2 flex items-center gap-3">
@@ -260,138 +484,41 @@ export function StudioToolbar({
                 More
               </Button>
               {menuOpen ? (
-                <div
-                  ref={menuRef}
-                  id={menuId}
-                  role="menu"
-                  aria-label="Session actions"
-                  onKeyDown={handleMenuKeyDown}
-                  className="absolute right-0 top-[calc(100%+0.6rem)] z-40 w-[280px] rounded-[22px] border border-[var(--line)] bg-[var(--surface-1)] p-3 shadow-[var(--shadow-elevated)]"
-                >
-                  <div className="grid gap-2">
-                    <Button
-                      data-menu-item="true"
-                      role="menuitem"
-                      type="button"
-                      size="sm"
-                      variant="secondary"
-                      className="md:hidden"
-                      onClick={() => runMenuAction(completedCount > 0, onExportCsv)}
-                      aria-disabled={!completedCount}
+                isCompactMenu ? (
+                  <>
+                    <div
+                      className="fixed inset-0 z-40 bg-black/45"
+                      aria-hidden="true"
+                      onClick={() => closeMenu()}
+                    />
+                    <div
+                      ref={menuRef}
+                      id={menuId}
+                      role="menu"
+                      aria-label="Session actions"
+                      onKeyDown={handleMenuKeyDown}
+                      className="fixed inset-x-0 bottom-0 z-40 max-h-[calc(100dvh_-_4rem)] overflow-y-auto overscroll-contain rounded-t-[22px] border border-[var(--line)] bg-[var(--surface-1)] p-3 pb-[max(1rem,env(safe-area-inset-bottom))] shadow-[var(--shadow-elevated)]"
                     >
-                      <Download className="h-4 w-4" />
-                      CSV
-                    </Button>
-                    <Button
-                      data-menu-item="true"
-                      role="menuitem"
-                      type="button"
-                      size="sm"
-                      variant="secondary"
-                      className="md:hidden"
-                      onClick={() => runMenuAction(completedCount > 0, onExportJson)}
-                      aria-disabled={!completedCount}
-                    >
-                      <Download className="h-4 w-4" />
-                      JSON
-                    </Button>
-                    <Button
-                      data-menu-item="true"
-                      role="menuitem"
-                      type="button"
-                      size="sm"
-                      variant="secondary"
-                      className="md:hidden"
-                      onClick={() => runMenuAction(completedCount > 0, onExportMarkdown)}
-                      aria-disabled={!completedCount}
-                    >
-                      <FileText className="h-4 w-4" />
-                      Report
-                    </Button>
-                    <Button
-                      data-menu-item="true"
-                      role="menuitem"
-                      type="button"
-                      size="sm"
-                      variant="secondary"
-                      onClick={() => runMenuAction(completedCount > 0, onExportSession)}
-                      aria-disabled={!completedCount}
-                    >
-                      <Save className="h-4 w-4" />
-                      Export Session
-                    </Button>
-                    <Button
-                      data-menu-item="true"
-                      role="menuitem"
-                      type="button"
-                      size="sm"
-                      variant="secondary"
-                      onClick={() => runMenuAction(true, onOpenSession)}
-                    >
-                      <FolderOpen className="h-4 w-4" />
-                      Open Session
-                    </Button>
-                    <Button
-                      data-menu-item="true"
-                      role="menuitem"
-                      type="button"
-                      size="sm"
-                      variant={historyEnabled ? "secondary" : "primary"}
-                      onClick={() => runMenuAction(true, onToggleHistory)}
-                    >
-                      <History className="h-4 w-4" />
-                      {historyEnabled ? "Turn History Off" : "Turn History On"}
-                    </Button>
-                    <Button
-                      data-menu-item="true"
-                      role="menuitem"
-                      type="button"
-                      size="sm"
-                      variant="secondary"
-                      onClick={() => runMenuAction(historyEnabled, onOpenHistory)}
-                      aria-disabled={!historyEnabled}
-                    >
-                      <History className="h-4 w-4" />
-                      Open History
-                    </Button>
-                    <Button
-                      data-menu-item="true"
-                      role="menuitem"
-                      type="button"
-                      size="sm"
-                      variant="secondary"
-                      onClick={() => runMenuAction(finishedCount > 0, onClearFinished)}
-                      aria-disabled={!finishedCount}
-                    >
-                      <Trash2 className="h-4 w-4" />
-                      Clear Finished
-                    </Button>
-                    <Button
-                      data-menu-item="true"
-                      role="menuitem"
-                      type="button"
-                      size="sm"
-                      variant="secondary"
-                      onClick={() => runMenuAction(activeCount > 0, onCancelActive)}
-                      aria-disabled={!activeCount}
-                    >
-                      <Square className="h-4 w-4" />
-                      Cancel Active
-                    </Button>
-                    <Button
-                      data-menu-item="true"
-                      role="menuitem"
-                      type="button"
-                      size="sm"
-                      variant="danger"
-                      onClick={() => runMenuAction(jobsCount > 0, onClearSession)}
-                      aria-disabled={!jobsCount}
-                    >
-                      <Trash2 className="h-4 w-4" />
-                      Clear Session
-                    </Button>
+                      <div className="mx-auto mb-2 h-1.5 w-10 shrink-0 rounded-full bg-[var(--line)]" aria-hidden="true" />
+                      {menuItems}
+                    </div>
+                  </>
+                ) : (
+                  <div
+                    ref={menuRef}
+                    id={menuId}
+                    role="menu"
+                    aria-label="Session actions"
+                    onKeyDown={handleMenuKeyDown}
+                    style={menuMaxHeight != null ? { maxHeight: `${menuMaxHeight}px` } : undefined}
+                    className={cn(
+                      "absolute right-0 z-40 w-[280px] max-w-[calc(100vw_-_2rem)] max-h-[calc(100dvh_-_8rem)] overflow-y-auto overscroll-contain rounded-[22px] border border-[var(--line)] bg-[var(--surface-1)] p-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] shadow-[var(--shadow-elevated)]",
+                      menuPlacement === "above" ? "bottom-[calc(100%+0.6rem)]" : "top-[calc(100%+0.6rem)]",
+                    )}
+                  >
+                    {menuItems}
                   </div>
-                </div>
+                )
               ) : null}
             </div>
           </div>

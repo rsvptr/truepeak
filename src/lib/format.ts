@@ -1,3 +1,5 @@
+import type { IntegratedInvalidReason, LoudnessMetrics } from "@/types/audio";
+
 const NEGATIVE_FLOOR = -144;
 const timestampFormatter = new Intl.DateTimeFormat("en-GB", {
   year: "numeric",
@@ -24,12 +26,83 @@ export function formatLufs(value: number | null | undefined, precision = 2) {
   return `${toFixedClean(value, precision)} LUFS`;
 }
 
+export function describeIntegratedInvalidReason(
+  reason: IntegratedInvalidReason | undefined,
+) {
+  switch (reason) {
+    case "too-short":
+      return "Clip is too short for a complete 400 ms gated measurement.";
+    case "below-gate":
+      return "All audio is below the -70 LUFS absolute gate.";
+    default:
+      return "Integrated loudness is not a valid measurement.";
+  }
+}
+
+/**
+ * Formats the measured value only when the analyzer says it is valid. Legacy
+ * records have no validity flag and retain their historical presentation.
+ */
+export function formatIntegratedLufs(
+  metrics: Pick<LoudnessMetrics, "integratedLufs" | "integratedValid">,
+  precision = 2,
+) {
+  return metrics.integratedValid === false
+    ? "No valid measurement"
+    : formatLufs(metrics.integratedLufs, precision);
+}
+
+export function formatLoudnessRange(
+  metrics: Pick<LoudnessMetrics, "loudnessRange" | "loudnessRangeUnstable">,
+  precision = 2,
+) {
+  const value = formatDb(metrics.loudnessRange, "LU", precision);
+  return metrics.loudnessRangeUnstable === true ? `${value} (unstable)` : value;
+}
+
 export function formatDb(value: number | null | undefined, suffix = "dB", precision = 2) {
   if (value == null || !Number.isFinite(value)) {
     return "n/a";
   }
 
   return `${toFixedClean(value, precision)} ${suffix}`;
+}
+
+// Strips trailing fractional zeros (and a bare trailing dot) left behind by
+// toFixedClean, e.g. "-18.00" -> "-18" but "-14.50" -> "-14.5". The decimal
+// point always precedes any zero this removes, so a whole number's own
+// trailing zero (as in "-100.00") is never touched.
+function trimTrailingZeros(fixed: string) {
+  if (!fixed.includes(".")) {
+    return fixed;
+  }
+
+  return fixed.replace(/0+$/, "").replace(/\.$/, "");
+}
+
+/**
+ * Formats preset-defined targets (loudness targets, true-peak ceilings) at
+ * only the precision they actually carry. Built-in presets are whole
+ * numbers, so this renders "-18 LUFS" rather than formatLufs's "-18.00
+ * LUFS" - a decimal suffix on a preset constant reads as measured
+ * precision it doesn't have. Custom targets can still carry real decimal
+ * input (e.g. -14.5), which this preserves instead of rounding it away.
+ */
+export function formatPresetLufs(value: number | null | undefined, precision = 2) {
+  if (value == null || !Number.isFinite(value)) {
+    return "n/a";
+  }
+
+  return `${trimTrailingZeros(toFixedClean(value, precision))} LUFS`;
+}
+
+/** Preset/ceiling counterpart to {@link formatPresetLufs}; see its docs. */
+export function formatPresetPeakDbtp(value: number | null | undefined, precision = 2) {
+  if (value == null || !Number.isFinite(value)) {
+    return "n/a";
+  }
+
+  return `${trimTrailingZeros(toFixedClean(value, precision))} dBTP`;
 }
 
 export function formatPeakDbtp(value: number | null | undefined) {

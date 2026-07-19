@@ -11,6 +11,10 @@ const SUPPORTED_AIFC_COMPRESSION_TYPES = new Set([
   "FL64",
 ]);
 
+// FVER timestamp for AIFF-C Version 1 (the only defined AIFC version), per the
+// Apple AIFF-C specification. AIFC files must carry an FVER chunk declaring it.
+const AIFC_VERSION_1 = 0xa2805140;
+
 function readAscii(view: DataView, offset: number, length: number) {
   let out = "";
   for (let index = 0; index < length; index += 1) {
@@ -105,6 +109,10 @@ export function parseAiffBuffer(
     throw new Error("Not an AIFF/AIFC file.");
   }
 
+  if (view.byteLength < 12) {
+    throw new Error("AIFF file header is truncated.");
+  }
+
   const formType = readAscii(view, 8, 4);
   if (formType !== "AIFF" && formType !== "AIFC") {
     throw new Error("Unsupported FORM type.");
@@ -115,11 +123,18 @@ export function parseAiffBuffer(
   let commSize = 0;
   let ssndOffset = 0;
   let ssndSize = 0;
+  let fverOffset = 0;
+  let fverSize = 0;
 
   while (offset + 8 <= view.byteLength) {
     const chunkId = readAscii(view, offset, 4);
     const chunkSize = view.getUint32(offset + 4, false);
     const dataOffset = offset + 8;
+
+    if (chunkId === "FVER") {
+      fverOffset = dataOffset;
+      fverSize = chunkSize;
+    }
 
     if (chunkId === "COMM") {
       commOffset = dataOffset;
@@ -131,9 +146,11 @@ export function parseAiffBuffer(
       ssndSize = chunkSize;
     }
 
-    // One COMM and one SSND chunk describe a valid file; stop scanning once
-    // both are known so attacker-padded chunk tails can't burn time.
-    if (commOffset && ssndOffset) {
+    // A valid AIFF is described by COMM + SSND; a valid AIFC additionally requires
+    // the mandatory FVER version chunk. Stop scanning once the required chunks are
+    // known so attacker-padded chunk tails can't burn time. FVER may legitimately
+    // appear after COMM/SSND, so for AIFC keep scanning until it is found or EOF.
+    if (commOffset && ssndOffset && (formType !== "AIFC" || fverOffset)) {
       break;
     }
 
@@ -142,6 +159,24 @@ export function parseAiffBuffer(
 
   if (!commOffset || !ssndOffset) {
     throw new Error("AIFF file is missing COMM or SSND chunks.");
+  }
+
+  // M-13: AIFC must carry the mandatory FVER (format version) chunk declaring the
+  // AIFF-C Version 1 timestamp. Reject a missing, truncated, or wrong-version FVER.
+  // Plain AIFF must not carry one and is unaffected.
+  if (formType === "AIFC") {
+    if (!fverOffset) {
+      throw new Error("AIFC file is missing the mandatory FVER (format version) chunk.");
+    }
+    if (fverSize < 4 || fverOffset + 4 > view.byteLength) {
+      throw new Error("AIFC FVER chunk is truncated.");
+    }
+    const fverTimestamp = view.getUint32(fverOffset, false);
+    if (fverTimestamp !== AIFC_VERSION_1) {
+      throw new Error(
+        `AIFC FVER declares an unsupported version timestamp 0x${fverTimestamp.toString(16)} (expected 0x${AIFC_VERSION_1.toString(16)}).`,
+      );
+    }
   }
 
   if (commSize < 18 || commOffset + 18 > view.byteLength) {
@@ -164,12 +199,35 @@ export function parseAiffBuffer(
     throw new Error("Invalid AIFF format values.");
   }
 
-  if (formType === "AIFC" && commSize >= 22) {
+  if (formType === "AIFC") {
+    // The extended AIFC COMM adds, after the 18 fixed bytes, a 4-byte compression
+    // type ID and a compression-name Pascal string (a 1-byte length count followed
+    // by that many characters). The minimum is therefore 23 bytes (18 + 4 + a count
+    // byte, even for an empty name). Bound BOTH the fixed+type region AND the pstring
+    // (count byte plus its declared characters) to the declared COMM size and to the
+    // physical buffer — never read out of bounds, and never default to PCM when the
+    // metadata is truncated or the name length is forged.
+    if (commSize < 23 || commOffset + 23 > view.byteLength) {
+      throw new Error(
+        "AIFC COMM chunk is missing its compression-type / compression-name fields (truncated extended COMM).",
+      );
+    }
     compressionType = readAscii(view, commOffset + 18, 4);
+    const compressionNameCount = view.getUint8(commOffset + 22);
+    const compressionNameEnd = commOffset + 23 + compressionNameCount;
+    if (compressionNameEnd > commOffset + commSize || compressionNameEnd > view.byteLength) {
+      throw new Error(
+        "AIFC COMM compression-name string extends past the COMM chunk or the end of the buffer.",
+      );
+    }
+
+    if (!SUPPORTED_AIFC_COMPRESSION_TYPES.has(compressionType)) {
+      throw new Error(`Unsupported AIFC compression type: ${compressionType}.`);
+    }
   }
 
-  if (formType === "AIFC" && !SUPPORTED_AIFC_COMPRESSION_TYPES.has(compressionType)) {
-    throw new Error(`Unsupported AIFC compression type: ${compressionType}.`);
+  if (ssndOffset + 8 > view.byteLength) {
+    throw new Error("AIFF SSND chunk is truncated.");
   }
 
   const soundDataOffset = view.getUint32(ssndOffset, false);

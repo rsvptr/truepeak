@@ -12,6 +12,13 @@ updates:
       # integrity-pins; automated bumps would fail the build until a human
       # reviews and re-pins anyway. Updates to it are deliberate, manual events.
       - dependency-name: "@ffmpeg/core"
+      # A TypeScript major bump ahead of the toolchain breaks the build: next
+      # build loads typescript through its own resolver, and a major it does not
+      # recognise fails with "trying to use TypeScript but do not have the
+      # required package(s)". Next and eslint-config-next set the supported
+      # range, so TypeScript majors move with them, not on their own.
+      - dependency-name: "typescript"
+        update-types: ["version-update:semver-major"]
     groups:
       minor-and-patch:
         update-types:

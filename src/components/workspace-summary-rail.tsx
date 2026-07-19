@@ -2,7 +2,7 @@
 
 import { BarChart3, SlidersHorizontal } from "lucide-react";
 import type { ComplianceState } from "@/audio/compliance";
-import { formatLufs, formatPeakDbtp } from "@/lib/format";
+import { formatLufs, formatPeakDbtp, formatPresetLufs, formatPresetPeakDbtp } from "@/lib/format";
 import type { AnalysisMode, TargetPreset } from "@/types/audio";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -24,7 +24,7 @@ interface WorkspaceSummaryRailProps {
 
 function RailMetric({ label, value, hint }: { label: string; value: string; hint: string }) {
   return (
-    <div className="flex h-full min-h-[96px] flex-col justify-between rounded-[20px] border border-[var(--line)]/60 bg-[var(--surface-1)]/50 px-3 py-3 sm:min-h-[124px] sm:px-4 sm:py-4">
+    <div className="flex h-full min-h-[96px] min-w-[150px] shrink-0 snap-start flex-col justify-between rounded-[20px] border border-[var(--line)]/60 bg-[var(--surface-1)]/50 px-3 py-3 sm:min-h-[124px] sm:min-w-0 sm:px-4 sm:py-4">
       <div className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">{label}</div>
       <div className="mt-2 break-words text-lg font-semibold text-[var(--ink)] tabular-nums sm:mt-3">{value}</div>
       <div className="mt-1 text-xs leading-5 text-[var(--muted)] sm:mt-2">{hint}</div>
@@ -34,7 +34,7 @@ function RailMetric({ label, value, hint }: { label: string; value: string; hint
 
 function CompactMetric({ label, value }: { label: string; value: string }) {
   return (
-    <div className="min-w-[104px] rounded-[16px] border border-[var(--line)]/60 bg-[var(--surface-1)]/46 px-3 py-2.5">
+    <div className="min-w-[104px] shrink-0 snap-start rounded-[16px] border border-[var(--line)]/60 bg-[var(--surface-1)]/46 px-3 py-2.5">
       <div className="text-[10px] uppercase tracking-[0.16em] text-[var(--muted)]">{label}</div>
       <div className="mt-1 text-sm font-semibold tabular-nums text-[var(--ink)]">{value}</div>
     </div>
@@ -59,7 +59,10 @@ export function WorkspaceSummaryRail({
     return (
       <div className="rounded-[20px] border border-[var(--line)]/60 bg-[var(--surface-0)]/82 px-3 py-3">
         <div className="flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
-          <div className="grid min-w-0 grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-6 xl:flex xl:flex-wrap">
+          {/* Mobile: single-row horizontal snap rail so the six metrics stay
+              one compact strip above the results instead of three stacked rows
+              (UX-010). sm and up restore the original grid/flex layout. */}
+          <div className="flex min-w-0 snap-x gap-2 overflow-x-auto pb-1 sm:grid sm:grid-cols-3 sm:overflow-visible sm:pb-0 lg:grid-cols-6 xl:flex xl:flex-wrap">
             <CompactMetric label="Queue" value={String(queueCount)} />
             <CompactMetric label="Complete" value={String(completedCount)} />
             <CompactMetric label="Issues" value={String(issueCount)} />
@@ -76,7 +79,7 @@ export function WorkspaceSummaryRail({
                 <div className="text-[10px] uppercase tracking-[0.16em] text-[var(--muted)]">Preset</div>
                 <div className="mt-1 truncate text-sm font-semibold text-[var(--ink)]">{currentTarget.label}</div>
                 <div className="mt-0.5 text-xs tabular-nums text-[var(--muted)]">
-                  {formatLufs(currentTarget.loudnessTargetLufs)} / {formatPeakDbtp(currentTarget.truePeakCeilingDbtp)}
+                  {formatPresetLufs(currentTarget.loudnessTargetLufs)} / {formatPresetPeakDbtp(currentTarget.truePeakCeilingDbtp)}
                 </div>
               </div>
             ) : (
@@ -85,20 +88,18 @@ export function WorkspaceSummaryRail({
               </div>
             )}
 
-            <div className="flex shrink-0 flex-wrap gap-2">
-              {analysisMode === "targeted" && currentTarget ? (
+            {/* No Compare button here: the compact rail only renders in
+                Advanced mode, immediately above the Session views tablist,
+                which already offers a Compare tab (see UX-036). Repeating
+                the action here doubled up the same destination. */}
+            {analysisMode === "targeted" && currentTarget ? (
+              <div className="flex shrink-0 flex-wrap gap-2">
                 <Button type="button" size="sm" variant="secondary" onClick={onOpenPresetLibrary}>
                   <SlidersHorizontal className="h-4 w-4" />
                   Presets
                 </Button>
-              ) : null}
-              {canOpenCompare ? (
-                <Button type="button" size="sm" variant="secondary" onClick={onOpenCompare}>
-                  <BarChart3 className="h-4 w-4" />
-                  Compare
-                </Button>
-              ) : null}
-            </div>
+              </div>
+            ) : null}
           </div>
         </div>
       </div>
@@ -108,12 +109,14 @@ export function WorkspaceSummaryRail({
   return (
     <div className="rounded-[24px] border border-[var(--line)]/65 bg-[var(--surface-0)]/92 px-4 py-4 sm:px-5">
       <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_minmax(320px,0.84fr)] xl:items-stretch">
-        <div className="grid grid-cols-2 gap-3 xl:grid-cols-3 2xl:grid-cols-6">
+        {/* Mobile: single-row horizontal snap rail (UX-010); sm and up restore
+            the original responsive grid. */}
+        <div className="flex snap-x gap-3 overflow-x-auto pb-1 sm:grid sm:grid-cols-2 sm:overflow-visible sm:pb-0 xl:grid-cols-3 2xl:grid-cols-6">
           <RailMetric label="Queue" value={String(queueCount)} hint="Files in this session" />
           <RailMetric label="Complete" value={String(completedCount)} hint="Ready to inspect" />
           <RailMetric label="Issues" value={String(issueCount)} hint="Failed or canceled" />
-          <RailMetric label="Average LUFS" value={formatLufs(averageLufs)} hint="Across completed files" />
-          <RailMetric label="Peak watch" value={formatPeakDbtp(hottestTruePeak)} hint="Highest measured true peak" />
+          <RailMetric label="Average LUFS" value={formatLufs(averageLufs)} hint="Across valid integrated readings" />
+          <RailMetric label="Hottest peak" value={formatPeakDbtp(hottestTruePeak)} hint="Highest measured true peak" />
           {analysisMode === "targeted" && complianceCounts ? (
             <RailMetric label="On target" value={String(complianceCounts["on-target"])} hint="Inside the tolerance window" />
           ) : null}
@@ -127,7 +130,7 @@ export function WorkspaceSummaryRail({
                   <div className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">Current preset</div>
                   <div className="mt-2 text-base font-semibold text-[var(--ink)]">{currentTarget.label}</div>
                   <div className="mt-1 text-sm text-[var(--muted)] tabular-nums">
-                    {formatLufs(currentTarget.loudnessTargetLufs)} / {formatPeakDbtp(currentTarget.truePeakCeilingDbtp)}
+                    {formatPresetLufs(currentTarget.loudnessTargetLufs)} / {formatPresetPeakDbtp(currentTarget.truePeakCeilingDbtp)}
                   </div>
                 </div>
                 <Button type="button" size="sm" variant="secondary" className="justify-center" onClick={onOpenPresetLibrary}>

@@ -8,9 +8,9 @@ const buttonVariants = cva(
     variants: {
       variant: {
         primary:
-          "border-transparent bg-[var(--accent-strong)] px-4 py-2 text-[var(--surface-0)] shadow-sm hover:bg-[var(--accent)] hover:shadow-[0_12px_28px_rgba(18,141,129,0.2)] focus-visible:ring-[var(--accent)]",
+          "border-transparent bg-[var(--accent-strong)] px-4 py-2 text-[var(--surface-0)] shadow-sm hover:bg-[var(--accent-hover)] hover:shadow-[0_12px_28px_rgba(18,141,129,0.2)] focus-visible:ring-[var(--accent)]",
         secondary:
-          "border-[var(--line)] bg-[var(--surface-1)] px-4 py-2 text-[var(--ink)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--surface-2)] hover:text-[var(--ink)] focus-visible:ring-[var(--accent)]",
+          "border-[var(--control-line)] bg-[var(--surface-1)] px-4 py-2 text-[var(--ink)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--surface-2)] hover:text-[var(--ink)] focus-visible:ring-[var(--accent)]",
         ghost:
           "border-transparent px-3 py-2 text-[var(--muted)] hover:bg-[var(--surface-2)] hover:text-[var(--ink)] focus-visible:ring-[var(--accent)]",
         danger:

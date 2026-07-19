@@ -47,6 +47,7 @@ export type ChannelLabel =
   | "Tfl"
   | "Tfc"
   | "Tfr"
+  | "Tc"
   | "Tsl"
   | "Tsr"
   | "Tbl"
@@ -110,10 +111,28 @@ export interface AnalysisTimeline {
   truePeakDbtp: number[];
 }
 
+export type IntegratedInvalidReason = "too-short" | "below-gate";
+
 export interface LoudnessMetrics {
   integratedLufs: number;
   ungatedLufs: number;
   loudnessRange: number;
+  /**
+   * False when no complete 400 ms gated block exists ("too-short") or nothing
+   * survives the -70 LUFS absolute gate ("below-gate"). When false,
+   * `integratedLufs` still carries the legacy -70 sentinel for wire
+   * compatibility but MUST NOT be presented as a measurement. Absent on
+   * records analyzed before this field existed: treat absent as
+   * "unknown/legacy", not as false.
+   */
+  integratedValid?: boolean;
+  /** Present iff integratedValid === false. */
+  integratedInvalidReason?: IntegratedInvalidReason;
+  /**
+   * True when programme duration < 60 s: Loudness Range is not statistically
+   * stable per EBU Tech 3341 section 2.4.
+   */
+  loudnessRangeUnstable?: boolean;
   maxMomentaryLufs: number | null;
   maxShortTermLufs: number | null;
   samplePeakDbfs: number;
@@ -134,6 +153,25 @@ export interface AnalysisResult {
   analyzedAt: string;
 }
 
+export type AnalysisProvenanceKind =
+  | "local-analysis"
+  | "restored-local"
+  | "unverified-import";
+
+/**
+ * Result origin carried across persistence and portable exports.
+ *
+ * `sourceJobId` and `sourceSessionDigest` are deliberately plain strings at
+ * the type level because their hard bounds are enforced at every session-file
+ * trust boundary. A portable file can never grant itself local provenance:
+ * the importer always rewrites its origin to `unverified-import`.
+ */
+export interface AnalysisProvenance {
+  kind: AnalysisProvenanceKind;
+  sourceJobId?: string;
+  sourceSessionDigest?: string;
+}
+
 export interface AnalysisJob {
   id: string;
   fileName: string;
@@ -150,6 +188,10 @@ export interface AnalysisJob {
   // True for jobs restored from this browser's persisted live session after a
   // refresh. Results only, like imported jobs.
   restored?: boolean;
+  // Structured origin used by portable sessions and report exports. Optional
+  // for legacy in-memory/IndexedDB records; consumers infer local/imported/
+  // restored origin from the compatibility flags when it is absent.
+  provenance?: AnalysisProvenance;
   // Wall-clock processing window for this run (epoch ms). Session-local only:
   // used for the per-file timing display and the batch ETA estimate.
   startedAtMs?: number;
@@ -161,10 +203,16 @@ export interface RecentSessionEntry {
   fileName: string;
   analyzedAt: string;
   analysisMode: AnalysisMode;
+  /** Explicitly distinguishes current-contract summaries from migrated rows. */
+  recordTrust?: "validated-v2" | "legacy-unknown";
+  provenanceKind?: AnalysisProvenanceKind;
   targetLabel: string | null;
   integratedLufs: number;
+  integratedValid?: boolean;
+  integratedInvalidReason?: IntegratedInvalidReason;
   truePeakDbtp: number;
   loudnessRange: number;
+  loudnessRangeUnstable?: boolean;
   sampleRate: number;
   channelLayoutName: string;
   decoderLabel: string;

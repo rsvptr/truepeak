@@ -7,6 +7,20 @@ import {
   shouldPreferBrowserDecoder,
 } from "@/audio/browser-decode";
 import {
+  DecodeResourceError,
+  assertDecodedFootprint,
+  assertSourceWithinBudget,
+  checkedResourceByteSum,
+  conservativeDecodePeakBytes,
+  decodePeakResidentBytes,
+  decodeFailureDetails,
+  growDecodePeakReservation,
+  inspectAudioContainer,
+  resolveDecodeBudget,
+  validatePlanarChannels,
+  type DecodeBudget,
+} from "@/audio/decode-budget";
+import {
   buildCsvExport,
   buildJsonExport,
   buildMarkdownExport,
@@ -14,25 +28,29 @@ import {
 } from "@/audio/export";
 import {
   MAX_SESSION_FILE_BYTES,
+  MAX_SESSION_JOBS,
   buildSessionFile,
   getSessionFileName,
-  parseSessionFile,
+  planSessionIntake,
 } from "@/audio/session-file";
 import {
-  clearLiveSession,
-  loadLiveSessionJobs,
-  persistLiveSessionJobs,
-  removeLiveSessionJobs,
+  indexedDbLiveSessionStore,
 } from "@/audio/live-session-store";
+import {
+  createLiveSessionController,
+  type LiveSessionControllerResult,
+} from "@/audio/live-session-controller";
 import {
   clearPersistedRecentSessions,
   loadRecentSessions,
   persistRecentSessions,
 } from "@/audio/persistence";
 import { DEFAULT_TARGET_PRESET } from "@/audio/presets";
+import { mergeImportedJobs, reconcileSessionJobs } from "@/audio/session-reconciliation";
 import { retargetAnalysisResult } from "@/audio/targeting";
 import { getCompletedAnalysisJobs, isActiveJob, isIssueJob } from "@/lib/session-selectors";
 import { makeId } from "@/lib/utils";
+import { fileIdentityKey } from "@/lib/file-identity";
 import type { ParallelLanesPreference } from "@/lib/workspace-preferences";
 import type {
   AnalysisJob,
@@ -47,12 +65,43 @@ import type {
   AnalyzerResponse,
   DecoderRequest,
   DecoderResponse,
+  DecodeResourceUsage,
 } from "@/workers/shared/messages";
+import type { SessionImportWorkerResponse } from "@/workers/session-import.worker";
 
 interface PendingResolver<T> {
   resolve: (value: T) => void;
   reject: (reason?: unknown) => void;
+  lease: LaneLease;
+  workerEpoch: number;
 }
+
+interface DecodedWorkerResult {
+  asset: DecodedAudioTransfer;
+  usage: DecodeResourceUsage;
+}
+
+interface DecodeReservation {
+  readonly plannedPeakBytes: number;
+  peakBytes: number;
+  exclusive: boolean;
+  released: boolean;
+}
+
+interface LaneLease {
+  readonly laneId: number;
+  readonly generation: number;
+  readonly jobId: string;
+  readonly runToken: number;
+  readonly reservation: DecodeReservation;
+  readonly browserAbortController: AbortController;
+}
+
+type JobResourcePlan =
+  | { kind: "preparing" }
+  | { kind: "known"; decodedBytes: number; trustedNative: boolean }
+  | { kind: "unknown" }
+  | { kind: "rejected"; error: string };
 
 // A lane is an independent decoder+analyzer worker pair that owns at most one
 // job at a time. Multiple lanes let the queue process files in parallel while
@@ -60,17 +109,27 @@ interface PendingResolver<T> {
 // terminates only its own lane's workers, never a neighbour's.
 interface WorkerLane {
   id: number;
-  decoder: Worker;
-  analyzer: Worker;
-  jobId: string | null;
+  decoder: Worker | null;
+  analyzer: Worker | null;
+  workerEpoch: number;
+  leaseGeneration: number;
+  lease: LaneLease | null;
+  retireAfterRelease: boolean;
   // Consecutive worker failures without a single successful message. Guards
   // against an unbounded terminate/respawn loop when worker scripts cannot
   // load at all (stale deploy, offline revisit).
   failureStreak: number;
 }
 
-// After this many consecutive worker failures the lane is removed instead of
-// re-attached; fresh lanes only appear again on the next queue activity.
+class WorkerTransportError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "WorkerTransportError";
+  }
+}
+
+// After this many consecutive worker failures the lane retires and the worker
+// circuit remains open until the user explicitly queues or retries work.
 const MAX_LANE_FAILURE_STREAK = 3;
 
 // Where analysis begins on the job's overall progress bar (read+decode owns
@@ -82,8 +141,84 @@ const ANALYSIS_PROGRESS_BASE = 0.86;
 // especially on phones; fresh lanes spin up in milliseconds when needed.
 const IDLE_LANE_TEARDOWN_MS = 45_000;
 
-// Hard ceiling on files accepted into one session in a single add.
-const MAX_INTAKE_FILES = 2000;
+const SESSION_IMPORT_TIMEOUT_MS = 45_000;
+
+function importSessionInWorker(file: File) {
+  return new Promise<Extract<SessionImportWorkerResponse, { type: "result" }>>(
+    (resolve, reject) => {
+      let worker: Worker;
+      try {
+        worker = new Worker(
+          new URL("../workers/session-import.worker.ts", import.meta.url),
+          { type: "module" },
+        );
+      } catch (error) {
+        reject(
+          new Error(
+            error instanceof Error
+              ? `Session import worker could not start: ${error.message}`
+              : "Session import worker could not start.",
+          ),
+        );
+        return;
+      }
+
+      let settled = false;
+      const finish = (
+        callback: () => void,
+      ) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        window.clearTimeout(timeoutId);
+        worker.terminate();
+        callback();
+      };
+      const timeoutId = window.setTimeout(() => {
+        finish(() => reject(new Error("Session validation timed out.")));
+      }, SESSION_IMPORT_TIMEOUT_MS);
+
+      worker.onerror = (event) => {
+        event.preventDefault();
+        finish(() =>
+          reject(
+            new Error(
+              event.message
+                ? `Session import worker failed: ${event.message}`
+                : "Session import worker failed.",
+            ),
+          ),
+        );
+      };
+      worker.onmessageerror = () => {
+        finish(() => reject(new Error("Session import worker returned an unreadable result.")));
+      };
+      worker.onmessage = (event: MessageEvent<SessionImportWorkerResponse>) => {
+        const message = event.data;
+        if (message.type === "error") {
+          finish(() => reject(new Error(message.error)));
+          return;
+        }
+        finish(() => resolve(message));
+      };
+
+      try {
+        worker.postMessage({ type: "import-session", file });
+      } catch (error) {
+        finish(() =>
+          reject(
+            new Error(
+              error instanceof Error
+                ? `Could not send the session file for validation: ${error.message}`
+                : "Could not send the session file for validation.",
+            ),
+          ),
+        );
+      }
+    },
+  );
+}
 
 function deviceMemoryGb() {
   if (typeof navigator === "undefined") {
@@ -146,12 +281,44 @@ function resolveHeavyFileBytes() {
   return (constrained ? 96 : 256) * 1024 * 1024;
 }
 
+function resolveAggregatePeakBytes(budget: DecodeBudget) {
+  const memory = deviceMemoryGb();
+  const canHoldTwoPeakRoutes =
+    memory != null ? memory >= 8 : !isCoarsePointerDevice();
+  const singleRoutePeak = conservativeDecodePeakBytes(budget);
+  return canHoldTwoPeakRoutes
+    ? checkedResourceByteSum(
+        [singleRoutePeak, singleRoutePeak],
+        "Aggregate decode route capacity",
+      )
+    : singleRoutePeak;
+}
+
+function canTryAlternateDecoder(error: unknown) {
+  return decodeFailureDetails(error).retryable;
+}
+
+function workerFailure(reason: string) {
+  return new WorkerTransportError(reason);
+}
+
+function cancellationFailure(reason: string) {
+  return new DecodeResourceError("cancelled", reason);
+}
+
+function allowRecoveryWritesByDefault() {
+  return true;
+}
+
 export interface UseTruePeakAnalyzerOptions {
   analysisMode?: AnalysisMode;
   analysisBlocked?: boolean;
   decodePreference?: DecodePreference;
   persistHistory?: boolean;
   parallelPreference?: ParallelLanesPreference;
+  restoreReady?: boolean;
+  recoveryWriteAllowed?: () => boolean;
+  recoveryWriteRevision?: number;
 }
 
 interface AnalyzerSettings {
@@ -221,10 +388,6 @@ function normalizeDecodeFailure(message: string, decodePreference: DecodePrefere
   return message;
 }
 
-function fileSignature(file: File) {
-  return `${file.name}:${file.size}:${file.lastModified}`;
-}
-
 const SUPPORTED_AUDIO_EXTENSIONS = new Set([
   "wav",
   "rf64",
@@ -269,11 +432,17 @@ function completedHistoryFingerprint(jobs: AnalysisJob[]) {
         target?.truePeakCeilingDbtp ?? "",
         target?.toleranceLufs ?? "",
         result.metrics.integratedLufs,
+        result.metrics.integratedValid ?? "legacy",
+        result.metrics.integratedInvalidReason ?? "",
         result.metrics.truePeakDbtp,
         result.metrics.loudnessRange,
+        result.metrics.loudnessRangeUnstable ?? "legacy",
         result.metadata.sampleRate,
         result.metadata.channelLayout.name,
         result.metadata.decoderLabel,
+        job.provenance?.kind ?? "legacy",
+        job.provenance?.sourceSessionDigest ?? "",
+        job.provenance?.sourceJobId ?? "",
         compliance?.label ?? "",
       ].join("");
     })
@@ -288,11 +457,38 @@ function describeWorkerFailure(label: string, event: ErrorEvent | MessageEvent) 
   return `${label} worker could not process a message.`;
 }
 
-// Shared by runJob's failure handler and resetLane's direct update so both
-// classify the same reasons as cancellation rather than failure.
+// Shared by runJob's failure handler and user-driven interruption paths so
+// both classify the same reasons as cancellation rather than failure.
 function isCancellationReason(message: string) {
   const lower = message.toLowerCase();
   return lower.includes("cancel") || lower.includes("restarted") || lower.includes("removed");
+}
+
+function persistenceFailureMessage(
+  result: LiveSessionControllerResult,
+  action: "restore" | "save" | "delete" | "clear",
+) {
+  const { outcome } = result;
+  if (
+    outcome.status !== "unavailable" &&
+    outcome.status !== "blocked" &&
+    outcome.status !== "failed"
+  ) {
+    return null;
+  }
+
+  const actionLabel =
+    action === "restore"
+      ? "restore the previous session"
+      : action === "save"
+        ? "save the recovery copy"
+        : action === "delete"
+          ? "update the recovery copy"
+          : "delete the recovery copy";
+  const retryCopy = result.retryExhausted
+    ? ` after ${result.attempts} attempts`
+    : "";
+  return `TruePeak could not ${actionLabel}${retryCopy}. ${outcome.message} Downloaded session files and report exports are unaffected.`;
 }
 
 export function useTruePeakAnalyzer(
@@ -304,9 +500,17 @@ export function useTruePeakAnalyzer(
   const decodePreference = options.decodePreference ?? "auto";
   const persistHistory = options.persistHistory ?? false;
   const parallelPreference = options.parallelPreference ?? "auto";
+  const restoreReady = options.restoreReady ?? true;
+  const recoveryWriteAllowed =
+    options.recoveryWriteAllowed ?? allowRecoveryWritesByDefault;
+  const recoveryWriteRevision = options.recoveryWriteRevision ?? 0;
   const [jobs, setJobs] = useState<AnalysisJob[]>([]);
   const [recentSessions, setRecentSessions] = useState<RecentSessionEntry[]>([]);
   const [notice, setNotice] = useState<string | null>(null);
+  const [persistenceIssue, setPersistenceIssue] = useState<string | null>(null);
+  const [liveSessionController] = useState(() =>
+    createLiveSessionController(indexedDbLiveSessionStore),
+  );
   // Resolved after mount (it consults navigator/matchMedia) so server and
   // first client render agree; the queue only starts on user action anyway.
   const [parallelLimit, setParallelLimit] = useState(1);
@@ -315,15 +519,22 @@ export function useTruePeakAnalyzer(
   const fileSignaturesRef = useRef(new Map<string, string>());
   const jobRunTokensRef = useRef(new Map<string, number>());
   const jobsRef = useRef<AnalysisJob[]>([]);
+  const workspaceOpenRef = useRef(true);
   const lanesRef = useRef<WorkerLane[]>([]);
   const laneSequenceRef = useRef(0);
   const laneLimitRef = useRef(1);
   const heavyFileBytesRef = useRef(256 * 1024 * 1024);
+  const decodeBudgetRef = useRef<DecodeBudget>(resolveDecodeBudget());
+  const aggregatePeakBytesRef = useRef(
+    conservativeDecodePeakBytes(resolveDecodeBudget()),
+  );
+  const reservedPeakBytesRef = useRef(0);
+  const resourcePlansRef = useRef(new Map<string, JobResourcePlan>());
   const idleTeardownRef = useRef<number | null>(null);
   const laneByJobRef = useRef(new Map<string, WorkerLane>());
   const heavyJobActiveRef = useRef<string | null>(null);
   const decoderPendingRef = useRef(
-    new Map<string, PendingResolver<DecodedAudioTransfer>>(),
+    new Map<string, PendingResolver<DecodedWorkerResult>>(),
   );
   const analyzerPendingRef = useRef(
     new Map<string, PendingResolver<AnalysisJob["result"]>>(),
@@ -335,9 +546,18 @@ export function useTruePeakAnalyzer(
   // Bumped by clearSession so a restore still resolving from IndexedDB cannot
   // resurrect rows into a session the user just cleared.
   const restoreGenerationRef = useRef(0);
-  const resetLaneRef = useRef<
-    (lane: WorkerLane, reason?: string, options?: { workerFailure?: boolean }) => void
+  const persistenceGenerationRef = useRef(
+    liveSessionController.captureGeneration(),
+  );
+  const persistenceFailureEpochRef = useRef(0);
+  const workerFaultRef = useRef<
+    (
+      lane: WorkerLane,
+      workerEpoch: number,
+      reason: string,
+    ) => void
   >(() => undefined);
+  const workerCircuitOpenRef = useRef(false);
   const fillLanesRef = useRef<() => void>(() => undefined);
   const settingsRef = useRef<AnalyzerSettings>({
     analysisBlocked,
@@ -401,7 +621,10 @@ export function useTruePeakAnalyzer(
   }, []);
 
   const isJobRunCurrent = useCallback((jobId: string, runToken: number) => {
-    if (jobRunTokensRef.current.get(jobId) !== runToken) {
+    if (
+      !workspaceOpenRef.current ||
+      jobRunTokensRef.current.get(jobId) !== runToken
+    ) {
       return false;
     }
 
@@ -444,6 +667,7 @@ export function useTruePeakAnalyzer(
     filesRef.current.delete(jobId);
     fileSignaturesRef.current.delete(jobId);
     jobRunTokensRef.current.delete(jobId);
+    resourcePlansRef.current.delete(jobId);
   }, []);
 
   // Progress events arrive from up to laneLimit workers at once. This returns
@@ -471,97 +695,197 @@ export function useTruePeakAnalyzer(
     [],
   );
 
+  const terminateLaneWorkers = useCallback((lane: WorkerLane) => {
+    // Advance the epoch before terminating so an already-queued event from the
+    // old pair cannot observe the replacement pair as current.
+    lane.workerEpoch += 1;
+    const decoder = lane.decoder;
+    const analyzer = lane.analyzer;
+    lane.decoder = null;
+    lane.analyzer = null;
+    decoder?.terminate();
+    analyzer?.terminate();
+  }, []);
+
+  const rejectLanePending = useCallback((lane: WorkerLane, reason: unknown) => {
+    const lease = lane.lease;
+    if (!lease) {
+      return;
+    }
+
+    const decoderPending = decoderPendingRef.current.get(lease.jobId);
+    if (decoderPending?.lease === lease) {
+      decoderPendingRef.current.delete(lease.jobId);
+      decoderPending.reject(reason);
+    }
+
+    const analyzerPending = analyzerPendingRef.current.get(lease.jobId);
+    if (analyzerPending?.lease === lease) {
+      analyzerPendingRef.current.delete(lease.jobId);
+      analyzerPending.reject(reason);
+    }
+  }, []);
+
   const attachLaneWorkers = useCallback((lane: WorkerLane) => {
-    const decoderWorker = new Worker(
-      new URL("../workers/decoder.worker.ts", import.meta.url),
-      {
-        type: "module",
-      },
-    );
-    const analyzerWorker = new Worker(
-      new URL("../workers/analyzer.worker.ts", import.meta.url),
-      {
-        type: "module",
-      },
-    );
+    const workerEpoch = lane.workerEpoch + 1;
+    lane.workerEpoch = workerEpoch;
+    let decoderWorker: Worker | null = null;
+    let analyzerWorker: Worker | null = null;
+
+    try {
+      decoderWorker = new Worker(
+        new URL("../workers/decoder.worker.ts", import.meta.url),
+        { type: "module" },
+      );
+      analyzerWorker = new Worker(
+        new URL("../workers/analyzer.worker.ts", import.meta.url),
+        { type: "module" },
+      );
+    } catch (error) {
+      decoderWorker?.terminate();
+      analyzerWorker?.terminate();
+      lane.decoder = null;
+      lane.analyzer = null;
+      return workerFailure(
+        error instanceof Error
+          ? `Analysis workers could not start: ${error.message}`
+          : "Analysis workers could not start.",
+      );
+    }
 
     decoderWorker.onerror = (event) => {
       event.preventDefault();
-      resetLaneRef.current(lane, describeWorkerFailure("Decoder", event), { workerFailure: true });
+      workerFaultRef.current(
+        lane,
+        workerEpoch,
+        describeWorkerFailure("Decoder", event),
+      );
     };
     decoderWorker.onmessageerror = (event) => {
-      resetLaneRef.current(lane, describeWorkerFailure("Decoder", event), { workerFailure: true });
+      workerFaultRef.current(
+        lane,
+        workerEpoch,
+        describeWorkerFailure("Decoder", event),
+      );
     };
     decoderWorker.onmessage = (event: MessageEvent<DecoderResponse>) => {
-      lane.failureStreak = 0;
-      const message = event.data;
-      if (message.type === "progress") {
-        if (!decoderPendingRef.current.has(message.jobId)) {
-          return;
-        }
+      if (
+        lane.workerEpoch !== workerEpoch ||
+        lane.decoder !== decoderWorker
+      ) {
+        return;
+      }
 
-        const displayProgress = nextProgressValue(message.jobId, "decoding", message.progress, message.label);
+      const message = event.data;
+      const pending = decoderPendingRef.current.get(message.jobId);
+      if (
+        !pending ||
+        pending.workerEpoch !== workerEpoch ||
+        pending.lease !== lane.lease
+      ) {
+        return;
+      }
+
+      if (message.type === "progress") {
+        const displayProgress = nextProgressValue(
+          message.jobId,
+          "decoding",
+          message.progress,
+          message.label,
+        );
         if (displayProgress == null) {
           return;
         }
 
-        updateJob(message.jobId, (job) => ({
-          ...job,
-          status: "decoding",
-          progressPercent: Math.max(job.progressPercent, displayProgress),
-          progressLabel: message.label,
-        }));
-        return;
-      }
-
-      const pending = decoderPendingRef.current.get(message.jobId);
-      if (!pending) {
+        updateJobIfRunCurrent(
+          message.jobId,
+          pending.lease.runToken,
+          (job) => ({
+            ...job,
+            status: "decoding",
+            progressPercent: Math.max(job.progressPercent, displayProgress),
+            progressLabel: message.label,
+          }),
+        );
         return;
       }
 
       decoderPendingRef.current.delete(message.jobId);
       if (message.type === "decoded") {
-        pending.resolve(message.asset);
+        pending.resolve({ asset: message.asset, usage: message.usage });
         return;
       }
 
-      pending.reject(new Error(message.error));
+      pending.reject(
+        new DecodeResourceError(
+          message.code,
+          message.error,
+          message.retryable,
+        ),
+      );
     };
 
     analyzerWorker.onerror = (event) => {
       event.preventDefault();
-      resetLaneRef.current(lane, describeWorkerFailure("Analyzer", event), { workerFailure: true });
+      workerFaultRef.current(
+        lane,
+        workerEpoch,
+        describeWorkerFailure("Analyzer", event),
+      );
     };
     analyzerWorker.onmessageerror = (event) => {
-      resetLaneRef.current(lane, describeWorkerFailure("Analyzer", event), { workerFailure: true });
+      workerFaultRef.current(
+        lane,
+        workerEpoch,
+        describeWorkerFailure("Analyzer", event),
+      );
     };
     analyzerWorker.onmessage = (event: MessageEvent<AnalyzerResponse>) => {
-      lane.failureStreak = 0;
-      const message = event.data;
-      if (message.type === "progress") {
-        if (!analyzerPendingRef.current.has(message.jobId)) {
-          return;
-        }
+      if (
+        lane.workerEpoch !== workerEpoch ||
+        lane.analyzer !== analyzerWorker
+      ) {
+        return;
+      }
 
+      const message = event.data;
+      const pending = analyzerPendingRef.current.get(message.jobId);
+      if (
+        !pending ||
+        pending.workerEpoch !== workerEpoch ||
+        pending.lease !== lane.lease
+      ) {
+        return;
+      }
+
+      if (message.type === "progress") {
         // The analyzer reports its own 0..1 fraction; analysis occupies the
         // tail of the job's overall progress, after read+decode.
-        const mapped = Math.min(0.99, ANALYSIS_PROGRESS_BASE + message.progress * (0.99 - ANALYSIS_PROGRESS_BASE));
-        const displayProgress = nextProgressValue(message.jobId, "analyzing", mapped, message.label);
+        const mapped = Math.min(
+          0.99,
+          ANALYSIS_PROGRESS_BASE +
+            message.progress * (0.99 - ANALYSIS_PROGRESS_BASE),
+        );
+        const displayProgress = nextProgressValue(
+          message.jobId,
+          "analyzing",
+          mapped,
+          message.label,
+        );
         if (displayProgress == null) {
           return;
         }
 
-        updateJob(message.jobId, (job) => ({
-          ...job,
-          status: "analyzing",
-          progressPercent: Math.max(job.progressPercent, displayProgress),
-          progressLabel: message.label,
-        }));
-        return;
-      }
-
-      const pending = analyzerPendingRef.current.get(message.jobId);
-      if (!pending) {
+        updateJobIfRunCurrent(
+          message.jobId,
+          pending.lease.runToken,
+          (job) => ({
+            ...job,
+            status: "analyzing",
+            progressPercent: Math.max(job.progressPercent, displayProgress),
+            progressLabel: message.label,
+          }),
+        );
         return;
       }
 
@@ -576,129 +900,114 @@ export function useTruePeakAnalyzer(
 
     lane.decoder = decoderWorker;
     lane.analyzer = analyzerWorker;
-  }, [nextProgressValue, updateJob]);
+    return null;
+  }, [nextProgressValue, updateJobIfRunCurrent]);
 
-  // Terminate and replace one lane's workers, failing only the job that lane
-  // was running. Other lanes keep working untouched.
-  const resetLane = useCallback(
-    (lane: WorkerLane, reason = "Worker restarted.", options?: { workerFailure?: boolean }) => {
-      lane.decoder.terminate();
-      lane.analyzer.terminate();
-
-      const jobId = lane.jobId;
-      if (jobId) {
-        let hadPending = false;
-        const decoderPending = decoderPendingRef.current.get(jobId);
-        if (decoderPending) {
-          hadPending = true;
-          decoderPendingRef.current.delete(jobId);
-          decoderPending.reject(new Error(reason));
-        }
-
-        const analyzerPending = analyzerPendingRef.current.get(jobId);
-        if (analyzerPending) {
-          hadPending = true;
-          analyzerPendingRef.current.delete(jobId);
-          analyzerPending.reject(new Error(reason));
-        }
-
-        // No pending resolver means the job is between worker calls (usually
-        // browser-decoding). Its runJob has nothing to reject, so end the run
-        // here: invalidate the token so the in-flight code bails at its next
-        // checkpoint instead of calling into a lane that may belong to another
-        // job by then, and settle the row's visible state directly. A job
-        // sitting in "queued" is left alone: it was re-queued by a retry and
-        // belongs to a future run, not to this lane's dying one.
-        if (!hadPending) {
-          invalidateJobRun(jobId);
-          const canceled = isCancellationReason(reason);
-          updateJob(jobId, (job) =>
-            isActiveJob(job) && job.status !== "queued"
-              ? {
-                  ...job,
-                  status: canceled ? "canceled" : "failed",
-                  error: canceled ? undefined : reason,
-                  progressLabel: canceled ? "Canceled" : "Failed",
-                  progressPercent: 1,
-                  finishedAtMs: Date.now(),
-                }
-              : job,
-          );
-        }
-
-        laneByJobRef.current.delete(jobId);
-        if (heavyJobActiveRef.current === jobId) {
-          heavyJobActiveRef.current = null;
-        }
+  const workerFault = useCallback(
+    (lane: WorkerLane, workerEpoch: number, reason: string) => {
+      if (lane.workerEpoch !== workerEpoch) {
+        return;
       }
 
-      lane.jobId = null;
+      terminateLaneWorkers(lane);
+      lane.failureStreak += 1;
+      rejectLanePending(lane, workerFailure(reason));
 
-      if (options?.workerFailure) {
-        lane.failureStreak += 1;
-        if (lane.failureStreak >= MAX_LANE_FAILURE_STREAK) {
-          // The worker scripts themselves are failing (for example a stale
-          // deploy whose chunks are gone). Re-attaching would just loop, so
-          // drop the lane and tell the user instead of burning CPU.
+      if (lane.failureStreak >= MAX_LANE_FAILURE_STREAK) {
+        lane.retireAfterRelease = true;
+        workerCircuitOpenRef.current = true;
+        if (!lane.lease) {
           const index = lanesRef.current.indexOf(lane);
           if (index >= 0) {
             lanesRef.current.splice(index, 1);
           }
-
-          pushNotice("The analysis workers keep failing to start. Reload the page and try again.");
-          return;
         }
+        pushNotice(
+          "The analysis workers keep failing to start. Reload the page and try again.",
+        );
+        return;
       }
 
-      attachLaneWorkers(lane);
+      const attachError = attachLaneWorkers(lane);
+      if (attachError) {
+        lane.failureStreak += 1;
+        if (lane.failureStreak >= MAX_LANE_FAILURE_STREAK) {
+          lane.retireAfterRelease = true;
+          workerCircuitOpenRef.current = true;
+          if (!lane.lease) {
+            const index = lanesRef.current.indexOf(lane);
+            if (index >= 0) {
+              lanesRef.current.splice(index, 1);
+            }
+          }
+          pushNotice(
+            "The analysis workers keep failing to start. Reload the page and try again.",
+          );
+        }
+      }
     },
-    [attachLaneWorkers, invalidateJobRun, pushNotice, updateJob],
+    [attachLaneWorkers, pushNotice, rejectLanePending, terminateLaneWorkers],
   );
 
   useEffect(() => {
-    resetLaneRef.current = resetLane;
-  }, [resetLane]);
+    workerFaultRef.current = workerFault;
+  }, [workerFault]);
+
+  // User-driven interruption is deliberately different from a worker fault:
+  // it aborts browser work and rejects worker work, but the immutable lease is
+  // retained until runJob's finally block observes that all decode work drained.
+  const interruptLane = useCallback(
+    (lane: WorkerLane, reason = "Job canceled.") => {
+      const lease = lane.lease;
+      if (!lease) {
+        return;
+      }
+
+      const cancellation = cancellationFailure(reason);
+      if (!lease.browserAbortController.signal.aborted) {
+        lease.browserAbortController.abort(cancellation);
+      }
+      try {
+        lane.decoder?.postMessage({
+          type: "cancel",
+          jobId: lease.jobId,
+        } satisfies DecoderRequest);
+      } catch {
+        // Termination below is the authoritative cancellation path.
+      }
+      terminateLaneWorkers(lane);
+      rejectLanePending(lane, cancellation);
+    },
+    [rejectLanePending, terminateLaneWorkers],
+  );
 
   // Terminate an idle lane and remove it. Mutates lanesRef's array in place so
   // the unmount cleanup (which captured the array) still sees every live lane.
   const disposeIdleLane = useCallback((lane: WorkerLane) => {
-    if (lane.jobId !== null) {
+    if (lane.lease !== null) {
       return;
     }
 
-    lane.decoder.terminate();
-    lane.analyzer.terminate();
+    terminateLaneWorkers(lane);
     const index = lanesRef.current.indexOf(lane);
     if (index >= 0) {
       lanesRef.current.splice(index, 1);
     }
-  }, []);
+  }, [terminateLaneWorkers]);
 
-  // Re-resolve the lane budget when the user preference changes (and once on
-  // mount, where navigator/matchMedia first become available).
-  useEffect(() => {
-    const limit = resolveLaneLimit(parallelPreference);
-    laneLimitRef.current = limit;
-    heavyFileBytesRef.current = resolveHeavyFileBytes();
-    setParallelLimit(limit);
-    // Shrink immediately if the new budget is lower; busy lanes finish their
-    // current file first (no new work lands on them past the limit).
-    const busyCount = lanesRef.current.filter((lane) => lane.jobId !== null).length;
-    const idleLanes = lanesRef.current.filter((lane) => lane.jobId === null);
-    const idleToKeep = Math.max(0, limit - busyCount);
-    idleLanes.slice(idleToKeep).forEach(disposeIdleLane);
-    fillLanesRef.current();
-  }, [disposeIdleLane, parallelPreference]);
-
-  // Free idle workers (and any ffmpeg.wasm heaps inside them) once the queue
-  // has been quiet for a while; they respawn on demand in milliseconds.
-  useEffect(() => {
+  const clearIdleLaneTeardown = useCallback(() => {
     if (idleTeardownRef.current != null) {
       window.clearTimeout(idleTeardownRef.current);
       idleTeardownRef.current = null;
     }
+  }, []);
 
-    if (hasActiveJobs || !lanesRef.current.length) {
+  const scheduleIdleLaneTeardown = useCallback(() => {
+    if (
+      idleTeardownRef.current != null ||
+      jobsRef.current.some(isActiveJob) ||
+      !lanesRef.current.length
+    ) {
       return;
     }
 
@@ -707,28 +1016,60 @@ export function useTruePeakAnalyzer(
       if (jobsRef.current.some(isActiveJob)) {
         return;
       }
-
       [...lanesRef.current].forEach(disposeIdleLane);
     }, IDLE_LANE_TEARDOWN_MS);
+  }, [disposeIdleLane]);
+
+  // Re-resolve the lane budget when the user preference changes (and once on
+  // mount, where navigator/matchMedia first become available).
+  useEffect(() => {
+    const limit = resolveLaneLimit(parallelPreference);
+    laneLimitRef.current = limit;
+    heavyFileBytesRef.current = resolveHeavyFileBytes();
+    aggregatePeakBytesRef.current = resolveAggregatePeakBytes(
+      decodeBudgetRef.current,
+    );
+    setParallelLimit(limit);
+    // Shrink immediately if the new budget is lower; busy lanes finish their
+    // current file first (no new work lands on them past the limit).
+    const busyCount = lanesRef.current.filter((lane) => lane.lease !== null).length;
+    const idleLanes = lanesRef.current.filter((lane) => lane.lease === null);
+    const idleToKeep = Math.max(0, limit - busyCount);
+    idleLanes.slice(idleToKeep).forEach(disposeIdleLane);
+    fillLanesRef.current();
+  }, [disposeIdleLane, parallelPreference]);
+
+  // Free idle workers (and any ffmpeg.wasm heaps inside them) once the queue
+  // has been quiet for a while; they respawn on demand in milliseconds.
+  useEffect(() => {
+    clearIdleLaneTeardown();
+    if (hasActiveJobs) {
+      return;
+    }
+    scheduleIdleLaneTeardown();
 
     return () => {
-      if (idleTeardownRef.current != null) {
-        window.clearTimeout(idleTeardownRef.current);
-        idleTeardownRef.current = null;
-      }
+      clearIdleLaneTeardown();
     };
-  }, [disposeIdleLane, hasActiveJobs]);
+  }, [clearIdleLaneTeardown, hasActiveJobs, scheduleIdleLaneTeardown]);
 
   useEffect(() => {
+    workspaceOpenRef.current = true;
     const lanes = lanesRef.current;
     const decoderPending = decoderPendingRef.current;
     const analyzerPending = analyzerPendingRef.current;
     const laneByJob = laneByJobRef.current;
+    const jobRunTokens = jobRunTokensRef.current;
 
     return () => {
+      workspaceOpenRef.current = false;
+      jobRunTokens.clear();
       lanes.forEach((lane) => {
-        lane.decoder.terminate();
-        lane.analyzer.terminate();
+        lane.lease?.browserAbortController.abort(
+          cancellationFailure("Workspace closed."),
+        );
+        lane.decoder?.terminate();
+        lane.analyzer?.terminate();
       });
       lanes.length = 0;
       decoderPending.forEach(({ reject }) => reject(new Error("Workspace closed.")));
@@ -737,6 +1078,7 @@ export function useTruePeakAnalyzer(
       analyzerPending.clear();
       laneByJob.clear();
       heavyJobActiveRef.current = null;
+      reservedPeakBytesRef.current = 0;
       if (noticeTimeoutRef.current) {
         window.clearTimeout(noticeTimeoutRef.current);
       }
@@ -744,14 +1086,17 @@ export function useTruePeakAnalyzer(
   }, []);
 
   useEffect(() => {
-    setRecentSessions(persistHistory ? loadRecentSessions() : []);
+    // Turning history off stops new writes; it does not delete summaries the
+    // user already saved. Keep them visible so the count and clear control stay
+    // truthful while the preference is off.
+    setRecentSessions(loadRecentSessions());
   }, [persistHistory]);
 
   // Restore the previous session's completed results once on load. Restored
   // jobs are view-only (no File handle survives a refresh), exactly like jobs
   // imported from a session file.
   useEffect(() => {
-    if (didRestoreRef.current) {
+    if (!restoreReady || didRestoreRef.current) {
       return;
     }
 
@@ -759,8 +1104,37 @@ export function useTruePeakAnalyzer(
     let cancelled = false;
     const generation = restoreGenerationRef.current;
 
-    void loadLiveSessionJobs().then((loadedJobs) => {
-      if (cancelled || generation !== restoreGenerationRef.current || !loadedJobs.length) {
+    const persistenceToken = persistenceGenerationRef.current;
+    void liveSessionController.read(persistenceToken).then((controllerResult) => {
+      if (cancelled || generation !== restoreGenerationRef.current) {
+        return;
+      }
+
+      const failure = persistenceFailureMessage(controllerResult, "restore");
+      if (failure) {
+        persistenceFailureEpochRef.current += 1;
+        setPersistenceIssue(failure);
+        pushNotice(failure);
+        return;
+      }
+
+      const { outcome } = controllerResult;
+      if (
+        outcome.status === "superseded" ||
+        outcome.operation !== "read" ||
+        (outcome.status !== "committed" && outcome.status !== "empty")
+      ) {
+        return;
+      }
+
+      setPersistenceIssue(null);
+      const loadedJobs = outcome.jobs;
+      if (!loadedJobs.length) {
+        if (outcome.invalidRecordCount > 0) {
+          pushNotice(
+            `${outcome.invalidRecordCount} saved recovery record${outcome.invalidRecordCount === 1 ? " was" : "s were"} invalid and could not be restored. The stored records were left untouched.`,
+          );
+        }
         return;
       }
 
@@ -769,21 +1143,7 @@ export function useTruePeakAnalyzer(
       // exactly like a job that finishes after a target switch; otherwise a
       // preset or mode change made before the refresh silently reverts.
       const settings = settingsRef.current;
-      const restoredJobs = settings.analysisBlocked
-        ? loadedJobs
-        : loadedJobs.map((job) =>
-            job.result
-              ? {
-                  ...job,
-                  result: retargetAnalysisResult(
-                    job.result,
-                    settings.analysisMode === "targeted"
-                      ? settings.target ?? DEFAULT_TARGET_PRESET
-                      : null,
-                  ),
-                }
-              : job,
-          );
+      const restoredJobs = reconcileSessionJobs(loadedJobs, settings);
 
       // Mark as already persisted so the autosave diff below doesn't rewrite
       // every record straight back.
@@ -814,20 +1174,37 @@ export function useTruePeakAnalyzer(
         return next;
       });
 
-      pushNotice(
+      const recoveryNotes = [
         `Restored ${fresh.length} result${fresh.length === 1 ? "" : "s"} from your last session.`,
-      );
+        outcome.invalidRecordCount
+          ? `${outcome.invalidRecordCount} invalid stored record${outcome.invalidRecordCount === 1 ? " was" : "s were"} left untouched.`
+          : null,
+        outcome.overflowRecordCount
+          ? `${outcome.overflowRecordCount} additional stored result${outcome.overflowRecordCount === 1 ? " remains" : "s remain"} outside the current restore limit.`
+          : null,
+      ].filter((part): part is string => part != null);
+      pushNotice(recoveryNotes.join(" "));
+    }).catch((error: unknown) => {
+      if (cancelled || generation !== restoreGenerationRef.current) {
+        return;
+      }
+
+      const message = `TruePeak could not restore the previous session. ${error instanceof Error ? error.message : "Recovery storage failed unexpectedly."}`;
+      persistenceFailureEpochRef.current += 1;
+      setPersistenceIssue(message);
+      pushNotice(message);
     });
 
     return () => {
       cancelled = true;
     };
-  }, [pushNotice]);
+  }, [liveSessionController, pushNotice, restoreReady]);
 
   // Autosave: mirror completed results into the live-session store, and drop
   // records for jobs that left the queue. Diffing against what's already
   // persisted keeps this a no-op on progress ticks.
   useEffect(() => {
+    const allowSaves = recoveryWriteAllowed();
     const currentById = new Map<string, AnalysisJob>();
     jobs.forEach((job) => {
       if (job.result) {
@@ -853,16 +1230,41 @@ export function useTruePeakAnalyzer(
       return;
     }
 
-    // Mark optimistically so concurrent effect runs don't double-write, but
-    // roll the marks back if the transaction fails (e.g. storage quota), so
-    // the next jobs change retries instead of silently dropping the records.
-    toSave.forEach((job) => persistedResultsRef.current.set(job.id, job.result!.analyzedAt));
-    if (toSave.length) {
-      void persistLiveSessionJobs(toSave).then((committed) => {
-        if (committed) {
+    // Mark optimistically so concurrent effect runs don't double-write. The
+    // controller owns autonomous bounded retries; failed final outcomes roll
+    // these marks back and surface a persistent issue instead of waiting for
+    // an unrelated jobs update to happen to retry.
+    const persistenceToken = persistenceGenerationRef.current;
+    const persistenceIssueEpoch = persistenceFailureEpochRef.current;
+    if (allowSaves && toSave.length) {
+      toSave.forEach((job) =>
+        persistedResultsRef.current.set(job.id, job.result!.analyzedAt),
+      );
+      void liveSessionController.write(toSave, persistenceToken).then((controllerResult) => {
+        const failure = persistenceFailureMessage(controllerResult, "save");
+        if (!failure) {
+          if (
+            controllerResult.outcome.status !== "superseded" &&
+            persistenceFailureEpochRef.current === persistenceIssueEpoch
+          ) {
+            setPersistenceIssue(null);
+          }
           return;
         }
 
+        persistenceFailureEpochRef.current += 1;
+        setPersistenceIssue(failure);
+        pushNotice(failure);
+        toSave.forEach((job) => {
+          if (persistedResultsRef.current.get(job.id) === job.result!.analyzedAt) {
+            persistedResultsRef.current.delete(job.id);
+          }
+        });
+      }).catch((error: unknown) => {
+        const message = `TruePeak could not save the recovery copy. ${error instanceof Error ? error.message : "Recovery storage failed unexpectedly."}`;
+        persistenceFailureEpochRef.current += 1;
+        setPersistenceIssue(message);
+        pushNotice(message);
         toSave.forEach((job) => {
           if (persistedResultsRef.current.get(job.id) === job.result!.analyzedAt) {
             persistedResultsRef.current.delete(job.id);
@@ -876,11 +1278,31 @@ export function useTruePeakAnalyzer(
         toDelete.map((jobId) => [jobId, persistedResultsRef.current.get(jobId)]),
       );
       toDelete.forEach((jobId) => persistedResultsRef.current.delete(jobId));
-      void removeLiveSessionJobs(toDelete).then((committed) => {
-        if (committed) {
+      void liveSessionController.delete(toDelete, persistenceToken).then((controllerResult) => {
+        const failure = persistenceFailureMessage(controllerResult, "delete");
+        if (!failure) {
+          if (
+            controllerResult.outcome.status !== "superseded" &&
+            persistenceFailureEpochRef.current === persistenceIssueEpoch
+          ) {
+            setPersistenceIssue(null);
+          }
           return;
         }
 
+        persistenceFailureEpochRef.current += 1;
+        setPersistenceIssue(failure);
+        pushNotice(failure);
+        previousMarks.forEach((analyzedAt, jobId) => {
+          if (analyzedAt != null && !persistedResultsRef.current.has(jobId)) {
+            persistedResultsRef.current.set(jobId, analyzedAt);
+          }
+        });
+      }).catch((error: unknown) => {
+        const message = `TruePeak could not update the recovery copy. ${error instanceof Error ? error.message : "Recovery storage failed unexpectedly."}`;
+        persistenceFailureEpochRef.current += 1;
+        setPersistenceIssue(message);
+        pushNotice(message);
         previousMarks.forEach((analyzedAt, jobId) => {
           if (analyzedAt != null && !persistedResultsRef.current.has(jobId)) {
             persistedResultsRef.current.set(jobId, analyzedAt);
@@ -888,7 +1310,13 @@ export function useTruePeakAnalyzer(
         });
       });
     }
-  }, [jobs]);
+  }, [
+    jobs,
+    liveSessionController,
+    pushNotice,
+    recoveryWriteAllowed,
+    recoveryWriteRevision,
+  ]);
 
   useEffect(() => {
     jobsRef.current = jobs;
@@ -994,52 +1422,325 @@ export function useTruePeakAnalyzer(
     });
   }, [analysisBlocked, analysisMode, target]);
 
-  const decodeInWorker = useCallback(
-    (lane: WorkerLane, jobId: string, file: File, mimeType: string) =>
-      new Promise<DecodedAudioTransfer>((resolve, reject) => {
-        decoderPendingRef.current.set(jobId, { resolve, reject });
-        try {
-          // Send the File handle; the worker reads the bytes itself so the
-          // main thread never holds a full copy of a large file.
-          lane.decoder.postMessage(
-            { type: "decode", jobId, fileName: file.name, mimeType, file } satisfies DecoderRequest,
-          );
-        } catch (error) {
-          const message = error instanceof Error ? error.message : "Unable to send audio to the decoder worker.";
-          // Reset while the pending resolver is still registered: resetLane
-          // then settles the run through the normal rejection path, so the
-          // caller's fallback decoder still gets its turn. Deleting first
-          // would make resetLane treat this as a between-calls failure and
-          // end the whole run. The local reject below is then a no-op.
-          resetLaneRef.current(lane, `Decoder worker post failed: ${message}`);
-          decoderPendingRef.current.delete(jobId);
-          reject(new Error(message));
+  const prepareResourcePlan = useCallback(
+    async (jobId: string, file: File) => {
+      if (resourcePlansRef.current.has(jobId)) {
+        return;
+      }
+
+      resourcePlansRef.current.set(jobId, { kind: "preparing" });
+      try {
+        const budget = decodeBudgetRef.current;
+        assertSourceWithinBudget(file.size, budget);
+
+        // FLAC STREAMINFO and AIFF COMM normally live near the start. Small
+        // sources are inspected in full (which also covers compact WAV files),
+        // while large/opaque sources remain deliberately unknown and therefore
+        // run exclusively rather than trusting a size-to-PCM guess.
+        const preflightBytes =
+          file.size <= 16 * 1024 * 1024
+            ? file.size
+            : Math.min(file.size, 256 * 1024);
+        const header = await file.slice(0, preflightBytes).arrayBuffer();
+        const metadata = inspectAudioContainer(header);
+        const inspectedWholeFile = preflightBytes === file.size;
+        const plan: JobResourcePlan = metadata
+          ? {
+              kind: "known",
+              decodedBytes: assertDecodedFootprint(
+                metadata,
+                budget,
+                "Container preflight",
+              ).decodedBytes,
+              // Only a complete integer-PCM WAV/AIFF shape is admitted as a
+              // bounded native route. FLAC metadata and partial headers can be
+              // contradicted by decoder output, so they stay conservative.
+              trustedNative:
+                inspectedWholeFile && metadata.nativeDecodeSafe,
+            }
+          : { kind: "unknown" };
+
+        if (
+          filesRef.current.get(jobId) === file &&
+          resourcePlansRef.current.get(jobId)?.kind === "preparing"
+        ) {
+          resourcePlansRef.current.set(jobId, plan);
         }
-      }),
+      } catch (error) {
+        if (
+          filesRef.current.get(jobId) === file &&
+          resourcePlansRef.current.get(jobId)?.kind === "preparing"
+        ) {
+          const details = decodeFailureDetails(error);
+          resourcePlansRef.current.set(jobId, {
+            kind: "rejected",
+            error: details.message,
+          });
+          updateJob(jobId, (job) =>
+            job.status === "queued"
+              ? {
+                  ...job,
+                  status: "failed",
+                  error: details.message,
+                  progressPercent: 1,
+                  progressLabel: "Resource limit",
+                  finishedAtMs: Date.now(),
+                }
+              : job,
+          );
+        }
+      } finally {
+        fillLanesRef.current();
+      }
+    },
+    [updateJob],
+  );
+
+  const ensureLaneWorkers = useCallback(
+    (lane: WorkerLane) => {
+      if (lane.decoder && lane.analyzer) {
+        return;
+      }
+      if (lane.retireAfterRelease) {
+        throw workerFailure("The analysis worker lane is no longer available.");
+      }
+
+      if (lane.decoder || lane.analyzer) {
+        terminateLaneWorkers(lane);
+      }
+      const attachError = attachLaneWorkers(lane);
+      if (!attachError) {
+        return;
+      }
+
+      lane.failureStreak += 1;
+      if (lane.failureStreak >= MAX_LANE_FAILURE_STREAK) {
+        lane.retireAfterRelease = true;
+        workerCircuitOpenRef.current = true;
+        pushNotice(
+          "The analysis workers keep failing to start. Reload the page and try again.",
+        );
+      }
+      throw attachError;
+    },
+    [attachLaneWorkers, pushNotice, terminateLaneWorkers],
+  );
+
+  const growLeasePeakReservation = useCallback(
+    (
+      lane: WorkerLane,
+      lease: LaneLease,
+      requiredPeakBytes: number,
+      requireExclusive: boolean,
+    ) => {
+      if (lane.lease !== lease) {
+        throw cancellationFailure("The decode lease is no longer current.");
+      }
+      if (
+        requireExclusive &&
+        lanesRef.current.some(
+          (candidate) =>
+            candidate !== lane && candidate.lease !== null,
+        )
+      ) {
+        throw new DecodeResourceError(
+          "decoded-budget-exceeded",
+          "The fallback decoder needs an exclusive peak-memory reservation, but another decode is still active. Retry after the current batch advances.",
+        );
+      }
+
+      const reservation = lease.reservation;
+      const nextTotal = growDecodePeakReservation(
+        reservedPeakBytesRef.current,
+        reservation.peakBytes,
+        requiredPeakBytes,
+        aggregatePeakBytesRef.current,
+      );
+
+      // All validation happens above. Mutate the aggregate and its lease as one
+      // synchronous step so no route can begin between the capacity check and
+      // ownership update.
+      reservedPeakBytesRef.current = nextTotal;
+      if (requiredPeakBytes > reservation.peakBytes) {
+        reservation.peakBytes = requiredPeakBytes;
+      }
+      if (requireExclusive && !reservation.exclusive) {
+        reservation.exclusive = true;
+        heavyJobActiveRef.current = lease.jobId;
+      }
+    },
     [],
   );
 
-  const analyzeInWorker = useCallback(
-    (lane: WorkerLane, jobId: string, asset: DecodedAudioTransfer, currentTarget: TargetPreset | null) =>
-      new Promise<AnalysisJob["result"]>((resolve, reject) => {
-        analyzerPendingRef.current.set(jobId, { resolve, reject });
+  const validateDecodedAssetForLease = useCallback(
+    (
+      lane: WorkerLane,
+      lease: LaneLease,
+      asset: DecodedAudioTransfer,
+      workerUsage?: DecodeResourceUsage,
+      browserRoute = false,
+    ) => {
+      const footprint = validatePlanarChannels(
+        asset.channelBuffers.map((buffer) => ({
+          length: buffer.byteLength / Float32Array.BYTES_PER_ELEMENT,
+          byteLength: buffer.byteLength,
+        })),
+        asset,
+        decodeBudgetRef.current,
+        "Decoded audio handoff",
+      );
+      if (
+        workerUsage != null &&
+        workerUsage.decodedBytes !== footprint.decodedBytes
+      ) {
+        throw new DecodeResourceError(
+          "invalid-metadata",
+          "Decoder resource accounting did not match the transferred PCM buffers.",
+        );
+      }
+
+      const actualPeakBytes = browserRoute
+        ? decodePeakResidentBytes("browser", footprint.decodedBytes)
+        : workerUsage?.outputBytes != null
+          ? decodePeakResidentBytes(
+              "compatibility-worker",
+              footprint.decodedBytes,
+              workerUsage.outputBytes,
+            )
+          : decodePeakResidentBytes(
+              "native-worker",
+              footprint.decodedBytes,
+            );
+      const conservativeRoute =
+        browserRoute || workerUsage?.outputBytes != null;
+      growLeasePeakReservation(
+        lane,
+        lease,
+        conservativeRoute
+          ? Math.max(
+              actualPeakBytes,
+              conservativeDecodePeakBytes(decodeBudgetRef.current),
+            )
+          : actualPeakBytes,
+        conservativeRoute,
+      );
+    },
+    [growLeasePeakReservation],
+  );
+
+  const decodeInWorker = useCallback(
+    (lane: WorkerLane, lease: LaneLease, file: File, mimeType: string) =>
+      new Promise<DecodedWorkerResult>((resolve, reject) => {
+        if (lane.lease !== lease) {
+          reject(cancellationFailure("The decoder lease is no longer current."));
+          return;
+        }
         try {
-          lane.analyzer.postMessage({
+          ensureLaneWorkers(lane);
+        } catch (error) {
+          reject(error);
+          return;
+        }
+
+        const decoder = lane.decoder;
+        if (!decoder) {
+          reject(workerFailure("The decoder worker is unavailable."));
+          return;
+        }
+        const pending: PendingResolver<DecodedWorkerResult> = {
+          resolve,
+          reject,
+          lease,
+          workerEpoch: lane.workerEpoch,
+        };
+        decoderPendingRef.current.set(lease.jobId, pending);
+        try {
+          // Send the File handle; the worker reads the bytes itself so the
+          // main thread never holds a full copy of a large file.
+          decoder.postMessage(
+            {
+              type: "decode",
+              jobId: lease.jobId,
+              fileName: file.name,
+              mimeType,
+              file,
+              budget: decodeBudgetRef.current,
+            } satisfies DecoderRequest,
+          );
+        } catch (error) {
+          const message =
+            error instanceof Error
+              ? error.message
+              : "Unable to send audio to the decoder worker.";
+          workerFaultRef.current(
+            lane,
+            pending.workerEpoch,
+            `Decoder worker post failed: ${message}`,
+          );
+          if (decoderPendingRef.current.get(lease.jobId) === pending) {
+            decoderPendingRef.current.delete(lease.jobId);
+            reject(workerFailure(message));
+          }
+        }
+      }),
+    [ensureLaneWorkers],
+  );
+
+  const analyzeInWorker = useCallback(
+    (
+      lane: WorkerLane,
+      lease: LaneLease,
+      asset: DecodedAudioTransfer,
+      currentTarget: TargetPreset | null,
+    ) =>
+      new Promise<AnalysisJob["result"]>((resolve, reject) => {
+        if (lane.lease !== lease) {
+          reject(cancellationFailure("The analyzer lease is no longer current."));
+          return;
+        }
+        try {
+          ensureLaneWorkers(lane);
+        } catch (error) {
+          reject(error);
+          return;
+        }
+
+        const analyzer = lane.analyzer;
+        if (!analyzer) {
+          reject(workerFailure("The analyzer worker is unavailable."));
+          return;
+        }
+        const pending: PendingResolver<AnalysisJob["result"]> = {
+          resolve,
+          reject,
+          lease,
+          workerEpoch: lane.workerEpoch,
+        };
+        analyzerPendingRef.current.set(lease.jobId, pending);
+        try {
+          analyzer.postMessage({
             type: "analyze",
-            jobId,
+            jobId: lease.jobId,
             asset,
             target: currentTarget,
           } satisfies AnalyzerRequest, asset.channelBuffers);
         } catch (error) {
-          const message = error instanceof Error ? error.message : "Unable to send audio to the analyzer worker.";
-          // Same ordering as decodeInWorker: reset before touching the
-          // pending so the rejection reaches runJob with a live run token.
-          resetLaneRef.current(lane, `Analyzer worker post failed: ${message}`);
-          analyzerPendingRef.current.delete(jobId);
-          reject(new Error(message));
+          const message =
+            error instanceof Error
+              ? error.message
+              : "Unable to send audio to the analyzer worker.";
+          workerFaultRef.current(
+            lane,
+            pending.workerEpoch,
+            `Analyzer worker post failed: ${message}`,
+          );
+          if (analyzerPendingRef.current.get(lease.jobId) === pending) {
+            analyzerPendingRef.current.delete(lease.jobId);
+            reject(workerFailure(message));
+          }
         }
       }),
-    [],
+    [ensureLaneWorkers],
   );
 
   const startBrowserDecodeHeartbeat = useCallback(
@@ -1065,41 +1766,79 @@ export function useTruePeakAnalyzer(
     [isJobRunCurrent, updateJobIfRunCurrent],
   );
 
-  const releaseLane = useCallback((jobId: string) => {
-    const lane = laneByJobRef.current.get(jobId);
-    if (lane && lane.jobId === jobId) {
-      lane.jobId = null;
-    }
+  const releaseLane = useCallback(
+    (lane: WorkerLane, lease: LaneLease, terminalSuccess: boolean) => {
+      // A stale finally block must never release a newer job that has since
+      // acquired this lane. Object identity plus generation makes that check
+      // explicit instead of relying on a mutable jobId string.
+      if (lane.lease !== lease || lane.leaseGeneration !== lease.generation) {
+        return;
+      }
 
-    laneByJobRef.current.delete(jobId);
-    if (heavyJobActiveRef.current === jobId) {
-      heavyJobActiveRef.current = null;
-    }
-  }, []);
+      if (!lease.reservation.released) {
+        lease.reservation.released = true;
+        reservedPeakBytesRef.current = Math.max(
+          0,
+          reservedPeakBytesRef.current - lease.reservation.peakBytes,
+        );
+      }
+      if (laneByJobRef.current.get(lease.jobId) === lane) {
+        laneByJobRef.current.delete(lease.jobId);
+      }
+      if (heavyJobActiveRef.current === lease.jobId) {
+        heavyJobActiveRef.current = null;
+      }
+      lane.lease = null;
+
+      // Progress is not proof that the worker pair is healthy. Only a complete
+      // decode+analysis result resets the consecutive transport-failure streak.
+      if (terminalSuccess) {
+        lane.failureStreak = 0;
+      }
+
+      if (lane.retireAfterRelease) {
+        terminateLaneWorkers(lane);
+        const index = lanesRef.current.indexOf(lane);
+        if (index >= 0) {
+          lanesRef.current.splice(index, 1);
+        }
+      }
+      // A canceled browser decode can outlive the first idle timer because its
+      // lease correctly remains busy while decodeAudioData drains. Re-arm the
+      // timer now that this lane is genuinely idle.
+      scheduleIdleLaneTeardown();
+    },
+    [scheduleIdleLaneTeardown, terminateLaneWorkers],
+  );
 
   const runJob = useCallback(
     async (
-      jobId: string,
       lane: WorkerLane,
+      lease: LaneLease,
       currentTarget: TargetPreset | null,
       currentAnalysisMode: AnalysisMode,
       currentDecodePreference: DecodePreference,
     ) => {
-      const runToken = beginJobRun(jobId);
+      const { jobId, runToken } = lease;
       const file = filesRef.current.get(jobId);
       if (!file) {
-        releaseLane(jobId);
-        updateJob(jobId, (job) => ({
+        updateJobIfRunCurrent(jobId, runToken, (job) => ({
           ...job,
           status: "failed",
           error: "Original file handle was not available for retry.",
           progressLabel: "Missing file",
           progressPercent: 1,
+          finishedAtMs: Date.now(),
         }));
+        releaseLane(lane, lease, false);
+        fillLanesRef.current();
         return;
       }
 
       let browserDecodeHeartbeat: number | null = null;
+      let terminalSuccess = false;
+      const leaseIsCurrent = () =>
+        lane.lease === lease && isJobRunCurrent(jobId, runToken);
 
       const stopBrowserDecodeHeartbeat = () => {
         if (browserDecodeHeartbeat != null) {
@@ -1120,12 +1859,20 @@ export function useTruePeakAnalyzer(
 
         const mimeType = file.type || "application/octet-stream";
         let decoded: DecodedAudioTransfer;
+        let workerUsage: DecodeResourceUsage | undefined;
+        let decodedByBrowser = false;
         const browserFirst =
           currentDecodePreference === "browser-first" ||
           (currentDecodePreference === "auto" &&
             shouldPreferBrowserDecoder(file.name, mimeType));
 
         if (browserFirst) {
+          growLeasePeakReservation(
+            lane,
+            lease,
+            conservativeDecodePeakBytes(decodeBudgetRef.current),
+            true,
+          );
           updateJobIfRunCurrent(jobId, runToken, (job) => ({
             ...job,
             status: "decoding",
@@ -1138,11 +1885,23 @@ export function useTruePeakAnalyzer(
           browserDecodeHeartbeat = startBrowserDecodeHeartbeat(jobId, runToken);
 
           try {
-            decoded = await decodeAudioFileInBrowser(file);
+            decoded = await decodeAudioFileInBrowser(
+              file,
+              undefined,
+              undefined,
+              {
+                signal: lease.browserAbortController.signal,
+                budget: decodeBudgetRef.current,
+              },
+            );
+            decodedByBrowser = true;
           } catch (browserError) {
             stopBrowserDecodeHeartbeat();
-            if (!isJobRunCurrent(jobId, runToken)) {
+            if (!leaseIsCurrent()) {
               return;
+            }
+            if (!canTryAlternateDecoder(browserError)) {
+              throw browserError;
             }
 
             const browserMessage =
@@ -1158,8 +1917,19 @@ export function useTruePeakAnalyzer(
             }));
 
             try {
-              decoded = await decodeInWorker(lane, jobId, file, mimeType);
+              const workerResult = await decodeInWorker(
+                lane,
+                lease,
+                file,
+                mimeType,
+              );
+              decoded = workerResult.asset;
+              workerUsage = workerResult.usage;
+              decodedByBrowser = false;
             } catch (workerError) {
+              if (!canTryAlternateDecoder(workerError)) {
+                throw workerError;
+              }
               const workerMessage =
                 workerError instanceof Error
                   ? workerError.message
@@ -1171,11 +1941,31 @@ export function useTruePeakAnalyzer(
           }
         } else {
           try {
-            decoded = await decodeInWorker(lane, jobId, file, mimeType);
+            const workerResult = await decodeInWorker(
+              lane,
+              lease,
+              file,
+              mimeType,
+            );
+            decoded = workerResult.asset;
+            workerUsage = workerResult.usage;
           } catch (decodeError) {
-            if (!isJobRunCurrent(jobId, runToken)) {
+            if (!leaseIsCurrent()) {
               return;
             }
+            if (!canTryAlternateDecoder(decodeError)) {
+              throw decodeError;
+            }
+
+            // The native route had a smaller checked reservation. Promote it
+            // atomically to the conservative exclusive peak before invoking a
+            // browser fallback that will allocate AudioBuffer + planar PCM.
+            growLeasePeakReservation(
+              lane,
+              lease,
+              conservativeDecodePeakBytes(decodeBudgetRef.current),
+              true,
+            );
 
             const primaryMessage =
               decodeError instanceof Error
@@ -1191,11 +1981,23 @@ export function useTruePeakAnalyzer(
 
             try {
               browserDecodeHeartbeat = startBrowserDecodeHeartbeat(jobId, runToken);
-              decoded = await decodeAudioFileInBrowser(file, primaryMessage);
+              decoded = await decodeAudioFileInBrowser(
+                file,
+                primaryMessage,
+                undefined,
+                {
+                  signal: lease.browserAbortController.signal,
+                  budget: decodeBudgetRef.current,
+                },
+              );
+              decodedByBrowser = true;
             } catch (fallbackError) {
               stopBrowserDecodeHeartbeat();
-              if (!isJobRunCurrent(jobId, runToken)) {
+              if (!leaseIsCurrent()) {
                 return;
+              }
+              if (!canTryAlternateDecoder(fallbackError)) {
+                throw fallbackError;
               }
 
               const fallbackMessage =
@@ -1209,9 +2011,16 @@ export function useTruePeakAnalyzer(
           }
         }
         stopBrowserDecodeHeartbeat();
-        if (!isJobRunCurrent(jobId, runToken)) {
+        if (!leaseIsCurrent()) {
           return;
         }
+        validateDecodedAssetForLease(
+          lane,
+          lease,
+          decoded,
+          workerUsage,
+          decodedByBrowser,
+        );
 
         updateJobIfRunCurrent(jobId, runToken, (job) => ({
           ...job,
@@ -1226,8 +2035,13 @@ export function useTruePeakAnalyzer(
           currentAnalysisMode === "targeted"
             ? currentTarget ?? DEFAULT_TARGET_PRESET
             : null;
-        const result = await analyzeInWorker(lane, jobId, decoded, targetForJob);
-        if (!isJobRunCurrent(jobId, runToken)) {
+        const result = await analyzeInWorker(
+          lane,
+          lease,
+          decoded,
+          targetForJob,
+        );
+        if (!leaseIsCurrent()) {
           return;
         }
 
@@ -1238,7 +2052,7 @@ export function useTruePeakAnalyzer(
         // this a mid-flight job would slip through with the old target applied.)
         const latestSettings = settingsRef.current;
         const reconciledResult =
-          result == null || latestSettings.analysisBlocked
+          result == null
             ? result
             : retargetAnalysisResult(
                 result,
@@ -1255,9 +2069,10 @@ export function useTruePeakAnalyzer(
           error: undefined,
           finishedAtMs: Date.now(),
         }));
+        terminalSuccess = true;
       } catch (error) {
         stopBrowserDecodeHeartbeat();
-        if (!isJobRunCurrent(jobId, runToken)) {
+        if (!leaseIsCurrent()) {
           return;
         }
 
@@ -1274,30 +2089,34 @@ export function useTruePeakAnalyzer(
         }));
       } finally {
         stopBrowserDecodeHeartbeat();
-        releaseLane(jobId);
+        releaseLane(lane, lease, terminalSuccess);
         // The freed lane can pick up the next queued file right away.
         fillLanesRef.current();
       }
     },
     [
       analyzeInWorker,
-      beginJobRun,
       decodeInWorker,
       isJobRunCurrent,
+      growLeasePeakReservation,
       releaseLane,
       startBrowserDecodeHeartbeat,
-      updateJob,
       updateJobIfRunCurrent,
+      validateDecodedAssetForLease,
     ],
   );
 
-  // Hand queued jobs to free lanes. Lanes are created on demand up to the
-  // device-derived limit. Heavy files run exclusively: nothing new starts while
-  // one is active, and one only starts once every lane is idle (draining first
-  // keeps FIFO order, so a large master can't be starved by a stream of small
-  // files behind it).
+  // Hand queued jobs to free lanes. A checked preflight reserves decoded PCM,
+  // not compressed source bytes. Sources whose footprint cannot be established
+  // safely run alone, as do very large files, so an optimistic estimate can
+  // never multiply across lanes.
   const fillLanes = useCallback(() => {
-    if (settingsRef.current.analysisBlocked || heavyJobActiveRef.current) {
+    if (
+      !workspaceOpenRef.current ||
+      settingsRef.current.analysisBlocked ||
+      heavyJobActiveRef.current ||
+      workerCircuitOpenRef.current
+    ) {
       return;
     }
 
@@ -1306,7 +2125,7 @@ export function useTruePeakAnalyzer(
     // must be culled here as they free up, otherwise the queue keeps running
     // at the old concurrency until it drains.
     while (lanesRef.current.length > laneLimitRef.current) {
-      const idle = lanesRef.current.find((lane) => lane.jobId === null);
+      const idle = lanesRef.current.find((lane) => lane.lease === null);
       if (!idle) {
         break;
       }
@@ -1315,7 +2134,9 @@ export function useTruePeakAnalyzer(
     }
 
     const acquireLane = (): WorkerLane | null => {
-      const idle = lanesRef.current.find((lane) => lane.jobId === null);
+      const idle = lanesRef.current.find(
+        (lane) => lane.lease === null && !lane.retireAfterRelease,
+      );
       if (idle) {
         return idle;
       }
@@ -1326,12 +2147,18 @@ export function useTruePeakAnalyzer(
 
       const lane: WorkerLane = {
         id: laneSequenceRef.current++,
-        decoder: null as unknown as Worker,
-        analyzer: null as unknown as Worker,
-        jobId: null,
+        decoder: null,
+        analyzer: null,
+        workerEpoch: 0,
+        leaseGeneration: 0,
+        lease: null,
+        retireAfterRelease: false,
         failureStreak: 0,
       };
-      attachLaneWorkers(lane);
+      const attachError = attachLaneWorkers(lane);
+      if (attachError) {
+        lane.failureStreak = 1;
+      }
       lanesRef.current.push(lane);
       return lane;
     };
@@ -1342,22 +2169,59 @@ export function useTruePeakAnalyzer(
       }
 
       const file = filesRef.current.get(job.id);
-      const heavy = !!file && file.size >= heavyFileBytesRef.current;
-      if (heavy) {
-        if (lanesRef.current.some((lane) => lane.jobId !== null)) {
-          break;
-        }
+      if (!file) {
+        updateJob(job.id, (current) => ({
+          ...current,
+          status: "failed",
+          error: "Original file handle is not available.",
+          progressPercent: 1,
+          progressLabel: "Missing file",
+          finishedAtMs: Date.now(),
+        }));
+        continue;
+      }
 
-        const lane = acquireLane();
-        if (!lane) {
-          break;
-        }
+      const plan = resourcePlansRef.current.get(job.id);
+      if (!plan) {
+        void prepareResourcePlan(job.id, file);
+        break;
+      }
+      if (plan.kind === "preparing") {
+        break;
+      }
+      if (plan.kind === "rejected") {
+        continue;
+      }
 
-        lane.jobId = job.id;
-        laneByJobRef.current.set(job.id, lane);
-        heavyJobActiveRef.current = job.id;
-        const settings = settingsRef.current;
-        void runJob(job.id, lane, settings.target, settings.analysisMode, settings.decodePreference);
+      const settings = settingsRef.current;
+      const mimeType = file.type || "application/octet-stream";
+      const browserFirst =
+        settings.decodePreference === "browser-first" ||
+        (settings.decodePreference === "auto" &&
+          shouldPreferBrowserDecoder(file.name, mimeType));
+      const trustedNativePrimary =
+        plan.kind === "known" && plan.trustedNative && !browserFirst;
+      const exclusive =
+        file.size >= heavyFileBytesRef.current || !trustedNativePrimary;
+      if (
+        exclusive &&
+        lanesRef.current.some((lane) => lane.lease !== null)
+      ) {
+        break;
+      }
+
+      const reservationPeakBytes = trustedNativePrimary
+        ? decodePeakResidentBytes("native-worker", plan.decodedBytes)
+        : conservativeDecodePeakBytes(decodeBudgetRef.current);
+      let nextReservedPeakBytes: number;
+      try {
+        nextReservedPeakBytes = growDecodePeakReservation(
+          reservedPeakBytesRef.current,
+          0,
+          reservationPeakBytes,
+          aggregatePeakBytesRef.current,
+        );
+      } catch {
         break;
       }
 
@@ -1366,12 +2230,46 @@ export function useTruePeakAnalyzer(
         break;
       }
 
-      lane.jobId = job.id;
+      const runToken = beginJobRun(job.id);
+      lane.leaseGeneration += 1;
+      const lease: LaneLease = Object.freeze({
+        laneId: lane.id,
+        generation: lane.leaseGeneration,
+        jobId: job.id,
+        runToken,
+        reservation: {
+          plannedPeakBytes: reservationPeakBytes,
+          peakBytes: reservationPeakBytes,
+          exclusive,
+          released: false,
+        },
+        browserAbortController: new AbortController(),
+      });
+      lane.lease = lease;
+      reservedPeakBytesRef.current = nextReservedPeakBytes;
       laneByJobRef.current.set(job.id, lane);
-      const settings = settingsRef.current;
-      void runJob(job.id, lane, settings.target, settings.analysisMode, settings.decodePreference);
+      if (exclusive) {
+        heavyJobActiveRef.current = job.id;
+      }
+      void runJob(
+        lane,
+        lease,
+        settings.target,
+        settings.analysisMode,
+        settings.decodePreference,
+      );
+      if (exclusive) {
+        break;
+      }
     }
-  }, [attachLaneWorkers, disposeIdleLane, runJob]);
+  }, [
+    attachLaneWorkers,
+    beginJobRun,
+    disposeIdleLane,
+    prepareResourcePlan,
+    runJob,
+    updateJob,
+  ]);
 
   useEffect(() => {
     fillLanesRef.current = fillLanes;
@@ -1383,10 +2281,14 @@ export function useTruePeakAnalyzer(
 
   const enqueueFiles = useCallback((input: FileList | File[]) => {
     const allFiles = Array.from(input);
-    // One session is a review desk, not a database; a runaway selection (or a
-    // dropped drive) gets cut off instead of freezing the tab with jobs.
-    const files = allFiles.slice(0, MAX_INTAKE_FILES);
-    const skippedOverCap = allFiles.length - files.length;
+    // One session is a review desk, not a database. The session limit is global:
+    // it is enforced against every job already in the session, not per add, so a
+    // runaway selection, a dropped drive, or a sequence of adds can never push
+    // the session past MAX_SESSION_JOBS and freeze the tab. Overflow is reported
+    // in the notice below, never silently dropped.
+    const intakePlan = planSessionIntake(jobsRef.current.length, allFiles.length);
+    const files = allFiles.slice(0, intakePlan.accepted);
+    const skippedOverCap = intakePlan.turnedAway;
     const knownSignatures = new Set(fileSignaturesRef.current.values());
     const accepted: File[] = [];
     let skippedEmpty = 0;
@@ -1404,20 +2306,25 @@ export function useTruePeakAnalyzer(
         return;
       }
 
-      const signature = fileSignature(file);
-      if (knownSignatures.has(signature)) {
+      const signature = fileIdentityKey(file);
+      if (signature && knownSignatures.has(signature)) {
         skippedDuplicates += 1;
         return;
       }
 
-      knownSignatures.add(signature);
+      if (signature) {
+        knownSignatures.add(signature);
+      }
       accepted.push(file);
     });
 
     const nextJobs = accepted.map<AnalysisJob>((file) => {
       const id = makeId("analysis");
       filesRef.current.set(id, file);
-      fileSignaturesRef.current.set(id, fileSignature(file));
+      const identity = fileIdentityKey(file);
+      if (identity) {
+        fileSignaturesRef.current.set(id, identity);
+      }
       return {
         id,
         fileName: file.name,
@@ -1430,6 +2337,9 @@ export function useTruePeakAnalyzer(
     });
 
     if (nextJobs.length) {
+      // A new explicit queue action is the retry boundary for a worker-start
+      // circuit breaker; background renders never reopen it on their own.
+      workerCircuitOpenRef.current = false;
       setJobs((current) => {
         const merged = [...nextJobs, ...current];
         jobsRef.current = merged;
@@ -1448,7 +2358,7 @@ export function useTruePeakAnalyzer(
         ? `${skippedEmpty} empty file${skippedEmpty === 1 ? "" : "s"}`
         : null,
       skippedOverCap
-        ? `${skippedOverCap} over the ${MAX_INTAKE_FILES}-file session limit`
+        ? `${skippedOverCap} over the ${MAX_SESSION_JOBS}-file session limit`
         : null,
     ].filter(Boolean);
 
@@ -1474,7 +2384,7 @@ export function useTruePeakAnalyzer(
     invalidateJobRun(jobId);
     const lane = laneByJobRef.current.get(jobId);
     if (lane) {
-      resetLane(lane, "Job canceled.");
+      interruptLane(lane, "Job canceled.");
     }
 
     updateJob(jobId, (job) => ({
@@ -1485,7 +2395,7 @@ export function useTruePeakAnalyzer(
       error: undefined,
     }));
     fillLanesRef.current();
-  }, [invalidateJobRun, resetLane, updateJob]);
+  }, [interruptLane, invalidateJobRun, updateJob]);
 
   const cancelActiveJobs = useCallback(() => {
     const activeIds = new Set(
@@ -1498,8 +2408,8 @@ export function useTruePeakAnalyzer(
 
     activeIds.forEach(invalidateJobRun);
     lanesRef.current.forEach((lane) => {
-      if (lane.jobId !== null) {
-        resetLane(lane, "Jobs canceled.");
+      if (lane.lease !== null && activeIds.has(lane.lease.jobId)) {
+        interruptLane(lane, "Jobs canceled.");
       }
     });
 
@@ -1521,7 +2431,7 @@ export function useTruePeakAnalyzer(
     pushNotice(
       `Canceled ${activeIds.size} active job${activeIds.size === 1 ? "" : "s"}.`,
     );
-  }, [invalidateJobRun, resetLane, pushNotice]);
+  }, [interruptLane, invalidateJobRun, pushNotice]);
 
   const retryJob = useCallback((jobId: string) => {
     if (!filesRef.current.has(jobId)) {
@@ -1529,6 +2439,8 @@ export function useTruePeakAnalyzer(
     }
 
     invalidateJobRun(jobId);
+    resourcePlansRef.current.delete(jobId);
+    workerCircuitOpenRef.current = false;
     updateJob(jobId, (job) => ({
       ...job,
       status: "queued",
@@ -1548,7 +2460,13 @@ export function useTruePeakAnalyzer(
         .map((job) => job.id),
     );
 
-    retryIds.forEach(invalidateJobRun);
+    retryIds.forEach((jobId) => {
+      invalidateJobRun(jobId);
+      resourcePlansRef.current.delete(jobId);
+    });
+    if (retryIds.size) {
+      workerCircuitOpenRef.current = false;
+    }
     setJobs((current) => {
       const next: AnalysisJob[] = current.map((job) => {
         if (retryIds.has(job.id)) {
@@ -1579,7 +2497,7 @@ export function useTruePeakAnalyzer(
     invalidateJobRun(jobId);
     const lane = laneByJobRef.current.get(jobId);
     if (lane) {
-      resetLane(lane, "Job removed.");
+      interruptLane(lane, "Job removed.");
     }
 
     dropJobResources(jobId);
@@ -1589,7 +2507,7 @@ export function useTruePeakAnalyzer(
       return next;
     });
     fillLanesRef.current();
-  }, [invalidateJobRun, resetLane, dropJobResources]);
+  }, [dropJobResources, interruptLane, invalidateJobRun]);
 
   const clearFinished = useCallback(() => {
     setJobs((current) => {
@@ -1608,30 +2526,60 @@ export function useTruePeakAnalyzer(
 
   const clearSession = useCallback(() => {
     restoreGenerationRef.current += 1;
+    // clear() advances the persistence tombstone synchronously before its
+    // transaction joins the serialized queue. Capture the new generation for
+    // every later state snapshot so an old autosave can never reappear after
+    // the clear commits.
+    const clearPromise = liveSessionController.clear();
+    persistenceGenerationRef.current = liveSessionController.captureGeneration();
     jobRunTokensRef.current.clear();
     lanesRef.current.forEach((lane) => {
-      if (lane.jobId !== null) {
-        resetLane(lane, "Session cleared.");
+      if (lane.lease !== null) {
+        interruptLane(lane, "Session cleared.");
       }
     });
 
     filesRef.current.clear();
     fileSignaturesRef.current.clear();
-    laneByJobRef.current.clear();
-    heavyJobActiveRef.current = null;
+    resourcePlansRef.current.clear();
     persistedResultsRef.current.clear();
-    void clearLiveSession();
     setJobs(() => {
       jobsRef.current = [];
       return [];
     });
-    pushNotice("Cleared the current analysis session.");
-  }, [resetLane, pushNotice]);
+    void clearPromise.then((controllerResult) => {
+      const failure = persistenceFailureMessage(controllerResult, "clear");
+      if (failure) {
+        persistenceFailureEpochRef.current += 1;
+        const message = `The visible session was cleared, but its browser recovery copy may remain. ${failure}`;
+        setPersistenceIssue(message);
+        pushNotice(message);
+        return;
+      }
+
+      if (controllerResult.outcome.status === "committed") {
+        setPersistenceIssue(null);
+        pushNotice("Cleared the current analysis session and its browser recovery copy.");
+      }
+    }).catch((error: unknown) => {
+      persistenceFailureEpochRef.current += 1;
+      const message = `The visible session was cleared, but its browser recovery copy could not be deleted. ${error instanceof Error ? error.message : "Recovery storage failed unexpectedly."}`;
+      setPersistenceIssue(message);
+      pushNotice(message);
+    });
+  }, [interruptLane, liveSessionController, pushNotice]);
 
   const clearRecentSessions = useCallback(() => {
-    clearPersistedRecentSessions();
-    setRecentSessions([]);
-    pushNotice("Cleared saved history from this browser.");
+    if (clearPersistedRecentSessions()) {
+      setRecentSessions([]);
+      pushNotice("Cleared saved history from this browser.");
+      return true;
+    }
+
+    pushNotice(
+      "TruePeak could not clear saved history from this browser. The existing history remains visible.",
+    );
+    return false;
   }, [pushNotice]);
 
   const exportCsv = useCallback(() => {
@@ -1675,8 +2623,12 @@ export function useTruePeakAnalyzer(
         buildSessionFile(jobsRef.current),
         "application/json;charset=utf-8",
       );
-    } catch {
-      pushNotice("The browser blocked the session download. Try again.");
+    } catch (error) {
+      pushNotice(
+        error instanceof Error
+          ? error.message
+          : "The browser blocked the session download. Try again.",
+      );
     }
   }, [pushNotice]);
 
@@ -1687,15 +2639,19 @@ export function useTruePeakAnalyzer(
         return 0;
       }
 
-      let text: string;
+      let importResult: Extract<SessionImportWorkerResponse, { type: "result" }>;
       try {
-        text = await file.text();
-      } catch {
-        pushNotice("Could not read that session file.");
+        importResult = await importSessionInWorker(file);
+      } catch (error) {
+        pushNotice(
+          error instanceof Error
+            ? error.message
+            : "Could not read or validate that session file.",
+        );
         return 0;
       }
 
-      const { jobs: importedJobs, error } = parseSessionFile(text);
+      const { jobs: importedJobs, error } = importResult;
       if (error || !importedJobs.length) {
         pushNotice(error ?? "No analyses were found in that session file.");
         return 0;
@@ -1703,19 +2659,29 @@ export function useTruePeakAnalyzer(
 
       // Count against the latest committed state (not inside the updater, which
       // React may invoke twice in development) so the notice numbers are right.
-      const existingIds = new Set(jobsRef.current.map((job) => job.id));
-      const fresh = importedJobs.filter((job) => !existingIds.has(job.id));
-      const added = fresh.length;
-      const skipped = importedJobs.length - added;
+      // Import shares file intake's global cap: mergeImportedJobs deduplicates
+      // against what is already present and then bounds the remainder to the
+      // room left under MAX_SESSION_JOBS, so a portable import can never push a
+      // full session past the limit the way file intake cannot.
+      const reconciledJobs = reconcileSessionJobs(importedJobs, settingsRef.current);
+      const { added, skippedDuplicates, skippedOverCap } = mergeImportedJobs(
+        jobsRef.current,
+        reconciledJobs,
+      );
 
       if (!added) {
-        pushNotice("Those analyses are already in this session.");
+        pushNotice(
+          skippedOverCap
+            ? `This session is already at the ${MAX_SESSION_JOBS}-file limit, so no analyses were imported.`
+            : "Those analyses are already in this session.",
+        );
         return 0;
       }
 
       setJobs((current) => {
-        const currentIds = new Set(current.map((job) => job.id));
-        const toAdd = fresh.filter((job) => !currentIds.has(job.id));
+        // Re-run the merge against the latest committed state so a concurrent
+        // add cannot let the import overshoot the cap it was planned against.
+        const { toAdd } = mergeImportedJobs(current, reconciledJobs);
         if (!toAdd.length) {
           return current;
         }
@@ -1725,9 +2691,16 @@ export function useTruePeakAnalyzer(
         return next;
       });
 
+      const skippedParts = [
+        skippedDuplicates ? `${skippedDuplicates} already present` : null,
+        skippedOverCap
+          ? `${skippedOverCap} over the ${MAX_SESSION_JOBS}-file session limit`
+          : null,
+      ].filter(Boolean);
+
       pushNotice(
-        skipped
-          ? `Loaded ${added} file${added === 1 ? "" : "s"} from the session (${skipped} already present).`
+        skippedParts.length
+          ? `Loaded ${added} file${added === 1 ? "" : "s"} from the session (${skippedParts.join(", ")}).`
           : `Loaded ${added} file${added === 1 ? "" : "s"} from the saved session.`,
       );
       return added;
@@ -1740,6 +2713,7 @@ export function useTruePeakAnalyzer(
     completedJobs,
     recentSessions,
     notice,
+    persistenceIssue,
     parallelLimit,
     enqueueFiles,
     cancelJob,

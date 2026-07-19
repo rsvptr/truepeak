@@ -7,16 +7,16 @@
     <a href="https://github.com/rsvptr/truepeak/actions/workflows/ci.yml">
       <img src="https://img.shields.io/github/actions/workflow/status/rsvptr/truepeak/ci.yml?branch=main&style=for-the-badge&logo=githubactions&logoColor=white&label=CI" alt="CI status" />
     </a>
-    <img src="https://img.shields.io/badge/Checks-96_fixed_+_1362_fuzz-0f9684?style=for-the-badge" alt="96 fixed checks plus 1362 fuzz cases" />
+    <img src="https://img.shields.io/badge/Checks-440%2B_fixed_+_1362_fuzz-0f9684?style=for-the-badge" alt="More than 440 fixed checks plus 1362 fuzz cases" />
     <img src="https://img.shields.io/badge/ffmpeg.wasm-fingerprint_pinned-654FF0?style=for-the-badge&logo=webassembly&logoColor=white" alt="ffmpeg.wasm pinned by fingerprint" />
   </p>
 </div>
 
 > **Note**
 >
-> TruePeak runs entirely in your browser. Your audio is read, decoded, and analyzed on your own machine. There is no upload path, no backend database, and no account system, so there is no audio or user data sitting on a server to steal in the first place. The work described below is about the inputs the app does accept, and about making sure the code you run is the code that was reviewed.
+> TruePeak reads, decodes, and analyzes audio on your machine. There is no audio-upload path, server-side application database, or account system; local recovery uses browser IndexedDB. Telemetry is off by default: Analytics and Speed Insights mount only when the build runs on Vercel (`VERCEL=1`) and the operator also sets `NEXT_PUBLIC_ENABLE_TELEMETRY=1`. When that opt-in is on, visit and performance telemetry is the network exception; audio bytes and measurement content are not sent through those integrations. The work below covers untrusted inputs, local persistence, resource exhaustion, and making sure the shipped code is the code that was reviewed.
 
-The short version: every parser that touches untrusted bytes is bounded, validated, and fuzzed. The pages ship with a strict Content Security Policy and related headers. The one large piece of third party code is pinned by fingerprint at build time. And CI checks all of it again on every push. The rest of this document walks through each layer, then states the accepted risks plainly.
+The short version: parsers and decode routes are bounded, validated, and fuzzed; pages ship with a strict Content Security Policy and related headers; the embedded ffmpeg.wasm bytes are fingerprint-pinned; and CI checks the primary paths on every push. The optional hosted telemetry (off unless explicitly enabled) and the known age of the pinned FFmpeg core are separate trust/accepted-risk boundaries called out below.
 
 ## Contents
 
@@ -34,7 +34,7 @@ The short version: every parser that touches untrusted bytes is bounded, validat
 
 ## The security model
 
-Everything interesting happens on your machine. The only server side work in the whole app is reading the theme cookie so the first paint uses the right colors. That shapes the threat model in a useful way: there is no data flow between users, so nothing a hostile file does can affect anyone except the person who opened it.
+Audio processing and result storage happen on your machine. The server reads the theme cookie (making `/` dynamically rendered), and a build only loads same-origin Vercel telemetry endpoints when the operator opts in with `NEXT_PUBLIC_ENABLE_TELEMETRY=1` on Vercel. There is still no application data flow between users, so the main hostile-file impact is confined to the browser session that opened it.
 
 What is worth defending, then, is the browser session itself. An attacker should not be able to run script in the app's origin, crash or hang the tab, quietly corrupt your stored results, or swap the code the app ships for something unreviewed.
 
@@ -44,11 +44,14 @@ Untrusted input reaches TruePeak in three ways, and each one goes through its ow
 
 ```mermaid
 flowchart LR
-    A["Audio files (drop or picker)"] --> P["Bounded binary parsers in worker lanes"]
-    B["Session files (.truepeak.json)"] --> W["Whitelist rebuild with caps"]
+    A["Audio files (drop or picker)"] --> P["Bounded worker parsers / ffmpeg.wasm"]
+    A --> BA["Budgeted browser Web Audio route"]
+    B["Session files (.truepeak.json)"] --> SW["Hash + whitelist rebuild in import worker"]
     C["Restored results (IndexedDB)"] --> W
     D["URL query + localStorage"] --> E["Enum and shape allowlists"]
     P --> F["Analyzer"]
+    BA --> F
+    SW --> G["React text rendering"]
     W --> G["React text rendering"]
     E --> G
     F --> G
@@ -62,15 +65,17 @@ The realistic attacker goals are running script in the app's origin (XSS), denia
 
 ## How untrusted input is handled
 
-**Audio files.** The WAV and AIFF parsers bound every allocation by the actual size of the buffer they were handed, so a header that declares an absurd size cannot cause an absurd allocation. The chunk scanners track only the chunk IDs they actually read and stop scanning once those are found. That closes off a real problem fixed during review: a file made of millions of tiny junk chunks used to balloon memory before a single audio byte was parsed. Format fields are also checked for the values binary formats can sneak past simple comparisons. The AIFF sample rate, for example, is an 80 bit float that can encode NaN and Infinity, both of which pass a naive check against zero and are now rejected outright. Anything that fails turns into a plain error message, and the rest of the batch keeps going.
+**Audio files.** The WAV/RF64 and AIFF/AIFC parsers bound field reads and allocations and reject incomplete metadata, including an RF64 data size larger than the physical bytes and an AIFC file missing its mandatory FVER chunk. Before or during every decode route, checked arithmetic enforces source, decoded, output, channel, frame, duration, and time budgets. FFmpeg output is probed before analysis and is rejected if a cap was hit or the decoded frame/byte metadata is inconsistent. Anything that fails becomes a structured, actionable job error while the rest of the batch continues.
 
-**Worker isolation.** Decoding and analysis run in Web Workers, one independent decoder and analyzer pair per active file. A file that manages to crash a worker takes down only its own lane, which is terminated and replaced automatically. It cannot touch a neighbouring file's work or the page itself. ffmpeg.wasm runs inside one of those workers and loads assets only from the app's own origin.
+**Worker isolation and lane ownership.** Direct/compatibility decoding and analysis run in Web Workers; browser-native codecs use Web Audio in the page realm because that API is not consistently available in workers. Every active job owns an immutable lane lease and worker generation. Stale events are ignored, a worker restart cannot release the lane into another job's hands, and cancellation retains ownership until any uninterruptible browser decode has drained. Synchronous worker-construction failures clean up partially created workers and settle the affected row. ffmpeg.wasm runs in the decoder worker and loads assets only from the app's origin.
 
-**Session files and restored results.** Imports are not trusted and then checked. They are rebuilt. Every field the app will ever read is checked for type, capped for length and count, and copied into a fresh object, so unknown fields and wrong values never exist on the other side. A URL embedded in a session file is kept only if it is plain `http` or `https`. The same validation runs on the app's own IndexedDB records when a session is restored after a refresh. IndexedDB lives in the same origin, but treating stored bytes as trusted is how corruption turns into a crash, so they get the full rebuild too. A malformed file is rejected with a clear message rather than a broken screen.
+**Session files and restored results.** Imports are hashed and rebuilt in a dedicated worker. Every consumed field is checked for type and cross-field consistency, capped for length/count, and copied into a fresh object. One malformed row rejects the whole file, imported IDs are replaced, and a file cannot grant itself trusted provenance or forge the SHA-256 that the app associates with its actual source bytes. Imported results remain explicitly unverified through re-export and IndexedDB recovery. The same whitelist rebuild runs on recovery records, which are read from IndexedDB schema v2. The restore walks a newest-first `createdAt` index and stops at the 1,000-record session limit. A record that fails validation within that newest-first region is moved to a quarantine store rather than deleted; records beyond the limit are left in place and reported as overflow. No record is deleted during a restore, and the read is transactional, so a failed quarantine move rolls back rather than dropping a record without quarantining it.
 
-**The URL and localStorage.** Workspace state in the query string (the active tab, filters, sort, and so on) is matched against fixed lists of allowed values. An unknown value falls back to a default rather than reaching any logic. Preferences read from localStorage are validated the same way, and stored history entries have their shape checked before use.
+**Settings/recovery consistency.** Target, mode, custom target fields, and decoder preference are validated before storage. Invalid text drafts never replace the last valid target snapshot. If localStorage refuses the settings write, a persistent warning is shown and new completed results are not added to IndexedDB recovery until a later settings write succeeds; deletes and an explicit Clear Session remain available. This prevents recovery from silently applying stale settings to newly measured results.
 
-**Rendering and exports.** Untrusted strings only ever render through React text interpolation, which escapes them. The app uses no raw HTML injection for user data; the single inline script in the page is a fixed theme snippet that takes no input. On the way out, the CSV export escapes quotes, commas, and line breaks, and it neutralizes anything a spreadsheet would treat as a formula (`=`, `+`, `-`, `@`, tabs, newlines), so a hostile filename cannot become an executing cell in Excel.
+**The URL and localStorage.** Workspace state in the query string (the active tab, filters, sort, and so on) is matched against fixed lists of allowed values. An unknown value falls back to a default rather than reaching any logic. Preferences read from localStorage are validated the same way. Stored history is count-, string-, date-, and number-bounded, current envelopes require explicit validity/provenance state, and migrated summaries are marked when the legacy contract is unknown.
+
+**Rendering and exports.** Untrusted strings render through React text interpolation. The app uses no raw HTML injection for user data; the single inline script is a fixed theme snippet. CSV fields are quoted and formula-neutralized, while Markdown report fields escape headings, links/images, HTML, separators, and line breaks so a hostile filename cannot restructure the report. JSON/CSV/Markdown exports prominently label unverified imported provenance. Records carrying the current validity flag never present the internal `-70` invalid-measurement sentinel as a real integrated reading; older records without that flag are explicitly treated as legacy/unknown where that distinction is available.
 
 ## Limits on untrusted input
 
@@ -80,14 +85,17 @@ Caps keep a hostile or simply enormous input from becoming a memory problem. The
 | --- | --- |
 | Session file size | 64 MB per import |
 | Jobs per session file | 1,000 |
-| Timeline points per result | 500,000 |
+| Timeline points per portable session | 500,000 aggregate (exports downsample) |
 | Short strings (names, labels) | 512 characters |
 | Long strings (notes, descriptions) | 2,000 characters |
 | Notes and warnings per result | 64 entries |
-| Files accepted per add | 2,000 |
-| Folder traversal depth on drop | 12 levels |
+| Jobs accepted into a running session | 1,000 (whole session, counted across every add, not per add) |
+| Default source / decoded / decoder-output bytes | 512 MiB / 256 MiB / 257 MiB per job (scheduler may lower) |
+| Aggregate modeled decode-route residency | One or two conservative route peaks, selected from device-memory/pointer signals; unknown routes run exclusively |
+| Channels / duration / decode time | 32 / 6 hours / 2 minutes per job by default |
+| Folder traversal | 2,000 files, 8,000 entries, depth 12, 256 pages, 5 seconds |
 
-When a cap cuts something off, the app says so in a notice instead of pretending it covered everything.
+One authoritative limit of 1,000 jobs now governs intake, recovery restore, portable export, and portable import. Intake counts every job already in the session, so a sequence of adds can never push the total past 1,000; files beyond the remaining room are turned away and reported, not dropped silently. The app fails an over-limit session export explicitly, rejects over-limit imports rather than truncating, and restores the newest 1,000 records while reporting overflow and leaving the extra stored records in place. The folder-traversal limit of 2,000 files is a separate enumeration safeguard for a dropped folder, not a session cap; intake still caps enqueued jobs at 1,000 regardless. Folder enumeration stops as soon as any traversal dimension is exhausted.
 
 ## Headers the pages ship with
 
@@ -106,19 +114,20 @@ Production drops `'unsafe-eval'` entirely. `'wasm-unsafe-eval'` is just enough f
 
 ## What is stored where
 
-Nothing leaves your machine. This is what stays on it, and how to remove it.
+Audio and result content stays on your machine. This table covers local state plus the optional telemetry exception.
 
 | Store | What lives there | Cleared by |
 | --- | --- | --- |
 | Cookie (`truepeak-theme`) | Light or dark, kept for one year, `SameSite=Lax`, `Secure` over HTTPS | Switching themes or clearing cookies |
-| localStorage | UI preferences, and the optional history summaries (off by default, most recent 20) | The Clear History control or clearing site data |
-| IndexedDB | Completed results for the live session, so a refresh does not lose a finished batch | Removing files, Clear Session, or clearing site data |
+| localStorage | UI/analysis/decoder preferences, and optional history summaries (off by default, most recent 20; turning it off does not delete existing summaries) | The Clear History control removes summaries; clearing site data removes all preferences |
+| IndexedDB (schema v2) | Completed results for the live session in a `jobs` store, plus a `quarantine` store for malformed recovery records set aside during restore, so a refresh does not lose a finished batch | Removing files, Clear Session, or clearing site data |
+| Vercel Analytics / Speed Insights | Off by default; only when the build runs on Vercel with `NEXT_PUBLIC_ENABLE_TELEMETRY=1`. Visit and performance telemetry, not audio bytes or measurement/session content | Leave `NEXT_PUBLIC_ENABLE_TELEMETRY` unset, or use browser/site privacy controls |
 
 ## Supply chain
 
 The largest piece of third party code the app serves to users is the ffmpeg.wasm runtime, so it gets the most careful handling. The build copies it from the installed package only after checking its SHA-256 fingerprints against values pinned in [`scripts/prepare-ffmpeg-assets.mjs`](./scripts/prepare-ffmpeg-assets.mjs). A package that does not match, whether that is a hijacked release, a tampered download, or simply an unreviewed version, stops the build and prints both fingerprints, so it never reaches a browser. Upgrading it is a deliberate, manual step: install, review, run the script with `--print-hashes`, and pin the new values.
 
-Around that sit the usual guards. `package-lock.json` pins the whole dependency tree. Dependabot proposes routine updates weekly, with `@ffmpeg/core` deliberately excluded, because an automated bump of that package can only ever produce a failed build until a person reviews and pins it. And CI fails any push whose dependencies carry a serious known advisory.
+Around that sit the usual guards. `package-lock.json` pins the npm tree. Dependabot proposes routine updates weekly, with `@ffmpeg/core` deliberately excluded because a replacement needs manual review and new hashes. CI fails npm dependencies at high/critical advisory severity. This does not scan CVEs in the C/C++ code embedded inside ffmpeg.wasm, and the optional Vercel telemetry scripts, when enabled, are served at runtime rather than pinned by this repository; both limitations are explicit accepted risks below.
 
 ## Continuous verification
 
@@ -126,7 +135,7 @@ Security claims drift out of date unless something checks them again. Two things
 
 **The fuzzer.** `npm run test:fuzz` runs roughly 1,360 deterministic cases against every parser that touches untrusted bytes: mutated WAV files across three encodings, mutated AIFF files, raw noise into every binary parser, mutated FLAC headers (that parser runs on the main thread, so it gets fuzzed directly), mutated session JSON, and two regression cases for the exact memory and sample rate bugs found during review. Every case must either parse into sane output or fail with a clean error inside a 250 ms budget. No hangs, no strange throws, no runaway memory. The seed is fixed, so any failure reproduces exactly, anywhere.
 
-**The CI gate.** Every push and pull request runs the install (which executes the ffmpeg fingerprint check), the linter, all six validation suites (the DSP reference signals, the EBU compliance cases, session round trips, bad input robustness, export escaping, and the fuzzer), then a production build and `npm audit --audit-level=high`. The badge at the top of this page is that pipeline's current verdict. The full suite breakdown lives in the [README's testing section](./README.md#testing).
+**The CI gate.** Every push and pull request runs the install (including the ffmpeg fingerprint check), linter, seven primary validation suites (DSP, the represented EBU reference subset, sessions, robustness, exports, presets, and fuzz), a production build, and `npm audit --audit-level=high`. Two focused harnesses, run manually with the commands below, additionally cover clear/save ordering, provenance recovery, decoded budgets, cancellation draining, and bounded folder traversal. The full breakdown lives in the [README's testing section](./README.md#testing).
 
 ## Check it yourself
 
@@ -134,8 +143,10 @@ None of the above needs to be taken on faith. From a checkout:
 
 ```bash
 npm install          # runs the ffmpeg fingerprint check as a postinstall step
-npm test             # all six suites: 96 fixed checks plus roughly 1,360 fuzz cases
+npm test             # all seven suites: 440+ fixed assertions plus 1,362 fuzz cases
 npm run test:fuzz    # just the fuzzer
+node scripts/dsp/validate-live-session.mjs
+node scripts/dsp/validate-runtime.mjs
 node scripts/prepare-ffmpeg-assets.mjs --print-hashes   # current ffmpeg fingerprints
 ```
 
@@ -152,7 +163,13 @@ Stated plainly, with the reasoning, so nobody has to rediscover them:
 - **`'unsafe-inline'` stays in `script-src`.** Next.js App Router starts up with inline scripts, and removing this requires nonce middleware. External script origins are still fully blocked, which is the part that breaks the usual XSS exfiltration approach.
 - **`'unsafe-inline'` stays in `style-src`** for styles the framework injects. Style injection without script execution is a minor vector here.
 - **`npm audit` reports moderate advisories for the PostCSS copy bundled inside Next.js's own build tooling.** It processes only this repository's own CSS at build time, cannot be reached at runtime, and the only offered fix is a major Next.js downgrade.
-- **Browsers without `navigator.deviceMemory`** (Safari and Firefox) fall back to conservative parallelism rules rather than hard memory guarantees. The gate that makes very large files run alone still applies.
+- **The pinned `@ffmpeg/core` 0.12.9 assets are built from FFmpeg n5.1.4, which is in the affected range for [CVE-2024-7272](https://nvd.nist.gov/vuln/detail/CVE-2024-7272) (a libswresample heap overflow).** This is a reviewed, accepted risk. Exploitability against these exact WebAssembly bytes was not demonstrated, and the blast radius is bounded by the WASM linear memory and worker isolation to the tab, not the host. Fingerprint integrity is not a security update, and no patched prebuilt core is available: the next published release, 0.12.10, ships byte-identical core assets. Hash-pinning stays in place. Revisit criteria: a patched upstream core release, or evidence of practical exploitability in WASM builds.
+- **Telemetry is off by default; an operator can opt in to mutable same-origin Analytics and Speed Insights scripts.** They mount only when the build runs on Vercel (`VERCEL=1`) and `NEXT_PUBLIC_ENABLE_TELEMETRY=1` is also set. A default Vercel deployment with that flag unset sends nothing. When an operator turns it on, this is disclosed rather than presented as "nothing leaves the device", and deployments with a stricter privacy boundary should leave the flag unset.
+- **CI actions currently use moving major-version tags.** The workflow now declares a top-level read-only token permission (`permissions: contents: read`) and disables credential persistence on checkout (`persist-credentials: false`), so the remaining hardening work is commit-SHA pinning of the action tags themselves.
+- **Web Audio can allocate decoded output before post-decode validation for codecs without trustworthy metadata.** Those files run exclusively, receive time/cancel controls, are checked before channel copying or analysis, and keep their lane until decoding drains, but a browser-level allocation spike cannot be prevented after `decodeAudioData()` starts.
+- **The intake and portable/recovery job caps are unified at 1,000.** Intake, recovery restore, portable export, and portable import all use the single 1,000-job session limit, counted across every add. Overflow is explicit and non-destructive: files beyond capacity are turned away and reported, over-limit exports and imports fail rather than truncate, and recovery restores the newest 1,000 records while leaving the rest in place.
+- **Browsers without `navigator.deviceMemory`** fall back to conservative aggregate reservations and parallelism. Per-job hard resource ceilings still apply.
+- **The bundled EBU checks are a reference subset, not certification.** The earlier Phase 1 DSP and parser gaps are now closed and covered by the test suites: the WAVE quad mask keeps true rears (side remapping applies only to a centre-present, side-absent 5.1 mask), 400 ms validity is handled at odd rates such as 11,025 Hz, the LRA procedure models the required trailing silence, RF64 rejects a declared data size larger than the physical bytes rather than clamping it, and AIFC requires the mandatory FVER and compression-name fields. The suite still runs a subset because Tech 3341 cases 7, 8, and 20 to 23, and Tech 3342 cases 5 and 6, need the EBU reference-audio downloads or 4x-fs synthesis rather than closed-form parameters. Treat a pass as regression protection for the documented behaviors, not as an EBU-Mode conformance guarantee.
 
 ## Reporting a vulnerability
 

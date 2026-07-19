@@ -1,5 +1,15 @@
 import { deriveChannelLayout } from "@/audio/channel-layout";
+import {
+  DecodeResourceError,
+  assertDecodedFootprint,
+  assertSourceWithinBudget,
+  inspectAudioContainer,
+  resolveDecodeBudget,
+  throwIfAborted,
+  validatePlanarChannels,
+} from "@/audio/decode-budget";
 import { toTransferAsset } from "@/audio/serialise";
+import type { DecodeBudget } from "@/audio/decode-budget";
 import type { DecodedAudioTransfer, SourceFormat } from "@/types/audio";
 
 const WAVE_EXTENSIONS = new Set(["wav", "rf64"]);
@@ -12,6 +22,11 @@ interface FlacStreamInfo {
   bitDepth: number;
   frameCount: number;
   durationSeconds: number;
+}
+
+export interface BrowserDecodeOptions {
+  signal?: AbortSignal;
+  budget?: DecodeBudget;
 }
 
 function inferSourceFormat(fileName: string): SourceFormat {
@@ -62,70 +77,74 @@ function getAudioContextConstructor() {
   return candidate;
 }
 
-function readAscii(view: DataView, offset: number, length: number) {
-  let out = "";
-  for (let index = 0; index < length; index += 1) {
-    out += String.fromCharCode(view.getUint8(offset + index));
-  }
-  return out;
-}
-
 // Exported for the fuzz suite: this runs on the main thread against untrusted
 // bytes before the browser decoder sees them, so it gets fuzzed directly.
 export function parseFlacStreamInfo(buffer: ArrayBuffer): FlacStreamInfo | null {
-  if (buffer.byteLength < 42) {
-    return null;
-  }
-
-  const view = new DataView(buffer);
-  if (readAscii(view, 0, 4) !== "fLaC") {
-    return null;
-  }
-
-  let offset = 4;
-  while (offset + 4 <= view.byteLength) {
-    const blockType = view.getUint8(offset) & 0x7f;
-    const blockLength =
-      (view.getUint8(offset + 1) << 16) |
-      (view.getUint8(offset + 2) << 8) |
-      view.getUint8(offset + 3);
-    offset += 4;
-
-    if (offset + blockLength > view.byteLength) {
-      return null;
-    }
-
-    if (blockType === 0) {
-      if (blockLength < 34) {
-        return null;
+  const metadata = inspectAudioContainer(buffer);
+  return metadata?.container === "flac"
+    ? {
+        sampleRate: metadata.sampleRate,
+        channelCount: metadata.channelCount,
+        bitDepth: metadata.bitDepth,
+        frameCount: metadata.frameCount,
+        durationSeconds: metadata.durationSeconds,
       }
+    : null;
+}
 
-      const byte10 = view.getUint8(offset + 10);
-      const byte11 = view.getUint8(offset + 11);
-      const byte12 = view.getUint8(offset + 12);
-      const byte13 = view.getUint8(offset + 13);
-      const sampleRate = (byte10 << 12) | (byte11 << 4) | (byte12 >> 4);
-      const channelCount = ((byte12 >> 1) & 0x07) + 1;
-      const bitDepth = (((byte12 & 0x01) << 4) | (byte13 >> 4)) + 1;
-      const frameCount = (byte13 & 0x0f) * 2 ** 32 + view.getUint32(offset + 14, false);
-
-      if (sampleRate <= 0 || channelCount <= 0 || bitDepth <= 0 || frameCount <= 0) {
-        return null;
-      }
-
-      return {
-        sampleRate,
-        channelCount,
-        bitDepth,
-        frameCount,
-        durationSeconds: frameCount / sampleRate,
-      };
-    }
-
-    offset += blockLength;
+// Web Audio exposes no reliable cancellation primitive for decodeAudioData.
+// Never reject the wrapper while that decode is still running: callers use
+// settlement to release/reassign a lane, and early rejection would allow the
+// unabortable decode to overlap the replacement job. The UI can react to its
+// own AbortSignal immediately; this promise drains first, then reports the
+// cancellation before any channel copy or analysis handoff.
+export async function waitForBrowserDecodeDrain<T>(
+  promise: Promise<T>,
+  signal?: AbortSignal,
+) {
+  throwIfAborted(signal);
+  try {
+    const value = await promise;
+    throwIfAborted(signal);
+    return value;
+  } catch (error) {
+    // A cancellation/time-budget reason takes precedence once the underlying
+    // decoder has drained; otherwise preserve the decoder's original error.
+    throwIfAborted(signal);
+    throw error;
   }
+}
 
-  return null;
+function createDecodeSignal(externalSignal: AbortSignal | undefined, maxDecodeMs: number) {
+  const controller = new AbortController();
+  const forwardExternalAbort = () => {
+    controller.abort(
+      externalSignal?.reason instanceof Error
+        ? externalSignal.reason
+        : new DecodeResourceError("cancelled", "Audio decoding was canceled."),
+    );
+  };
+  if (externalSignal?.aborted) {
+    forwardExternalAbort();
+  } else {
+    externalSignal?.addEventListener("abort", forwardExternalAbort, { once: true });
+  }
+  const timeoutId = window.setTimeout(() => {
+    controller.abort(
+      new DecodeResourceError(
+        "time-limit-exceeded",
+        `Browser decoding exceeded the ${maxDecodeMs} ms execution-time budget.`,
+      ),
+    );
+  }, maxDecodeMs);
+
+  return {
+    signal: controller.signal,
+    cleanup: () => {
+      window.clearTimeout(timeoutId);
+      externalSignal?.removeEventListener("abort", forwardExternalAbort);
+    },
+  };
 }
 
 function createAudioContext(
@@ -153,19 +172,77 @@ export async function decodeAudioFileInBrowser(
   file: File,
   primaryError?: string,
   sourceBuffer?: ArrayBuffer,
+  options: BrowserDecodeOptions = {},
 ): Promise<DecodedAudioTransfer> {
   const AudioContextConstructor = getAudioContextConstructor();
+  const budget = resolveDecodeBudget(options.budget);
+  const decodeSignal = createDecodeSignal(options.signal, budget.maxDecodeMs);
   let context: AudioContext | null = null;
 
   try {
+    throwIfAborted(decodeSignal.signal);
+    if (!sourceBuffer) {
+      assertSourceWithinBudget(file.size, budget);
+    }
     const input = sourceBuffer ?? await file.arrayBuffer();
+    throwIfAborted(decodeSignal.signal);
+    assertSourceWithinBudget(input.byteLength, budget);
     const sourceMetadata = parseFlacStreamInfo(input);
+    if (sourceMetadata) {
+      assertDecodedFootprint(sourceMetadata, budget, "FLAC STREAMINFO");
+    }
     const contextState = createAudioContext(AudioContextConstructor, sourceMetadata);
     context = contextState.context;
-    const decoded = await context.decodeAudioData(input);
+    const decoded = await waitForBrowserDecodeDrain(
+      context.decodeAudioData(input),
+      decodeSignal.signal,
+    );
+    throwIfAborted(decodeSignal.signal);
     const channelCount = decoded.numberOfChannels;
-    const channels = Array.from({ length: channelCount }, (_, index) =>
-      new Float32Array(decoded.getChannelData(index)),
+    assertDecodedFootprint(
+      {
+        frameCount: decoded.length,
+        channelCount,
+        sampleRate: decoded.sampleRate,
+        durationSeconds: decoded.duration,
+      },
+      budget,
+      "Browser decoder output",
+    );
+
+    const channelViews: Float32Array[] = [];
+    for (let index = 0; index < channelCount; index += 1) {
+      throwIfAborted(decodeSignal.signal);
+      channelViews.push(decoded.getChannelData(index));
+    }
+    validatePlanarChannels(
+      channelViews,
+      {
+        frameCount: decoded.length,
+        channelCount,
+        sampleRate: decoded.sampleRate,
+        durationSeconds: decoded.duration,
+      },
+      budget,
+      "Browser decoder output",
+    );
+
+    const channels: Float32Array[] = [];
+    for (const channelView of channelViews) {
+      throwIfAborted(decodeSignal.signal);
+      channels.push(new Float32Array(channelView));
+    }
+    throwIfAborted(decodeSignal.signal);
+    validatePlanarChannels(
+      channels,
+      {
+        frameCount: decoded.length,
+        channelCount,
+        sampleRate: decoded.sampleRate,
+        durationSeconds: decoded.duration,
+      },
+      budget,
+      "Copied browser decoder output",
     );
 
     const decodeNotes = [
@@ -194,6 +271,11 @@ export async function decodeAudioFileInBrowser(
           `Browser decoder returned ${decoded.numberOfChannels} channel${decoded.numberOfChannels === 1 ? "" : "s"} after source metadata reported ${sourceMetadata.channelCount}.`,
         );
       }
+      if (decoded.length !== sourceMetadata.frameCount) {
+        warnings.push(
+          `Browser decoder returned ${numberFormatter.format(decoded.length)} frames after source metadata reported ${numberFormatter.format(sourceMetadata.frameCount)}; analysis uses the decoded PCM frame count.`,
+        );
+      }
     }
 
     return toTransferAsset({
@@ -214,12 +296,12 @@ export async function decodeAudioFileInBrowser(
       channels,
     });
   } catch (error) {
-    throw new Error(
-      error instanceof Error
-        ? error.message
-        : "The browser decoder could not read this audio file.",
-    );
+    if (error instanceof Error) {
+      throw error;
+    }
+    throw new Error("The browser decoder could not read this audio file.");
   } finally {
+    decodeSignal.cleanup();
     void context?.close().catch(() => undefined);
   }
 }

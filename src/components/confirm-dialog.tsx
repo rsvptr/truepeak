@@ -29,12 +29,14 @@ export function ConfirmDialog({
 }: ConfirmDialogProps) {
   const titleId = useId();
   const descriptionId = useId();
+  const containerRef = useRef<HTMLDivElement | null>(null);
   const panelRef = useRef<HTMLDivElement | null>(null);
   const cancelButtonRef = useRef<HTMLButtonElement | null>(null);
 
   useModalFocus({
     open,
     panelRef,
+    containerRef,
     onClose,
     // The safe action gets initial focus so Enter cannot destroy anything.
     getInitialFocus: () => cancelButtonRef.current,
@@ -45,7 +47,11 @@ export function ConfirmDialog({
   }
 
   return (
-    <div className="fixed inset-0 z-[70] flex items-center justify-center px-4 py-6 sm:px-6" aria-hidden={false}>
+    <div
+      ref={containerRef}
+      className="fixed inset-0 z-[70] flex items-center justify-center overflow-y-auto px-4 pt-[max(1.5rem,env(safe-area-inset-top))] pb-[max(1.5rem,env(safe-area-inset-bottom))] sm:px-6 [@media(max-height:640px)]:items-start"
+      aria-hidden={false}
+    >
       <div
         aria-hidden="true"
         className="tp-fade-in absolute inset-0 bg-black/62 backdrop-blur-sm"
@@ -58,7 +64,7 @@ export function ConfirmDialog({
         aria-labelledby={titleId}
         aria-describedby={descriptionId}
         tabIndex={-1}
-        className="tp-dialog-in relative z-10 w-full max-w-[460px] rounded-[28px] border border-[var(--line)] bg-[var(--surface-1)] p-5 shadow-[var(--shadow-elevated)] focus:outline-none sm:p-6"
+        className="tp-dialog-in relative z-10 max-h-[calc(100dvh_-_env(safe-area-inset-top)_-_env(safe-area-inset-bottom)_-_3rem)] w-full max-w-[460px] overflow-y-auto rounded-[28px] border border-[var(--line)] bg-[var(--surface-1)] p-5 shadow-[var(--shadow-elevated)] focus:outline-none sm:p-6"
       >
         <div className="flex items-start gap-4">
           <div
@@ -82,7 +88,11 @@ export function ConfirmDialog({
             </p>
           </div>
         </div>
-        <div className="mt-6 flex flex-col-reverse gap-2 sm:flex-row sm:justify-end">
+        {/* Mobile stacks vertically in DOM/tab order (Cancel, then Confirm)
+            rather than reversing visual order with flex-col-reverse, which
+            previously put Confirm above Cancel while Tab still visited
+            Cancel first (UX-028). */}
+        <div className="mt-6 flex flex-col gap-2 sm:flex-row sm:justify-end">
           <Button ref={cancelButtonRef} type="button" size="sm" variant="secondary" onClick={onClose}>
             {cancelLabel}
           </Button>

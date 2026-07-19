@@ -18,8 +18,21 @@ export function getComplianceSummary(result: AnalysisResult): ComplianceSummary 
     return null;
   }
 
+  if (result.metrics.integratedValid === false) {
+    return null;
+  }
+
   const deltaFromTargetLufs = result.metrics.integratedLufs - result.target.loudnessTargetLufs;
   const window = Math.max(0.1, result.target.toleranceLufs);
+
+  if (Math.abs(deltaFromTargetLufs) <= window) {
+    return {
+      state: "on-target",
+      label: "On target",
+      description: `Integrated loudness sits within +/-${window.toFixed(2)} LU of the selected target.`,
+      deltaFromTargetLufs,
+    };
+  }
 
   if (result.metrics.normalizationLimited) {
     return {
@@ -27,15 +40,6 @@ export function getComplianceSummary(result: AnalysisResult): ComplianceSummary 
       label: "Ceiling-limited",
       description:
         "Normalization gain was capped to keep the projected true peak inside the selected ceiling.",
-      deltaFromTargetLufs,
-    };
-  }
-
-  if (Math.abs(deltaFromTargetLufs) <= window) {
-    return {
-      state: "on-target",
-      label: "On target",
-      description: `Integrated loudness sits within +/-${window.toFixed(2)} LU of the selected target.`,
       deltaFromTargetLufs,
     };
   }

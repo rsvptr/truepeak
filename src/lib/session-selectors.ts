@@ -5,6 +5,25 @@ export interface CompletedAnalysisJob extends AnalysisJob {
   result: NonNullable<AnalysisJob["result"]>;
 }
 
+/** Sort finite metrics while keeping unavailable values unranked at the end. */
+export function compareOptionalMetric(
+  left: number | null | undefined,
+  right: number | null | undefined,
+  direction: "asc" | "desc",
+) {
+  const leftValid = left != null && Number.isFinite(left);
+  const rightValid = right != null && Number.isFinite(right);
+  if (!leftValid || !rightValid) {
+    if (leftValid === rightValid) {
+      return 0;
+    }
+    return leftValid ? -1 : 1;
+  }
+
+  const delta = left! - right!;
+  return direction === "asc" ? delta : -delta;
+}
+
 // These run inside memos and render bodies on every progress tick, so they are
 // written as single passes over the queue instead of chained filter/map/sort
 // copies. Sets keep the status checks allocation-free.
@@ -26,6 +45,10 @@ export function isIssueJob(job: AnalysisJob) {
 
 export function getCompletedAnalysisJobs(jobs: AnalysisJob[]) {
   return jobs.filter((job): job is CompletedAnalysisJob => job.result != null);
+}
+
+export function hasValidIntegratedMeasurement(job: AnalysisJob) {
+  return job.result != null && job.result.metrics.integratedValid !== false;
 }
 
 export function countQueueJobs(jobs: AnalysisJob[]) {
@@ -50,7 +73,7 @@ export function averageIntegratedLufs(jobs: AnalysisJob[]) {
   let count = 0;
   for (const job of jobs) {
     const value = job.result?.metrics.integratedLufs;
-    if (value != null) {
+    if (value != null && job.result?.metrics.integratedValid !== false) {
       sum += value;
       count += 1;
     }
@@ -73,8 +96,11 @@ export function highestTruePeakDbtp(jobs: AnalysisJob[]) {
 
 export function getAttentionJobs(jobs: CompletedAnalysisJob[]) {
   return jobs.filter((job) => {
+    if (job.result.metrics.integratedValid === false) {
+      return true;
+    }
     const compliance = getComplianceSummary(job.result);
-    return compliance?.state === "above-target" || compliance?.state === "ceiling-limited";
+    return compliance != null && compliance.state !== "on-target";
   });
 }
 
@@ -117,11 +143,18 @@ function pickExtreme<T>(items: T[], getValue: (item: T) => number, direction: "a
 }
 
 export function getQuietestJob(jobs: CompletedAnalysisJob[]) {
-  return pickExtreme(jobs, (job) => job.result.metrics.integratedLufs, "asc");
+  return pickExtreme(
+    jobs.filter(hasValidIntegratedMeasurement),
+    (job) => job.result.metrics.integratedLufs,
+    "asc",
+  );
 }
 
 export function getLoudestJob(jobs: CompletedAnalysisJob[]) {
-  return pickExtreme(jobs, (job) => job.result.metrics.integratedLufs);
+  return pickExtreme(
+    jobs.filter(hasValidIntegratedMeasurement),
+    (job) => job.result.metrics.integratedLufs,
+  );
 }
 
 export function getHottestPeakJob(jobs: CompletedAnalysisJob[]) {
@@ -138,13 +171,24 @@ export function getLongestJob(jobs: CompletedAnalysisJob[]) {
 
 export function getHighestProjectedPeakJob(jobs: CompletedAnalysisJob[]) {
   return pickExtreme(
-    jobs,
-    (job) => job.result.metrics.projectedTruePeakDbtp ?? Number.NEGATIVE_INFINITY,
+    jobs.filter(
+      (job) =>
+        job.result.metrics.integratedValid !== false &&
+        job.result.metrics.projectedTruePeakDbtp != null,
+    ),
+    (job) => job.result.metrics.projectedTruePeakDbtp!,
   );
 }
 
 export function getLargestMoveJob(jobs: CompletedAnalysisJob[]) {
-  return pickExtreme(jobs, (job) => Math.abs(job.result.metrics.targetDeltaDb ?? 0));
+  return pickExtreme(
+    jobs.filter(
+      (job) =>
+        job.result.metrics.integratedValid !== false &&
+        job.result.metrics.targetDeltaDb != null,
+    ),
+    (job) => Math.abs(job.result.metrics.targetDeltaDb!),
+  );
 }
 
 export function getClosestToTargetJob(jobs: CompletedAnalysisJob[], targetLufs: number | null) {
@@ -152,7 +196,11 @@ export function getClosestToTargetJob(jobs: CompletedAnalysisJob[], targetLufs: 
     return null;
   }
 
-  return pickExtreme(jobs, (job) => Math.abs(job.result.metrics.integratedLufs - targetLufs), "asc");
+  return pickExtreme(
+    jobs.filter(hasValidIntegratedMeasurement),
+    (job) => Math.abs(job.result.metrics.integratedLufs - targetLufs),
+    "asc",
+  );
 }
 
 export function getSessionSampleRates(jobs: CompletedAnalysisJob[]) {
@@ -165,11 +213,16 @@ export function getSessionChannelLayouts(jobs: CompletedAnalysisJob[]) {
 
 export function getTargetedFocusJobs(jobs: CompletedAnalysisJob[]) {
   // One compliance computation per job; the dedupe pass preserves the original
-  // priority order (ceiling-limited, then remaining attention, then below).
+  // priority order (invalid, ceiling-limited, remaining attention, then below).
+  const invalidJobs: CompletedAnalysisJob[] = [];
   const ceilingLimitedJobs: CompletedAnalysisJob[] = [];
   const attentionJobs: CompletedAnalysisJob[] = [];
   const belowTargetJobs: CompletedAnalysisJob[] = [];
   for (const job of jobs) {
+    if (job.result.metrics.integratedValid === false) {
+      invalidJobs.push(job);
+      continue;
+    }
     const state = getComplianceSummary(job.result)?.state;
     if (state === "ceiling-limited") {
       ceilingLimitedJobs.push(job);
@@ -183,7 +236,12 @@ export function getTargetedFocusJobs(jobs: CompletedAnalysisJob[]) {
 
   const seen = new Set<string>();
 
-  return [...ceilingLimitedJobs, ...attentionJobs, ...belowTargetJobs].filter((job) => {
+  return [
+    ...invalidJobs,
+    ...ceilingLimitedJobs,
+    ...attentionJobs,
+    ...belowTargetJobs,
+  ].filter((job) => {
     if (seen.has(job.id)) {
       return false;
     }
@@ -197,7 +255,10 @@ export function getMeasureOnlyFocusJobs(jobs: CompletedAnalysisJob[]) {
   const ordered = [
     ...sortByMetric(jobs, (job) => job.result.metrics.truePeakDbtp),
     ...sortByMetric(jobs, (job) => job.result.metrics.loudnessRange),
-    ...sortByMetric(jobs, (job) => job.result.metrics.integratedLufs),
+    ...sortByMetric(
+      jobs.filter(hasValidIntegratedMeasurement),
+      (job) => job.result.metrics.integratedLufs,
+    ),
   ];
 
   return ordered.filter((job) => {

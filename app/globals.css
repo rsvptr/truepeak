@@ -10,6 +10,10 @@
   --surface-2: #112422;
   --surface-3: #17312d;
   --line: rgba(170, 205, 198, 0.16);
+  /* Stronger boundary token for identifiable controls (buttons, inputs,
+     selects, grouped toggles) — --line alone measures ~1.4:1 against the
+     surfaces it sits on, well under the 3:1 non-text contrast target. */
+  --control-line: rgba(170, 205, 198, 0.5);
   --accent: #37d2be;
   --accent-strong: #128d81;
   --accent-soft: rgba(55, 210, 190, 0.14);
@@ -17,6 +21,10 @@
      accent, but the light theme needs the deeper shade to reach AA contrast
      on the tinted background. */
   --accent-text: #37d2be;
+  /* Hover fill for solid accent controls. Dark theme's near-black button text
+     stays legible either way, so hovering can keep lightening toward
+     --accent. */
+  --accent-hover: var(--accent);
   --danger: #ff7b88;
   --success: #55d59c;
   --warning: #f7b756;
@@ -28,6 +36,9 @@
   --chart-shortterm: #f7b756;
   --chart-truepeak: #ff9c55;
   --page-bg: linear-gradient(180deg, #050e0d 0%, #071211 36%, #0a1716 100%);
+  /* Fallback for consumers of the shared sticky-toolbar offset before the
+     toolbar has measured itself on mount (see studio-toolbar.tsx). */
+  --sticky-toolbar-offset: 92px;
 }
 
 [data-theme="light"] {
@@ -39,10 +50,15 @@
   --surface-2: #e8f1ee;
   --surface-3: #dbeae5;
   --line: rgba(13, 49, 44, 0.14);
+  --control-line: rgba(13, 49, 44, 0.6);
   --accent: #0f9684;
   --accent-strong: #0c7568;
   --accent-soft: rgba(15, 150, 132, 0.13);
   --accent-text: #0c7568;
+  /* Light theme's filled controls use white text; lightening the fill on
+     hover (as dark theme does) drops white-text contrast to ~3.67:1. Darken
+     instead so hover stays comfortably above 4.5:1. */
+  --accent-hover: color-mix(in srgb, var(--accent-strong) 88%, black 12%);
   --danger: #bc2740;
   --success: #11744e;
   --warning: #8a5a00;
@@ -198,6 +214,15 @@ summary,
   transform: translate3d(0, -1px, 0);
 }
 
+/* Layered viewport-height fallback for root/error/empty states: vh first for
+   engines without dvh support, then dvh so mobile browser chrome resizing
+   (address bar show/hide) doesn't jump the layout. Declaration order (not
+   Tailwind class order, which isn't guaranteed) decides the winner. */
+.tp-min-h-viewport {
+  min-height: 100vh;
+  min-height: 100dvh;
+}
+
 /* Semantic status tones — theme-aware so chips stay legible in light *and* dark.
    Border + soft fill are mixed from the token; text uses the solid token. */
 .tone-success {
@@ -261,6 +286,23 @@ summary,
   input[type="number"],
   select {
     font-size: 16px;
+  }
+
+  /* The rule above only covers form controls. Actionable links and
+     disclosure triggers (e.g. "Open Reference", "Failure details") are just
+     as tappable and need the same floor. Padding — not a larger font — does
+     the work, since it also helps plain inline anchors whose display mode
+     means min-height alone is ignored. */
+  a {
+    min-height: 44px;
+    padding-block: 0.5rem;
+  }
+
+  summary {
+    display: flex;
+    align-items: center;
+    min-height: 44px;
+    padding-block: 0.5rem;
   }
 }
 

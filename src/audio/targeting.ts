@@ -30,6 +30,17 @@ export function applyTargetToMetrics(
   target: TargetPreset,
 ): LoudnessMetrics {
   const baseMetrics = clearTargetFromMetrics(metrics);
+
+  if (baseMetrics.integratedValid === false) {
+    return {
+      ...baseMetrics,
+      unclampedTargetDeltaDb: null,
+      targetDeltaDb: null,
+      projectedTruePeakDbtp: null,
+      normalizationLimited: false,
+    };
+  }
+
   const unclampedTargetDeltaDb = target.loudnessTargetLufs - baseMetrics.integratedLufs;
   const maxAllowedDelta = target.truePeakCeilingDbtp - baseMetrics.truePeakDbtp;
   const targetDeltaDb =
