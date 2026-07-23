@@ -5,6 +5,10 @@
   "engines": {
     "node": ">=24"
   },
+  "overrides": {
+    "postcss": "^8.5.10",
+    "sharp": "^0.35.0"
+  },
   "scripts": {
     "prepare:ffmpeg": "node scripts/prepare-ffmpeg-assets.mjs",
     "postinstall": "npm run prepare:ffmpeg",
