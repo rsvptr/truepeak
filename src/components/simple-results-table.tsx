@@ -370,24 +370,26 @@ export const SimpleResultsTable = memo(function SimpleResultsTable({
             <col className="hidden xl:table-column xl:w-[10%]" />
             <col className="w-[14%]" />
           </colgroup>
-          {/* Sticky offset is a shared CSS variable (UX-012): the global
-              toolbar above this table is itself sticky, and a bare `top-0`
-              header slides underneath it once both are pinned. The toolbar
-              owner is responsible for setting --sticky-toolbar-offset to
-              its rendered height (including when it wraps to more than one
-              row); this table only needs to respect it. */}
+          {/* The header cells are sticky against the overflow-x wrapper, NOT
+              the page: an ancestor with overflow-x:auto is a scroll container,
+              so sticky can never dock these cells under the page-level
+              toolbar. Keep the offset at top-0 - any positive offset (e.g. a
+              toolbar-height variable) permanently pushes the header that far
+              down into the card at rest, covering the first rows. Verified
+              against a live reproduction; do not reintroduce an offset here
+              without restructuring the wrappers. */}
           <thead>
             <tr className="border-b border-[var(--line)] text-left text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">
-              <th scope="col" className="sticky top-[var(--sticky-toolbar-offset,0px)] bg-[var(--surface-1)]/96 px-5 py-4 backdrop-blur">File</th>
-              <th scope="col" className="sticky top-[var(--sticky-toolbar-offset,0px)] bg-[var(--surface-1)]/96 px-4 py-4 backdrop-blur">Integrated</th>
+              <th scope="col" className="sticky top-0 bg-[var(--surface-1)]/96 px-5 py-4 backdrop-blur">File</th>
+              <th scope="col" className="sticky top-0 bg-[var(--surface-1)]/96 px-4 py-4 backdrop-blur">Integrated</th>
               {analysisMode === "targeted" ? (
-                <th scope="col" className="sticky top-[var(--sticky-toolbar-offset,0px)] hidden bg-[var(--surface-1)]/96 px-4 py-4 backdrop-blur lg:table-cell">
+                <th scope="col" className="sticky top-0 hidden bg-[var(--surface-1)]/96 px-4 py-4 backdrop-blur lg:table-cell">
                   Gain
                 </th>
               ) : null}
-              <th scope="col" className="sticky top-[var(--sticky-toolbar-offset,0px)] bg-[var(--surface-1)]/96 px-4 py-4 backdrop-blur">True peak</th>
-              <th scope="col" className="sticky top-[var(--sticky-toolbar-offset,0px)] hidden bg-[var(--surface-1)]/96 px-4 py-4 backdrop-blur xl:table-cell">LRA</th>
-              <th scope="col" className="sticky top-[var(--sticky-toolbar-offset,0px)] px-5 py-4 backdrop-blur bg-[var(--surface-1)]/96">Actions</th>
+              <th scope="col" className="sticky top-0 bg-[var(--surface-1)]/96 px-4 py-4 backdrop-blur">True peak</th>
+              <th scope="col" className="sticky top-0 hidden bg-[var(--surface-1)]/96 px-4 py-4 backdrop-blur xl:table-cell">LRA</th>
+              <th scope="col" className="sticky top-0 px-5 py-4 backdrop-blur bg-[var(--surface-1)]/96">Actions</th>
             </tr>
           </thead>
           <tbody>

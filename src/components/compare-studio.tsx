@@ -1296,19 +1296,22 @@ export function CompareStudio({
                     Comparison table for {visibleJobs.length === sortedJobs.length ? `${sortedJobs.length} file${sortedJobs.length === 1 ? "" : "s"}` : `${visibleJobs.length} of ${sortedJobs.length} files`}, sorted by {sortLabel} (
                     {formatSortDirection(compareDirection).toLowerCase()}){referenceJob ? `, relative to reference file ${referenceJob.fileName}` : ""}.
                   </caption>
-                  {/* Shares --sticky-toolbar-offset with the queue table
-                      (UX-012) so both respect the same sticky toolbar. */}
+                  {/* Same constraint as the queue table: these cells are
+                      sticky against the overflow-x wrapper, so the offset must
+                      stay top-0. A positive offset displaces the header into
+                      the rows at rest instead of docking it under the
+                      toolbar. */}
                   <thead>
                     <tr className="text-left text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">
-                      <th scope="col" className="sticky top-[var(--sticky-toolbar-offset,0px)] bg-[var(--surface-0)]/95 px-4 py-2 backdrop-blur">File</th>
-                      <th scope="col" className="sticky top-[var(--sticky-toolbar-offset,0px)] bg-[var(--surface-0)]/95 px-4 py-2 backdrop-blur">Integrated</th>
-                      {referenceJob ? <th scope="col" className="sticky top-[var(--sticky-toolbar-offset,0px)] bg-[var(--surface-0)]/95 px-4 py-2 backdrop-blur">Vs ref</th> : null}
-                      {analysisMode === "targeted" ? <th scope="col" className="sticky top-[var(--sticky-toolbar-offset,0px)] bg-[var(--surface-0)]/95 px-4 py-2 backdrop-blur">Gain</th> : null}
-                      <th scope="col" className="sticky top-[var(--sticky-toolbar-offset,0px)] bg-[var(--surface-0)]/95 px-4 py-2 backdrop-blur">True peak</th>
-                      <th scope="col" className="sticky top-[var(--sticky-toolbar-offset,0px)] hidden bg-[var(--surface-0)]/95 px-4 py-2 backdrop-blur md:table-cell">LRA</th>
-                      <th scope="col" className="sticky top-[var(--sticky-toolbar-offset,0px)] hidden bg-[var(--surface-0)]/95 px-4 py-2 backdrop-blur xl:table-cell">Duration</th>
-                      <th scope="col" className="sticky top-[var(--sticky-toolbar-offset,0px)] hidden bg-[var(--surface-0)]/95 px-4 py-2 backdrop-blur 2xl:table-cell">Decoder</th>
-                      <th scope="col" className="sticky top-[var(--sticky-toolbar-offset,0px)] bg-[var(--surface-0)]/95 px-4 py-2 backdrop-blur">Inspect</th>
+                      <th scope="col" className="sticky top-0 bg-[var(--surface-0)]/95 px-4 py-2 backdrop-blur">File</th>
+                      <th scope="col" className="sticky top-0 bg-[var(--surface-0)]/95 px-4 py-2 backdrop-blur">Integrated</th>
+                      {referenceJob ? <th scope="col" className="sticky top-0 bg-[var(--surface-0)]/95 px-4 py-2 backdrop-blur">Vs ref</th> : null}
+                      {analysisMode === "targeted" ? <th scope="col" className="sticky top-0 bg-[var(--surface-0)]/95 px-4 py-2 backdrop-blur">Gain</th> : null}
+                      <th scope="col" className="sticky top-0 bg-[var(--surface-0)]/95 px-4 py-2 backdrop-blur">True peak</th>
+                      <th scope="col" className="sticky top-0 hidden bg-[var(--surface-0)]/95 px-4 py-2 backdrop-blur md:table-cell">LRA</th>
+                      <th scope="col" className="sticky top-0 hidden bg-[var(--surface-0)]/95 px-4 py-2 backdrop-blur xl:table-cell">Duration</th>
+                      <th scope="col" className="sticky top-0 hidden bg-[var(--surface-0)]/95 px-4 py-2 backdrop-blur 2xl:table-cell">Decoder</th>
+                      <th scope="col" className="sticky top-0 bg-[var(--surface-0)]/95 px-4 py-2 backdrop-blur">Inspect</th>
                     </tr>
                   </thead>
                   <tbody>

@@ -36,9 +36,6 @@
   --chart-shortterm: #f7b756;
   --chart-truepeak: #ff9c55;
   --page-bg: linear-gradient(180deg, #050e0d 0%, #071211 36%, #0a1716 100%);
-  /* Fallback for consumers of the shared sticky-toolbar offset before the
-     toolbar has measured itself on mount (see studio-toolbar.tsx). */
-  --sticky-toolbar-offset: 92px;
 }
 
 [data-theme="light"] {

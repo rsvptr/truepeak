@@ -148,32 +148,6 @@ export function StudioToolbar({
     closeMenu(true);
   };
 
-  // Publish the toolbar's actual rendered footprint (its sticky "top" offset
-  // plus its own height) as a shared CSS variable so other sticky elements
-  // (e.g. table headers) can dock immediately below it instead of guessing a
-  // fixed offset that breaks once the toolbar wraps to more rows.
-  useEffect(() => {
-    const element = wrapperRef.current;
-    if (!element || typeof ResizeObserver === "undefined") {
-      return;
-    }
-
-    const updateOffset = () => {
-      const topOffset = Number.parseFloat(window.getComputedStyle(element).top) || 0;
-      const offset = Math.ceil(topOffset + element.offsetHeight);
-      document.documentElement.style.setProperty("--sticky-toolbar-offset", `${offset}px`);
-    };
-
-    updateOffset();
-    const observer = new ResizeObserver(updateOffset);
-    observer.observe(element);
-    window.addEventListener("resize", updateOffset);
-    return () => {
-      observer.disconnect();
-      window.removeEventListener("resize", updateOffset);
-    };
-  }, []);
-
   // Below this width, the More menu renders as a bottom sheet instead of an
   // anchored dropdown so it never has to fight for horizontal room.
   useEffect(() => {
