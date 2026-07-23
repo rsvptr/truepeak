@@ -19,6 +19,11 @@ updates:
       # range, so TypeScript majors move with them, not on their own.
       - dependency-name: "typescript"
         update-types: ["version-update:semver-major"]
+      # eslint 10 crashes eslint-config-next's bundled eslint-plugin-react
+      # (createRuleListeners fails during lint). The config package moves the
+      # supported eslint major, so eslint majors follow it, not the reverse.
+      - dependency-name: "eslint"
+        update-types: ["version-update:semver-major"]
     groups:
       minor-and-patch:
         update-types:
