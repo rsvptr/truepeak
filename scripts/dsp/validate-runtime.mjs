@@ -17,7 +17,9 @@ const {
   assertSourceWithinBudget,
   checkedDecodedBytes,
   checkedResourceByteSum,
+  classifyReservationContention,
   conservativeDecodePeakBytes,
+  declaredDecodeCorroboratedByFileSize,
   decodePeakResidentBytes,
   decodeFailureDetails,
   growDecodePeakReservation,
@@ -32,7 +34,14 @@ const {
   collectDroppedFiles,
   getDroppedFileRelativePath,
 } = await import("../../src/lib/dropped-files.ts");
-const { waitForBrowserDecodeDrain } = await import("../../src/audio/browser-decode.ts");
+const {
+  isBrowserDecodeDrainTimeout,
+  waitForBrowserDecodeDrain,
+} = await import("../../src/audio/browser-decode.ts");
+const {
+  browserDecodeWindowCapacity,
+  createCountingSemaphore,
+} = await import("../../src/audio/decode-window.ts");
 
 let passed = 0;
 let failed = 0;
@@ -306,6 +315,94 @@ try {
   drainedCode = error instanceof DecodeResourceError ? error.code : null;
 }
 ok("drained browser decode then reports cancellation", wrapperSettled && drainedCode === "cancelled");
+
+// A decodeAudioData promise that never settles (a documented WebKit/Blink
+// failure mode) must not park the drain wrapper forever: once the signal has
+// aborted, a bounded grace abandons the zombie decode so its window slot can be
+// reclaimed instead of deadlocking every later browser decode (finding [3]). A
+// short grace keeps the check fast.
+{
+  const neverSettles = new Promise(() => {});
+  const zombieSignal = new AbortController();
+  let zombieError = null;
+  const zombieWait = waitForBrowserDecodeDrain(
+    neverSettles,
+    zombieSignal.signal,
+    40,
+  ).catch((error) => {
+    zombieError = error;
+  });
+  const graceStarted = performance.now();
+  // Abort AFTER the wrapper has parked on the never-settling decode, so the
+  // bounded grace (not the entry guard) is what abandons it.
+  zombieSignal.abort(new DecodeResourceError("cancelled", "user canceled"));
+  await zombieWait;
+  const graceElapsed = performance.now() - graceStarted;
+  ok(
+    "a never-settling browser decode is abandoned within the post-abort grace",
+    isBrowserDecodeDrainTimeout(zombieError) &&
+      zombieError instanceof DecodeResourceError &&
+      zombieError.code === "time-limit-exceeded" &&
+      graceElapsed < 500,
+  );
+}
+
+// A normally-settling decode is unaffected by the grace: it resolves with its
+// value and never triggers the drain timeout, even with a small grace set.
+{
+  const settles = Promise.resolve({ numberOfChannels: 2 });
+  const idleSignal = new AbortController();
+  let settledValue = null;
+  let settleError = null;
+  try {
+    settledValue = await waitForBrowserDecodeDrain(settles, idleSignal.signal, 40);
+  } catch (error) {
+    settleError = error;
+  }
+  ok(
+    "a normally-settling decode resolves unaffected by the drain grace",
+    settleError === null &&
+      settledValue != null &&
+      settledValue.numberOfChannels === 2,
+  );
+}
+
+// The grace only ever arms after an abort: a still-pending decode whose signal
+// has not aborted keeps waiting past the grace window without a premature drain
+// timeout, then returns its value once it finally settles.
+{
+  let releasePending;
+  const pending = new Promise((resolve) => {
+    releasePending = resolve;
+  });
+  const patientSignal = new AbortController();
+  const outcome = { value: null, errored: false };
+  const patientWait = waitForBrowserDecodeDrain(
+    pending,
+    patientSignal.signal,
+    20,
+  ).then(
+    (value) => {
+      outcome.value = value;
+    },
+    () => {
+      outcome.errored = true;
+    },
+  );
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  ok(
+    "the drain grace stays disarmed until the signal aborts",
+    outcome.errored === false && outcome.value === null,
+  );
+  releasePending({ numberOfChannels: 1 });
+  await patientWait;
+  ok(
+    "an un-aborted slow decode still returns its value after it settles",
+    outcome.errored === false &&
+      outcome.value != null &&
+      outcome.value.numberOfChannels === 1,
+  );
+}
 
 console.log("\nContainer preflight");
 const flac = inspectAudioContainer(encodeFlacHeader(48000, 2, 24, 96000));
@@ -653,6 +750,294 @@ ok(
     conservativeDecodePeakBytes(constrained),
     2,
   ) === 1,
+);
+
+// ---------------------------------------------------------------------------
+// Reservation contention classification. When a fallback/true-up route cannot
+// grow its reservation, the scheduler must tell a momentarily full aggregate
+// (transient: requeue and retry once the batch drains) apart from a route that
+// can never fit the whole aggregate (permanent over-budget). This pure helper
+// is what the hook's growLeasePeakReservation uses to make that call, so the
+// contention branch is testable without a DOM.
+console.log("\n[J] Reservation contention classification");
+
+const capablePeak = conservativeDecodePeakBytes(capable);
+const capableAggregate = checkedResourceByteSum([capablePeak, capablePeak]);
+
+ok(
+  "a conservative route that fits the empty aggregate is transient contention",
+  classifyReservationContention(capablePeak, capableAggregate) === "retryable",
+);
+ok(
+  "a reservation exactly equal to the whole aggregate is still transient (fits alone)",
+  classifyReservationContention(capableAggregate, capableAggregate) === "retryable",
+);
+ok(
+  "a reservation larger than the whole aggregate can never fit and is permanent",
+  classifyReservationContention(capableAggregate + 1, capableAggregate) === "permanent",
+);
+ok(
+  "a constrained single-route aggregate still admits its own conservative peak",
+  classifyReservationContention(
+    conservativeDecodePeakBytes(constrained),
+    conservativeDecodePeakBytes(constrained),
+  ) === "retryable",
+);
+throwsCode("contention classification validates its inputs", "invalid-metadata", () =>
+  classifyReservationContention(0, capableAggregate));
+
+// End to end with the aggregate model: a full two-route aggregate rejects a
+// further conservative route, and that rejection classifies as retryable
+// contention (the reservation would fit an empty batch) rather than a permanent
+// over-budget. This mirrors the hook flipping a job back to "queued" instead of
+// failing it when >=2 browser-first files contend for the fallback reservation.
+let contendedCode = null;
+try {
+  growDecodePeakReservation(capableAggregate, 0, capablePeak, capableAggregate);
+} catch (error) {
+  contendedCode = error instanceof DecodeResourceError ? error.code : null;
+}
+ok("a full aggregate rejects a further conservative route", contendedCode === "decoded-budget-exceeded");
+ok(
+  "and that rejection is retryable contention, not permanent over-budget",
+  classifyReservationContention(capablePeak, capableAggregate) === "retryable",
+);
+
+// ---------------------------------------------------------------------------
+// FLAC footprint corroboration. FLAC is the only compressed container admitted
+// on the strength of its declared STREAMINFO length, and the browser codec
+// decodes every frame present regardless of that length. An under-declared
+// header would hand admission a concurrency reservation far below the real
+// decode, so with the pre-decode exclusive reservation removed several such
+// files could decode at once and breach the aggregate peak cap before the
+// post-decode footprint check fires. The scheduler corroborates the declared
+// footprint against the file size before trusting it: a lossless decode is at
+// least the compressed file's own size. This pure check is what lets the hook
+// keep genuine high-resolution FLACs on the parallel known-footprint route
+// while flipping an under-declared header to the conservative unknown plan.
+console.log("\n[K] FLAC footprint corroboration");
+
+// A genuine 24-bit/192 kHz stereo master (~4 min): STREAMINFO declares the true
+// length, whose float32 decode dwarfs any realistically compressed file, so it
+// stays trusted and keeps decoding in parallel with its peers.
+const honestFlac = inspectAudioContainer(encodeFlacHeader(192000, 2, 24, 192000 * 240));
+const honestFlacDecodedBytes = assertDecodedFootprint(
+  honestFlac,
+  capable,
+  "Honest FLAC",
+).decodedBytes;
+ok(
+  "a genuine hi-res FLAC footprint is corroborated by a realistically compressed file",
+  honestFlac?.container === "flac" &&
+    declaredDecodeCorroboratedByFileSize(honestFlacDecodedBytes, 180 * 1024 * 1024) === true,
+);
+
+// The attack: STREAMINFO declares ~1024 samples (a few KiB decoded) but the file
+// is hundreds of MiB. The declared footprint cannot account for the file's
+// bytes, so it is not trusted and the hook falls back to the conservative plan.
+const underDeclaredFlac = inspectAudioContainer(encodeFlacHeader(192000, 2, 24, 1024));
+const underDeclaredDecodedBytes = assertDecodedFootprint(
+  underDeclaredFlac,
+  capable,
+  "Under-declared FLAC",
+).decodedBytes;
+ok(
+  "an under-declared FLAC footprint is not corroborated against a large file",
+  underDeclaredFlac?.container === "flac" &&
+    declaredDecodeCorroboratedByFileSize(underDeclaredDecodedBytes, 512 * 1024 * 1024) === false,
+);
+ok(
+  "a footprint that exactly matches the file size is corroborated (lossless floor)",
+  declaredDecodeCorroboratedByFileSize(4 * 1024 * 1024, 4 * 1024 * 1024) === true,
+);
+ok(
+  "a footprint one byte under the file size is not corroborated",
+  declaredDecodeCorroboratedByFileSize(4 * 1024 * 1024 - 1, 4 * 1024 * 1024) === false,
+);
+throwsCode("footprint corroboration validates its declared bytes", "invalid-metadata", () =>
+  declaredDecodeCorroboratedByFileSize(0, 4 * 1024 * 1024));
+throwsCode("footprint corroboration validates its file size", "invalid-metadata", () =>
+  declaredDecodeCorroboratedByFileSize(4 * 1024 * 1024, 0));
+
+// ---------------------------------------------------------------------------
+// Browser-decode window semaphore. Removing the pre-decode exclusive escalation
+// removed the only serialization of browser-first decodes, so several files
+// with an under-declared footprint could each allocate up to the browser peak
+// inside decodeAudioData at once, transiently breaching the aggregate cap
+// before the post-decode footprint check fires. This pure FIFO counting
+// semaphore bounds how many browser decodes run concurrently to
+// floor(aggregate / browserPeak), keeping the combined transient allocation
+// inside the aggregate cap. It has no DOM dependency, so the hook's transient
+// guard is exercised here directly.
+console.log("\n[L] Browser-decode window semaphore");
+
+const flushMicrotasks = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+// FIFO order: one slot, two queued waiters served strictly in arrival order as
+// the slot is released and re-released.
+{
+  const semaphore = createCountingSemaphore(1);
+  const served = [];
+  const releaseHeld = await semaphore.acquire();
+  const first = semaphore.acquire().then((release) => {
+    served.push("first");
+    return release;
+  });
+  const second = semaphore.acquire().then((release) => {
+    served.push("second");
+    return release;
+  });
+  await flushMicrotasks();
+  ok(
+    "queued waiters stay parked while the only slot is held",
+    served.length === 0 && semaphore.pending === 2 && semaphore.available === 0,
+  );
+  releaseHeld();
+  const releaseFirst = await first;
+  ok("the first waiter is served first (FIFO)", served.join(",") === "first");
+  releaseFirst();
+  const releaseSecond = await second;
+  ok(
+    "the second waiter is served only after the first (FIFO)",
+    served.join(",") === "first,second",
+  );
+  releaseSecond();
+  ok(
+    "the slot returns to the pool once every holder releases",
+    semaphore.available === 1 && semaphore.pending === 0,
+  );
+}
+
+// Capacity respected: two slots are handed out immediately, a third waits until
+// one is released, and the window never runs more than `capacity` at once.
+{
+  const semaphore = createCountingSemaphore(2);
+  const releaseA = await semaphore.acquire();
+  const releaseB = await semaphore.acquire();
+  ok(
+    "a two-slot window hands both slots out immediately",
+    semaphore.available === 0 && semaphore.pending === 0,
+  );
+  let thirdRan = false;
+  const third = semaphore.acquire().then((release) => {
+    thirdRan = true;
+    return release;
+  });
+  await flushMicrotasks();
+  ok(
+    "a third acquire waits while both slots are held",
+    thirdRan === false && semaphore.pending === 1,
+  );
+  releaseA();
+  const releaseThird = await third;
+  ok(
+    "releasing a slot admits exactly one waiter, never exceeding capacity",
+    thirdRan === true && semaphore.available === 0 && semaphore.pending === 0,
+  );
+  releaseThird();
+  releaseB();
+  ok("both slots are free once all holders release", semaphore.available === 2);
+}
+
+// Abort while waiting: an aborted waiter leaves the FIFO queue without ever
+// consuming a slot, so the held slot is still free when its holder releases and
+// no waiter is stranded.
+{
+  const semaphore = createCountingSemaphore(1);
+  const releaseHeld = await semaphore.acquire();
+  const controller = new AbortController();
+  let rejectionReason = null;
+  const abortedWait = semaphore.acquire(controller.signal).then(
+    () => "granted",
+    (reason) => {
+      rejectionReason = reason;
+      return "rejected";
+    },
+  );
+  await flushMicrotasks();
+  ok("an acquire with no free slot joins the queue", semaphore.pending === 1);
+  const reason = new Error("waiter aborted while queued");
+  controller.abort(reason);
+  ok(
+    "aborting a queued waiter removes it from the queue at once",
+    semaphore.pending === 0,
+  );
+  ok(
+    "the aborted acquire rejects with the signal reason",
+    (await abortedWait) === "rejected" && rejectionReason === reason,
+  );
+  releaseHeld();
+  ok(
+    "the aborted waiter consumed no slot, so releasing frees the window",
+    semaphore.available === 1,
+  );
+  const releaseNext = await semaphore.acquire();
+  ok("a fresh acquire then claims the freed slot", semaphore.available === 0);
+  releaseNext();
+}
+
+// Release idempotence: a second release is a no-op and can never over-free a
+// slot into a phantom extra holder.
+{
+  const semaphore = createCountingSemaphore(1);
+  const release = await semaphore.acquire();
+  ok("holding the only slot leaves none available", semaphore.available === 0);
+  release();
+  release();
+  ok(
+    "a repeated release does not over-free the window",
+    semaphore.available === 1 && semaphore.capacity === 1,
+  );
+  const releaseBusy = await semaphore.acquire();
+  let grantedHolders = 0;
+  const queued = semaphore.acquire().then((next) => {
+    grantedHolders += 1;
+    return next;
+  });
+  await flushMicrotasks();
+  releaseBusy();
+  releaseBusy(); // idempotent: the second call must not grant a phantom holder
+  const releaseQueued = await queued;
+  await flushMicrotasks();
+  ok(
+    "a repeated release does not double-grant a waiter",
+    grantedHolders === 1 && semaphore.available === 0,
+  );
+  releaseQueued();
+}
+
+// Capacity formula: the window that bounds concurrent browser decodes resolves
+// to 2 on the capable large tier (whose aggregate holds two conservative
+// routes) and 1 on a constrained single-route device, and never drops below 1.
+ok(
+  "the capable large tier admits two concurrent browser decodes",
+  browserDecodeWindowCapacity(aggregateCapable, capable) === 2,
+);
+ok(
+  "a constrained single-route device admits one browser decode at a time",
+  browserDecodeWindowCapacity(
+    conservativeDecodePeakBytes(constrained),
+    constrained,
+  ) === 1,
+);
+ok(
+  "the window capacity floor is one even when the aggregate is below a browser peak",
+  browserDecodeWindowCapacity(1, capable) === 1,
+);
+ok(
+  "a window exactly one browser peak wide admits exactly one",
+  browserDecodeWindowCapacity(
+    decodePeakResidentBytes("browser", capable.maxDecodedBytes),
+    capable,
+  ) === 1,
+);
+ok(
+  "setCapacity re-sizes the window in place when the aggregate is re-resolved",
+  (() => {
+    const semaphore = createCountingSemaphore(1);
+    semaphore.setCapacity(browserDecodeWindowCapacity(aggregateCapable, capable));
+    return semaphore.capacity === 2 && semaphore.available === 2;
+  })(),
 );
 
 console.log(`\n==== Runtime safety: ${passed} passed, ${failed} failed ====\n`);

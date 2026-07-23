@@ -23,6 +23,7 @@ import {
 } from "lucide-react";
 import { formatDuration } from "@/lib/format";
 import { cn } from "@/lib/utils";
+import { useBackgroundInert } from "@/hooks/use-modal-focus";
 import { TruePeakLogo } from "@/components/truepeak-logo";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -101,6 +102,19 @@ export function StudioToolbar({
   const menuRef = useRef<HTMLDivElement | null>(null);
   const triggerRef = useRef<HTMLButtonElement | null>(null);
   const wrapperRef = useRef<HTMLDivElement | null>(null);
+  // Wraps the compact (bottom-sheet) variant's backdrop + panel. That
+  // variant looks fully modal (full-screen dim, fixed sheet), so it should
+  // actually block the background behind it -- see useBackgroundInert below.
+  const compactMenuContainerRef = useRef<HTMLDivElement | null>(null);
+
+  // The compact bottom-sheet visually implies the rest of the page is
+  // blocked while it's open, but its Escape/outside-click/Tab handling below
+  // is deliberately its own (a menu, not a dialog), so it doesn't go through
+  // the full useModalFocus stack. This closes the remaining gap: without it,
+  // a screen reader's virtual cursor (which Tab-based interception can't
+  // catch) could still reach and activate background controls, and the
+  // dimmed page underneath could still be scrolled by touch.
+  useBackgroundInert(menuOpen && isCompactMenu, compactMenuContainerRef);
 
   const focusMenuItem = (index: number) => {
     // Unavailable items stay focusable (aria-disabled, not disabled), so
@@ -485,7 +499,11 @@ export function StudioToolbar({
               </Button>
               {menuOpen ? (
                 isCompactMenu ? (
-                  <>
+                  // display:contents keeps this purely a ref anchor for
+                  // useBackgroundInert -- both children are position:fixed,
+                  // so it must not introduce a box that could affect layout
+                  // or become a fixed-position containing block itself.
+                  <div ref={compactMenuContainerRef} className="contents">
                     <div
                       className="fixed inset-0 z-40 bg-black/45"
                       aria-hidden="true"
@@ -502,7 +520,7 @@ export function StudioToolbar({
                       <div className="mx-auto mb-2 h-1.5 w-10 shrink-0 rounded-full bg-[var(--line)]" aria-hidden="true" />
                       {menuItems}
                     </div>
-                  </>
+                  </div>
                 ) : (
                   <div
                     ref={menuRef}

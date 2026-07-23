@@ -61,7 +61,11 @@ export function evidenceToneClass(evidence: TargetPreset["evidence"]): string {
  * success, hotter-than-target as danger, quieter-than-target as info.
  */
 export function deltaToneClass(value: number | null | undefined): string {
-  if (value == null || !Number.isFinite(value) || Math.abs(value) < 0.05) {
+  if (value == null || !Number.isFinite(value)) {
+    return "text-[var(--muted)]";
+  }
+
+  if (Math.abs(value) < 0.05) {
     return "text-[var(--success)]";
   }
 

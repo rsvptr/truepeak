@@ -135,7 +135,7 @@ Security claims drift out of date unless something checks them again. Two things
 
 **The fuzzer.** `npm run test:fuzz` runs roughly 1,360 deterministic cases against every parser that touches untrusted bytes: mutated WAV files across three encodings, mutated AIFF files, raw noise into every binary parser, mutated FLAC headers (that parser runs on the main thread, so it gets fuzzed directly), mutated session JSON, and two regression cases for the exact memory and sample rate bugs found during review. Every case must either parse into sane output or fail with a clean error inside a 250 ms budget. No hangs, no strange throws, no runaway memory. The seed is fixed, so any failure reproduces exactly, anywhere.
 
-**The CI gate.** Every push and pull request runs the install (including the ffmpeg fingerprint check), linter, seven primary validation suites (DSP, the represented EBU reference subset, sessions, robustness, exports, presets, and fuzz), a production build, and `npm audit --audit-level=high`. Two focused harnesses, run manually with the commands below, additionally cover clear/save ordering, provenance recovery, decoded budgets, cancellation draining, and bounded folder traversal. The full breakdown lives in the [README's testing section](./README.md#testing).
+**The CI gate.** Every push and pull request runs the install (including the ffmpeg fingerprint check), linter, all nine primary validation suites via `npm test` (DSP, the represented EBU reference subset, sessions, robustness, exports, presets, live session, runtime, and fuzz), a production build, and `npm audit --audit-level=high`. The live session and runtime suites cover clear/save ordering, provenance recovery, decoded budgets, cancellation draining, and bounded folder traversal; they run as part of `npm test` but can also be run individually with the commands below. The full breakdown lives in the [README's testing section](./README.md#testing).
 
 ## Check it yourself
 
@@ -143,10 +143,10 @@ None of the above needs to be taken on faith. From a checkout:
 
 ```bash
 npm install          # runs the ffmpeg fingerprint check as a postinstall step
-npm test             # all seven suites: 440+ fixed assertions plus 1,362 fuzz cases
+npm test             # all nine suites: 440+ fixed assertions plus 1,362 fuzz cases
 npm run test:fuzz    # just the fuzzer
-node scripts/dsp/validate-live-session.mjs
-node scripts/dsp/validate-runtime.mjs
+node scripts/dsp/validate-live-session.mjs   # just the live session suite
+node scripts/dsp/validate-runtime.mjs        # just the runtime suite
 node scripts/prepare-ffmpeg-assets.mjs --print-hashes   # current ffmpeg fingerprints
 ```
 

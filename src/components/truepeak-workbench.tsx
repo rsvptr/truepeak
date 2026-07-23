@@ -1170,13 +1170,21 @@ export function TruePeakWorkbench() {
     () => sortedQueueJobs.find((job) => job.id === routeSelectedJob?.id) ?? null,
     [routeSelectedJob?.id, sortedQueueJobs],
   );
+  // An explicit selection (routeSelectedJob) must never be silently swapped
+  // out for whatever the current filter/search happens to leave at the top
+  // of the list: only fall back to sortedQueueJobs[0] when there is truly no
+  // selection. When the selected job exists but the active filter/search
+  // hides it from the visible queue, selectedJobHiddenByFilter drives a
+  // "hidden by filter" affordance instead (see selectionHiddenNotice below).
   const selectedJob = useMemo(() => {
     if (activeWorkspaceTab === "queue") {
-      return visibleSelectedJob ?? sortedQueueJobs[0] ?? null;
+      return routeSelectedJob ?? sortedQueueJobs[0] ?? null;
     }
 
     return routeSelectedJob ?? completedJobs[0] ?? jobs[0] ?? null;
-  }, [activeWorkspaceTab, completedJobs, jobs, routeSelectedJob, sortedQueueJobs, visibleSelectedJob]);
+  }, [activeWorkspaceTab, completedJobs, jobs, routeSelectedJob, sortedQueueJobs]);
+  const selectedJobHiddenByFilter =
+    activeWorkspaceTab === "queue" && !!routeSelectedJob && !visibleSelectedJob;
   const queueAverage = averageIntegratedLufs(completedJobs);
   const hottestTruePeak = highestTruePeakDbtp(completedJobs);
   const complianceCounts = useMemo(() => getComplianceCounts(completedJobs), [completedJobs]);
@@ -1417,6 +1425,34 @@ export function TruePeakWorkbench() {
     setQueueSearchDraft("");
     updateWorkspaceRoute({ search: null, filter: null, sort: null });
   }, [updateWorkspaceRoute]);
+
+  // Rendered above the inspector (inline or drawer) whenever the explicitly
+  // selected job still exists but the active queue filter/search hides it
+  // from the visible list, so the inspector keeping that job's data on
+  // screen (see selectedJob above) is never mistaken for a stale or broken
+  // view. "Show in list" clears the filter/search/sort so the row reappears.
+  const selectionHiddenNotice =
+    selectedJobHiddenByFilter && selectedJob ? (
+      <div
+        role="status"
+        className="tp-notice-in mb-4 flex items-start gap-3 rounded-[22px] border border-[color:var(--accent)]/15 bg-[color:var(--accent-soft)] px-4 py-3 text-sm text-[var(--ink)]"
+      >
+        <Info className="mt-0.5 h-4 w-4 shrink-0 text-[var(--accent-text)]" aria-hidden="true" />
+        <div className="min-w-0 flex-1">
+          <span>
+            {"Hidden by the current search or filter — still showing "}
+            <strong className="font-semibold">{selectedJob.fileName}</strong>
+            {"."}
+          </span>
+          <div className="mt-2">
+            <Button type="button" size="sm" variant="secondary" onClick={resetQueueView}>
+              <RefreshCcw className="h-4 w-4" aria-hidden="true" />
+              Show in list
+            </Button>
+          </div>
+        </div>
+      </div>
+    ) : null;
 
   const handleFiles = (files: FileList | null) => {
     if (!files?.length) return;
@@ -1711,12 +1747,14 @@ export function TruePeakWorkbench() {
         break;
       case "clear-session":
         clearSession();
+        pushUiNotice("Session cleared.");
         break;
       case "clear-history": {
         const cleared = clearRecentSessions();
         if (cleared && workspaceDrawer === "history") {
           setWorkspaceDrawer("none");
         }
+        pushUiNotice("Saved history cleared.");
         break;
       }
     }
@@ -2088,7 +2126,7 @@ export function TruePeakWorkbench() {
                         autoComplete="off"
                         spellCheck={false}
                         placeholder="Search by file, status, preset, decoder, or layout…"
-                        className={cn("w-full rounded-full border border-[var(--line)] bg-[var(--surface-1)] pl-11 pr-4 text-sm text-[var(--ink)] outline-none transition-[border-color,background-color] duration-200 ease-out focus:border-[var(--accent)]", uiMode === "advanced" ? "h-10" : "h-11")}
+                        className={cn("w-full rounded-full border border-[var(--control-line)] bg-[var(--surface-1)] pl-11 pr-4 text-sm text-[var(--ink)] outline-none transition-[border-color,background-color] duration-200 ease-out focus:border-[var(--accent)]", uiMode === "advanced" ? "h-10" : "h-11")}
                       />
                     </div>
                     <div className="flex flex-col gap-3 xl:items-end">
@@ -2111,7 +2149,7 @@ export function TruePeakWorkbench() {
                           </button>
                         ))}
                       </div>
-                      <label htmlFor="queue-sort" className={cn("inline-flex items-center gap-2 rounded-full border border-[var(--line)] bg-[var(--surface-1)] px-4 text-sm text-[var(--muted)]", uiMode === "advanced" ? "py-1.5" : "py-2")}>
+                      <label htmlFor="queue-sort" className={cn("inline-flex items-center gap-2 rounded-full border border-[var(--control-line)] bg-[var(--surface-1)] px-4 text-sm text-[var(--muted)]", uiMode === "advanced" ? "py-1.5" : "py-2")}>
                         <ArrowUpDown className="h-4 w-4" />
                         <span>Sort:</span>
                         <select id="queue-sort" name="queue-sort" aria-label="Sort files in the current session" value={queueSort} onChange={(event) => setQueueSort(event.target.value as QueueSort)} className="rounded-[8px] bg-transparent font-semibold text-[var(--ink)] outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)]">
@@ -2121,7 +2159,7 @@ export function TruePeakWorkbench() {
                         </select>
                       </label>
                       {queueViewIsFiltered ? (
-                        <Button type="button" size="sm" variant="ghost" onClick={resetQueueView} aria-label="Reset queue search, filters, and sort">
+                        <Button type="button" size="sm" variant="ghost" onClick={resetQueueView} aria-label="Reset View: clears queue search, filters, and sort">
                           <RefreshCcw className="h-4 w-4" aria-hidden="true" />
                           Reset View
                         </Button>
@@ -2170,16 +2208,19 @@ export function TruePeakWorkbench() {
                 </Card>
 
                 {uiMode === "simple" && showInlineInspector && selectedJob ? (
-                  <InspectorPanel
-                    job={selectedJob}
-                    analysisMode={analysisMode}
-                    detailTab={detailTab}
-                    completedCount={completedJobs.length}
-                    onDetailTabChange={setDetailTab}
-                    onOpenCompare={undefined}
-                    onRetryJob={retrySingleJob}
-                    onCancelJob={cancelJob}
-                  />
+                  <div className="min-w-0">
+                    {selectionHiddenNotice}
+                    <InspectorPanel
+                      job={selectedJob}
+                      analysisMode={analysisMode}
+                      detailTab={detailTab}
+                      completedCount={completedJobs.length}
+                      onDetailTabChange={setDetailTab}
+                      onOpenCompare={undefined}
+                      onRetryJob={retrySingleJob}
+                      onCancelJob={cancelJob}
+                    />
+                  </div>
                 ) : null}
 
                 {uiMode === "advanced" && showInlineInspector && selectedJob ? (
@@ -2189,6 +2230,7 @@ export function TruePeakWorkbench() {
                     aria-labelledby="selected-file-details-heading"
                     className="min-w-0 scroll-mt-28 focus:outline-none"
                   >
+                  {selectionHiddenNotice}
                   <InspectorPanel
                     job={selectedJob}
                     analysisMode={analysisMode}
@@ -2313,6 +2355,8 @@ export function TruePeakWorkbench() {
         desktopClassName="lg:w-[min(760px,96vw)]"
       >
         {selectedJob ? (
+          <>
+          {selectionHiddenNotice}
           <InspectorPanel
             job={selectedJob}
             analysisMode={analysisMode}
@@ -2323,6 +2367,7 @@ export function TruePeakWorkbench() {
             onRetryJob={retrySingleJob}
             onCancelJob={cancelJob}
           />
+          </>
         ) : null}
       </DrawerPanel>
       </main>

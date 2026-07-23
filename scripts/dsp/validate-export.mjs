@@ -45,6 +45,7 @@ function completedJob(
   fileName,
   {
     integratedLufs = -14.2,
+    truePeakDbtp = -0.8,
     measureOnly = false,
     invalidReason = null,
     unstable = false,
@@ -86,7 +87,7 @@ function completedJob(
         maxMomentaryLufs: -11,
         maxShortTermLufs: -12,
         samplePeakDbfs: -1,
-        truePeakDbtp: -0.8,
+        truePeakDbtp,
         unclampedTargetDeltaDb: invalid || measureOnly ? null : 0.2,
         targetDeltaDb: invalid || measureOnly ? null : 0.2,
         projectedTruePeakDbtp: invalid || measureOnly ? null : -0.6,
@@ -172,10 +173,24 @@ const completedCount = jobs.filter((job) => job.status === "complete").length;
 console.log("\n[A] CSV escaping, validity, and provenance");
 const csv = buildCsvExport(jobs);
 const csvLines = csv.split("\n");
-const csvHeader = csvLines[0].split(",");
+// The CSV leads with a UTF-8 BOM (so Excel-on-Windows reads a double-clicked file
+// as UTF-8); strip it before the header/column assertions below.
+const csvHeaderLine = csvLines[0].replace(/^\uFEFF/, "");
+const csvHeader = csvHeaderLine.split(",");
 const invalidRow = csvLines.find((line) => line.startsWith("invalid-short.wav,"))?.split(",") ?? [];
 const importedRow = csvLines.find((line) => line.startsWith("imported.wav,")) ?? "";
-check("header row present", csvLines[0].startsWith("Filename,Status,Analysis Mode,"));
+check("CSV begins with a UTF-8 BOM", csv.startsWith("\uFEFF"), JSON.stringify(csv.slice(0, 1)));
+check("header row present", csvHeaderLine.startsWith("Filename,Status,Analysis Mode,"));
+
+// A BOM only helps if it survives as bytes and a BOM-aware reader (Excel,
+// TextDecoder) strips it while decoding the rest as UTF-8, so a non-ASCII filename
+// round-trips instead of mojibaking under the system ANSI codepage.
+const bomCsv = buildCsvExport([completedJob("Café Été.wav")]);
+const csvBytes = new TextEncoder().encode(bomCsv);
+check("CSV emits the UTF-8 BOM bytes EF BB BF", csvBytes[0] === 0xef && csvBytes[1] === 0xbb && csvBytes[2] === 0xbf, `${csvBytes[0]},${csvBytes[1]},${csvBytes[2]}`);
+const excelDecoded = new TextDecoder("utf-8").decode(csvBytes); // ignoreBOM=false → strips the BOM like Excel
+check("BOM-aware reader strips the BOM so the header parses cleanly", excelDecoded.startsWith("Filename,Status,Analysis Mode,"));
+check("non-ASCII filename round-trips without mojibake", excelDecoded.includes("Café Été.wav") && !excelDecoded.includes("CafÃ©"));
 check("validity columns present", csvHeader.includes("Integrated Status") && csvHeader.includes("Integrated Invalid Reason"));
 check("LRA status column present", csvHeader.includes("LRA Status"));
 check("provenance columns present", csvHeader.includes("Provenance") && csvHeader.includes("Source Session Digest"));
@@ -259,14 +274,20 @@ const selectorJobs = [quiet, invalid, loud];
 check("average excludes invalid integrated value", averageIntegratedLufs(selectorJobs) === -15);
 check("quietest excludes invalid -70 sentinel", getQuietestJob(selectorJobs)?.fileName === "quiet.wav");
 check("loudest remains valid result", getLoudestJob(selectorJobs)?.fileName === "loud.wav");
+// on-target.wav is genuinely compliant: loudness within tolerance AND true peak
+// (-1.5) under the -1 ceiling. hot-peak.wav has on-target loudness but its measured
+// true peak (-0.8) breaches the -1 ceiling, so the corrected compliance semantics
+// must surface it for attention rather than hiding it behind the loudness read.
 const attentionNames = getAttentionJobs([
-  completedJob("on-target.wav"),
+  completedJob("on-target.wav", { truePeakDbtp: -1.5 }),
+  completedJob("hot-peak.wav", { truePeakDbtp: -0.8 }),
   quiet,
   invalid,
 ]).map((entry) => entry.fileName);
 check("attention includes below-target results", attentionNames.includes("quiet.wav"));
 check("attention includes invalid integrated results", attentionNames.includes("invalid-short.wav"));
-check("attention excludes on-target results", !attentionNames.includes("on-target.wav"));
+check("attention includes on-target-loudness files whose true peak breaches the ceiling", attentionNames.includes("hot-peak.wav"));
+check("attention excludes genuinely on-target results", !attentionNames.includes("on-target.wav"));
 check(
   "targeted focus prioritizes invalid integrated results",
   getTargetedFocusJobs([quiet, invalid, loud])[0]?.fileName === "invalid-short.wav",
@@ -408,8 +429,15 @@ check(
 delete globalThis.window;
 
 console.log("\n[F] Empty input + file names");
-check("empty CSV is header-only", buildCsvExport([]).split("\n").length === 1);
+const emptyCsv = buildCsvExport([]);
+check("empty CSV is header-only", emptyCsv.split("\n").length === 1);
+check("empty CSV still carries the UTF-8 BOM", emptyCsv.startsWith("\uFEFF"));
 check("empty JSON is []", buildJsonExport([]) === "[]");
+check("empty Markdown reports 0", buildMarkdownExport([]).includes("Completed files: 0"));
+// The BOM is CSV-only: JSON must stay BOM-free (strict parsers reject it) and
+// Markdown does not need one.
+check("JSON export carries no BOM", !buildJsonExport(jobs).startsWith("\uFEFF"));
+check("Markdown export carries no BOM", !buildMarkdownExport(jobs).startsWith("\uFEFF"));
 check("empty Markdown reports 0", buildMarkdownExport([]).includes("Completed files: 0"));
 check("csv extension", getExportFileName("csv").endsWith(".csv"));
 check("json extension", getExportFileName("json").endsWith(".json"));

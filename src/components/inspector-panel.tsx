@@ -1,6 +1,6 @@
 "use client";
 
-import { useRef, type KeyboardEvent, type Ref } from "react";
+import { useEffect, useRef, type KeyboardEvent, type Ref } from "react";
 import dynamic from "next/dynamic";
 import { BarChart3, CircleAlert, LoaderCircle, RefreshCcw, Square } from "lucide-react";
 import { getComplianceSummary } from "@/audio/compliance";
@@ -131,30 +131,69 @@ export function InspectorPanel({
   const errorDisplay = getJobErrorDisplay(job.error);
   const tabRefs = useRef<Array<HTMLButtonElement | null>>([]);
 
+  // Timeline/Technical have nothing to show until a result exists (only the
+  // status block below is meaningful), so keep only Overview interactive
+  // rather than letting a tab claim `aria-selected` with no matching
+  // tabpanel in the DOM.
+  const isTabDisabled = (tabId: InspectorDetailTab) => !result && tabId !== "overview";
+
+  // Guard against a stale non-overview selection (e.g. a retry clears
+  // `result` while Timeline/Technical was still selected) so the selected
+  // tab and the rendered tabpanel never drift apart.
+  useEffect(() => {
+    if (!result && detailTab !== "overview") {
+      onDetailTabChange("overview");
+    }
+  }, [result, detailTab, onDetailTabChange]);
+
+  const stepToEnabledIndex = (start: number, direction: 1 | -1) => {
+    let index = start;
+    for (let i = 0; i < DETAIL_TABS.length; i += 1) {
+      index = (index + direction + DETAIL_TABS.length) % DETAIL_TABS.length;
+      if (!isTabDisabled(DETAIL_TABS[index].id)) {
+        return index;
+      }
+    }
+    return start;
+  };
+
+  const firstEnabledIndex = () => {
+    const index = DETAIL_TABS.findIndex((tab) => !isTabDisabled(tab.id));
+    return index === -1 ? 0 : index;
+  };
+
+  const lastEnabledIndex = () => {
+    for (let i = DETAIL_TABS.length - 1; i >= 0; i -= 1) {
+      if (!isTabDisabled(DETAIL_TABS[i].id)) {
+        return i;
+      }
+    }
+    return DETAIL_TABS.length - 1;
+  };
+
   const handleDetailTabKeyDown = (
     event: KeyboardEvent<HTMLButtonElement>,
     index: number,
   ) => {
-    const lastIndex = DETAIL_TABS.length - 1;
     let nextIndex: number | null = null;
 
     if (event.key === "ArrowRight" || event.key === "ArrowDown") {
-      nextIndex = index >= lastIndex ? 0 : index + 1;
+      nextIndex = stepToEnabledIndex(index, 1);
     }
 
     if (event.key === "ArrowLeft" || event.key === "ArrowUp") {
-      nextIndex = index <= 0 ? lastIndex : index - 1;
+      nextIndex = stepToEnabledIndex(index, -1);
     }
 
     if (event.key === "Home") {
-      nextIndex = 0;
+      nextIndex = firstEnabledIndex();
     }
 
     if (event.key === "End") {
-      nextIndex = lastIndex;
+      nextIndex = lastEnabledIndex();
     }
 
-    if (nextIndex == null) {
+    if (nextIndex == null || nextIndex === index) {
       return;
     }
 
@@ -245,34 +284,43 @@ export function InspectorPanel({
       </div>
 
       <div className="mt-5 flex flex-wrap gap-2 border-b border-[var(--line)]/80 pb-5" role="tablist" aria-label="File detail sections">
-        {DETAIL_TABS.map((tab, index) => (
-          <button
-            key={tab.id}
-            ref={(element) => {
-              tabRefs.current[index] = element;
-            }}
-            type="button"
-            onClick={() => onDetailTabChange(tab.id)}
-            onKeyDown={(event) => handleDetailTabKeyDown(event, index)}
-            role="tab"
-            aria-selected={detailTab === tab.id}
-            aria-controls={`inspector-panel-${tab.id}`}
-            id={`inspector-tab-${tab.id}`}
-            tabIndex={detailTab === tab.id ? 0 : -1}
-            className={cn(
-              "rounded-full border px-3 py-2 text-xs font-semibold uppercase tracking-[0.16em] transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)]",
-              detailTab === tab.id
-                ? "border-[color:var(--accent)] bg-[color:var(--accent-soft)] text-[var(--ink)]"
-                : "border-[var(--line)] bg-[var(--surface-1)] text-[var(--muted)] hover:border-[color:var(--accent)]/30",
-            )}
-          >
-            {tab.label}
-          </button>
-        ))}
+        {DETAIL_TABS.map((tab, index) => {
+          const disabled = isTabDisabled(tab.id);
+          return (
+            <button
+              key={tab.id}
+              ref={(element) => {
+                tabRefs.current[index] = element;
+              }}
+              type="button"
+              disabled={disabled}
+              onClick={() => onDetailTabChange(tab.id)}
+              onKeyDown={(event) => handleDetailTabKeyDown(event, index)}
+              role="tab"
+              aria-selected={detailTab === tab.id}
+              aria-controls={disabled ? undefined : `inspector-panel-${tab.id}`}
+              id={`inspector-tab-${tab.id}`}
+              tabIndex={detailTab === tab.id ? 0 : -1}
+              className={cn(
+                "rounded-full border px-3 py-2 text-xs font-semibold uppercase tracking-[0.16em] transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)] disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:border-[var(--line)]",
+                detailTab === tab.id
+                  ? "border-[color:var(--accent)] bg-[color:var(--accent-soft)] text-[var(--ink)]"
+                  : "border-[var(--line)] bg-[var(--surface-1)] text-[var(--muted)] hover:border-[color:var(--accent)]/30",
+              )}
+            >
+              {tab.label}
+            </button>
+          );
+        })}
       </div>
 
       {!result ? (
-        <div className="mt-5 rounded-[24px] border border-[var(--line)] bg-[var(--surface-1)] p-5">
+        <div
+          id="inspector-panel-overview"
+          role="tabpanel"
+          aria-labelledby="inspector-tab-overview"
+          className="mt-5 rounded-[24px] border border-[var(--line)] bg-[var(--surface-1)] p-5"
+        >
           <div className="flex items-center gap-3 text-[var(--muted)]">
             {isActiveJob(job) ? (
               // Spin a wrapper element, not the SVG itself: transforms on SVG

@@ -778,5 +778,80 @@ for (const n of [0, 1, 2, 3]) {
     parseAiffBuffer(buildAiffTruncatedSsnd(n), "x.aiff", "audio/aiff"), "SSND");
 }
 
+console.log("\n[H] AIFC unbounded-scan DoS: parseAiffBuffer bounds its chunk walk (finding [0])");
+// An AIFC with COMM+SSND discovered early but NO FVER and a large padded tail of
+// size-0 chunks must NOT scan to EOF. parseAiffBuffer caps its chunk walk at 100k
+// iterations exactly like inspectAiff, so the flood is rejected as "missing FVER"
+// cheaply instead of freezing the synchronous, budget-immune decoder lane for
+// seconds. (COMM contents need only be recognized: for AIFC the parser throws
+// "missing FVER" before it ever validates COMM.)
+function writeAifcFloodHeader(view) {
+  putAscii(view, 0, "FORM");
+  view.setUint32(4, view.byteLength - 8, false);
+  putAscii(view, 8, "AIFC");
+  putAscii(view, 12, "COMM");
+  view.setUint32(16, 18, false);
+  view.setUint16(20, 2, false); // channels
+  view.setUint32(22, 1000, false); // frames
+  view.setUint16(26, 16, false); // bits per sample
+  putFloat80(view, 28, 44100);
+  putAscii(view, 38, "SSND");
+  view.setUint32(42, 8, false); // declared size 8 = offset+blockSize header, no audio
+  view.setUint32(46, 0, false); // data offset
+  view.setUint32(50, 0, false); // block size
+  // The next chunk begins at offset 54; the rest of the (zeroed) buffer forms
+  // size-0 chunks — id "\0\0\0\0", size 0 — that a walk marches through 8 bytes at a time.
+}
+function buildAifcFloodNoFver(totalBytes) {
+  const buffer = new ArrayBuffer(totalBytes);
+  writeAifcFloodHeader(new DataView(buffer));
+  return buffer;
+}
+function buildAifcFloodFverBeyondCap(zeroChunksBeforeFver = 120_000) {
+  // COMM(chunk 1) + SSND(chunk 2) + zeroChunksBeforeFver zero chunks, then a VALID
+  // FVER at chunk (zeroChunksBeforeFver + 3) — comfortably past the 100k cap.
+  const fverAt = 54 + zeroChunksBeforeFver * 8;
+  const buffer = new ArrayBuffer(fverAt + 12);
+  const view = new DataView(buffer);
+  writeAifcFloodHeader(view);
+  putAscii(view, fverAt, "FVER");
+  view.setUint32(fverAt + 4, 4, false);
+  view.setUint32(fverAt + 8, 0xa2805140, false); // AIFF-C Version 1 timestamp (valid)
+  return buffer;
+}
+
+// Timing guard (the acceptance repro): a 256 MiB in-budget flood must be rejected in
+// well under a second. Pre-cap this walked ~33.5M chunks — a multi-hundred-ms to
+// multi-second synchronous freeze; the cap stops after 100k regardless of file size.
+// The buffer is built OUTSIDE the timed region so only the parse is measured.
+const aifcFloodBuffer = buildAifcFloodNoFver(256 * 1024 * 1024);
+expectFast(
+  "256 MiB AIFC flood (COMM+SSND early, no FVER, padded tail) rejected fast",
+  () => parseAiffBuffer(aifcFloodBuffer, "flood.aifc", "audio/aiff"),
+  750,
+);
+// The flood is still rejected for the RIGHT reason, not silently parsed.
+expectThrowDescriptive(
+  "AIFC flood with no FVER rejected as missing FVER",
+  () => parseAiffBuffer(buildAifcFloodNoFver(2 * 1024 * 1024), "flood.aifc", "audio/aiff"),
+  "FVER",
+);
+// Deterministic cap proof (no wall-clock reliance): a valid FVER hidden beyond the
+// 100k cap must NOT be found, so the file is rejected as missing FVER. An unbounded
+// walk would instead find the far FVER and throw a different, non-FVER error — so
+// this assertion fails the moment the cap is removed.
+expectThrowDescriptive(
+  "AIFC hiding a valid FVER beyond the 100k chunk cap is rejected as missing FVER",
+  () => parseAiffBuffer(buildAifcFloodFverBeyondCap(), "flood.aifc", "audio/aiff"),
+  "FVER",
+);
+// Regression guard for the cap NOT breaking legitimate files: a well-formed AIFC
+// (FVER within the first handful of chunks) still parses.
+expectOk(
+  "well-formed AIFC still parses under the chunk cap",
+  () => parseAiffBuffer(buildAiffFixture({ formType: "AIFC", compressionType: "NONE", compressionName: "not compressed" }), "ok.aifc", "audio/aiff"),
+  (asset) => asset.frameCount > 0 && asset.channels[0].every((v) => Number.isFinite(v)),
+);
+
 console.log(`\n==== Robustness: ${passed} passed, ${failed} failed ====\n`);
 process.exit(failed ? 1 : 0);

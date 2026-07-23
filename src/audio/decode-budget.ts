@@ -247,6 +247,59 @@ export function growDecodePeakReservation(
   return nextTotal;
 }
 
+export type ReservationContention = "retryable" | "permanent";
+
+/**
+ * Classifies a rejected peak-memory reservation as transient contention or a
+ * permanent over-budget condition. A route whose reservation would fit an
+ * otherwise-empty aggregate is only blocked because the batch is momentarily
+ * full, so the scheduler can requeue it and admit it once running jobs release
+ * their reservations. A route larger than the entire aggregate can never be
+ * admitted at all and must fail. Pure so the scheduler's contention branch is
+ * testable without a DOM.
+ */
+export function classifyReservationContention(
+  requiredReservationBytes: number,
+  aggregateLimitBytes: number,
+): ReservationContention {
+  finitePositiveInteger(requiredReservationBytes, "Required reservation bytes");
+  finitePositiveInteger(aggregateLimitBytes, "Aggregate resident-byte limit");
+  return requiredReservationBytes <= aggregateLimitBytes ? "retryable" : "permanent";
+}
+
+/**
+ * Decides whether a compressed container's declared decoded footprint can be
+ * trusted as a concurrency reservation, given the real file size.
+ *
+ * FLAC is the only compressed container the scheduler admits on the strength of
+ * its declared STREAMINFO length. Unlike uncompressed PCM WAV/AIFF — whose
+ * declared payload the inspector already bounds against the real file size, and
+ * whose decoder reads exactly that many bytes — a FLAC STREAMINFO sample count
+ * is not bounded by the file, and the browser codec decodes every frame the
+ * file actually contains regardless of it. An under-declared header would hand
+ * admission a peak reservation far below the real decode, so several such files
+ * could decode at once and breach the aggregate peak cap before the post-decode
+ * footprint check fires.
+ *
+ * A lossless stream never encodes to more bytes than its own native PCM (the
+ * worst case is verbatim storage), and float32 decoded PCM is at least the
+ * native sample size, so an honest decode is at least as large as the file it
+ * came from. When the declared footprint is smaller than the file it cannot
+ * account for the bytes actually present, so the length is not trustworthy as a
+ * concurrency bound and the caller must fall back to the conservative plan.
+ * Genuine 16/24-bit masters clear this floor with room to spare (float32 PCM is
+ * 2x/1.33x the native size), so the parallel known-footprint route is
+ * preserved. Pure so the scheduler's trust decision is testable without a DOM.
+ */
+export function declaredDecodeCorroboratedByFileSize(
+  declaredDecodedBytes: number,
+  fileSizeBytes: number,
+): boolean {
+  finitePositiveInteger(declaredDecodedBytes, "Declared decoded bytes");
+  finitePositiveInteger(fileSizeBytes, "Container file size");
+  return declaredDecodedBytes >= fileSizeBytes;
+}
+
 function configuredLimit(
   value: number | undefined,
   fallback: number,

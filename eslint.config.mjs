@@ -3,7 +3,7 @@ import nextVitals from "eslint-config-next/core-web-vitals";
 const config = [
   ...nextVitals,
   {
-    ignores: [".next/**", "out/**", "test-results/**", "playwright-report/**"],
+    ignores: [".next/**", "out/**", "test-results/**", "playwright-report/**", "public/vendor/**"],
   },
   {
     // eslint-plugin-react-hooks v6 ships React Compiler advisory rules. This project

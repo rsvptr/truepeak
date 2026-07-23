@@ -211,6 +211,13 @@ async function testStorePersistsUnverifiedProvenance() {
   const transaction = {
     error: null,
     objectStore: () => ({
+      // Ownership-scoped writes read the existing row before deciding to put; a
+      // fresh store has none, so this resolves to undefined and the put proceeds.
+      get: () => {
+        const request = { onsuccess: null, result: undefined };
+        queueMicrotask(() => request.onsuccess?.());
+        return request;
+      },
       put: (record) => storedRecords.push(record),
     }),
   };
@@ -664,6 +671,10 @@ class MemStoreHandle {
     return this.txn.runRequest(() => size);
   }
 
+  get(key) {
+    return this.txn.runRequest(() => this.store.records.get(key));
+  }
+
   put(value) {
     return this.txn.runRequest(() => {
       this.store.records.set(value[this.keyPath], value);
@@ -1004,6 +1015,246 @@ async function testBoundedRestoreStopsAtLimitNewestFirst() {
   );
 }
 
+// ---------------------------------------------------------------------------
+// Cross-tab ownership (finding [4]). Records carry {ownerId, heartbeatMs}; a tab
+// may only overwrite/delete/clear rows it owns or that a crashed/closed peer
+// left behind, restore prefers its own rows and adopts stale/legacy ones, and a
+// live peer's rows are strictly protected.
+// ---------------------------------------------------------------------------
+
+const OWNERSHIP_CLOCK = Date.UTC(2026, 6, 20, 12, 0, 0);
+const STALE_WINDOW_MS = 2 * 60 * 1000;
+
+// A stored row with an optional owner/heartbeat and a valid normalizedJob so the
+// shim restores it. Omitting owner+heartbeat models a legacy (pre-ownership) row.
+function storedRow(id, ownerId, heartbeatMs, createdAt = "2026-07-18T00:00:00.000Z") {
+  return {
+    id,
+    createdAt,
+    ...(ownerId !== undefined ? { ownerId } : {}),
+    ...(heartbeatMs !== undefined ? { heartbeatMs } : {}),
+    normalizedJob: { id, createdAt },
+  };
+}
+
+function ownershipDisk(records) {
+  return makeDisk(2, {
+    jobs: {
+      keyPath: "id",
+      indexes: [{ name: "createdAt", keyPath: "createdAt" }],
+      records,
+    },
+    quarantine: { keyPath: "id" },
+  });
+}
+
+async function testForeignLiveRecordIsProtected() {
+  // tab-A persisted "peer-live" with a fresh heartbeat. tab-B may surface it
+  // view-only on restore (recovery must never be withheld), but must not adopt,
+  // delete, clear, or overwrite it through any mutating path.
+  const asTabB = { ownerId: "tab-B", now: OWNERSHIP_CLOCK + 1000, staleAfterMs: STALE_WINDOW_MS };
+  const seed = () => ownershipDisk([storedRow("peer-live", "tab-A", OWNERSHIP_CLOCK)]);
+
+  const readDisk = seed();
+  await withMockIndexedDb(createMemoryIndexedDb(readDisk), async () => {
+    const outcome = await storeModule.readLiveSessionJobs(asTabB);
+    // Restore is view-only: the row IS surfaced (so single-tab recovery after an
+    // accidental close is not silently discarded), but its stored ownership is
+    // left intact -- the read never re-stamps or removes it.
+    assert.equal(outcome.status, "committed", "a live peer's valid row is surfaced view-only");
+    assert.deepEqual(outcome.jobs.map((job) => job.id), ["peer-live"]);
+    assert.equal(outcome.jobs[0].restored, true, "the surfaced row is flagged restored");
+    assert.equal(outcome.invalidRecordCount, 0, "a live peer's row is never quarantined");
+  });
+  const readRow = readDisk.stores.get("jobs").records.get("peer-live");
+  assert.equal(readRow.ownerId, "tab-A", "read leaves the peer's owner untouched (not adopted)");
+  assert.equal(readRow.heartbeatMs, OWNERSHIP_CLOCK, "read leaves the peer's heartbeat untouched");
+  assert.equal(readDisk.stores.get("quarantine").records.size, 0);
+
+  const deleteDisk = seed();
+  await withMockIndexedDb(createMemoryIndexedDb(deleteDisk), async () => {
+    const outcome = await storeModule.deleteLiveSessionJobs(["peer-live"], asTabB);
+    assert.equal(outcome.status, "committed");
+    assert.equal(outcome.count, 0, "no live peer row is deleted");
+  });
+  assert.ok(
+    deleteDisk.stores.get("jobs").records.has("peer-live"),
+    "delete leaves the live peer's row in place",
+  );
+
+  const clearDisk = seed();
+  await withMockIndexedDb(createMemoryIndexedDb(clearDisk), async () => {
+    const outcome = await storeModule.clearLiveSessionStore(asTabB);
+    assert.equal(outcome.status, "committed");
+    assert.equal(outcome.count, 0, "clear removes no live peer row");
+  });
+  assert.ok(
+    clearDisk.stores.get("jobs").records.has("peer-live"),
+    "clear leaves the live peer's row in place (no blind store.clear wipe)",
+  );
+
+  const writeDisk = seed();
+  await withMockIndexedDb(createMemoryIndexedDb(writeDisk), async () => {
+    const outcome = await storeModule.writeLiveSessionJobs(
+      [
+        {
+          id: "peer-live",
+          fileName: "tab-b.wav",
+          mimeType: "audio/wav",
+          createdAt: "2026-07-19T00:00:00.000Z",
+          result: { analyzedAt: "2026-07-19T00:00:00.000Z" },
+        },
+      ],
+      asTabB,
+    );
+    assert.equal(outcome.status, "committed");
+    assert.equal(outcome.count, 0, "no live peer row is overwritten");
+  });
+  const writeRow = writeDisk.stores.get("jobs").records.get("peer-live");
+  assert.equal(writeRow.ownerId, "tab-A", "write does not steal a live peer's row");
+  assert.equal(writeRow.fileName, undefined, "the peer's original record is unchanged");
+}
+
+async function testAccidentalCloseRecoverySurfacesOwnRows() {
+  // The follow-up finding's acceptance criterion. A single tab wrote rows under
+  // ownerId "tab-A" with a fresh heartbeat, then closed accidentally. Its per-tab
+  // sessionStorage ownerId died with it, so the reopened tab mints a NEW id
+  // ("tab-A2") and restores within the 2-minute stale window. From the reopened
+  // tab's view the rows are foreign-fresh -- previously withheld, silently
+  // emptying the recovered session. Restore must now surface them.
+  const disk = ownershipDisk([
+    storedRow("done-1", "tab-A", OWNERSHIP_CLOCK, "2026-07-18T00:00:00.000Z"),
+    storedRow("done-2", "tab-A", OWNERSHIP_CLOCK, "2026-07-18T00:00:01.000Z"),
+  ]);
+  // Reopened one second later: well inside STALE_WINDOW_MS.
+  const reopened = { ownerId: "tab-A2", now: OWNERSHIP_CLOCK + 1000, staleAfterMs: STALE_WINDOW_MS };
+
+  await withMockIndexedDb(createMemoryIndexedDb(disk), async () => {
+    const outcome = await storeModule.readLiveSessionJobs(reopened);
+    assert.equal(outcome.status, "committed", "the reopened tab recovers its own finished batch");
+    assert.deepEqual(
+      outcome.jobs.map((job) => job.id).sort(),
+      ["done-1", "done-2"],
+      "every completed row is surfaced, not silently dropped",
+    );
+    assert.equal(outcome.invalidRecordCount, 0);
+    assert.equal(outcome.overflowRecordCount, 0, "surfaced rows are not miscounted as overflow");
+  });
+
+  // Ownership is left intact rather than adopted, so the overflow accounting is
+  // exact and (in the genuine live-peer case) the peer keeps authority.
+  for (const id of ["done-1", "done-2"]) {
+    const row = disk.stores.get("jobs").records.get(id);
+    assert.equal(row.ownerId, "tab-A", `${id} keeps its original owner after a view-only restore`);
+    assert.equal(row.heartbeatMs, OWNERSHIP_CLOCK, `${id} heartbeat is untouched by restore`);
+  }
+}
+
+async function testForeignLiveInvalidRecordIsLeftInPlace() {
+  // An INVALID row (no normalizedJob) owned by a live peer must be left strictly
+  // in place: surfacing does not apply (it cannot be normalized), and quarantine
+  // must not touch another tab's data. It is excluded from invalidRecordCount and
+  // from overflow (accounted as a skipped foreign row).
+  const disk = ownershipDisk([
+    { id: "peer-bad", createdAt: "2026-07-18T00:00:00.000Z", ownerId: "tab-A", heartbeatMs: OWNERSHIP_CLOCK },
+  ]);
+  const asTabB = { ownerId: "tab-B", now: OWNERSHIP_CLOCK + 1000, staleAfterMs: STALE_WINDOW_MS };
+
+  await withMockIndexedDb(createMemoryIndexedDb(disk), async () => {
+    const outcome = await storeModule.readLiveSessionJobs(asTabB);
+    assert.equal(outcome.status, "empty", "an invalid live-peer row surfaces nothing");
+    assert.deepEqual(outcome.jobs, []);
+    assert.equal(outcome.invalidRecordCount, 0, "a live peer's invalid row is not quarantined");
+    assert.equal(outcome.overflowRecordCount, 0, "a skipped foreign row is not counted as overflow");
+  });
+  assert.ok(
+    disk.stores.get("jobs").records.has("peer-bad"),
+    "the live peer's invalid row is left in place, not deleted",
+  );
+  assert.equal(disk.stores.get("quarantine").records.size, 0, "nothing was quarantined from a peer");
+}
+
+async function testCrashedTabRecordIsAdopted() {
+  // tab-A's heartbeat is older than the stale window: a crashed/closed tab. tab-B
+  // adopts the row on restore, claiming ownership so a third tab cannot re-adopt.
+  const staleHeartbeat = OWNERSHIP_CLOCK - 3 * 60 * 1000;
+  const disk = ownershipDisk([storedRow("crashed", "tab-A", staleHeartbeat)]);
+  const asTabB = { ownerId: "tab-B", now: OWNERSHIP_CLOCK, staleAfterMs: STALE_WINDOW_MS };
+
+  await withMockIndexedDb(createMemoryIndexedDb(disk), async () => {
+    const outcome = await storeModule.readLiveSessionJobs(asTabB);
+    assert.equal(outcome.status, "committed", "a crashed peer's stale row is restored");
+    assert.deepEqual(outcome.jobs.map((job) => job.id), ["crashed"]);
+    assert.equal(outcome.jobs[0].restored, true, "the adopted row is flagged restored");
+    assert.equal(outcome.invalidRecordCount, 0);
+
+    const adopted = disk.stores.get("jobs").records.get("crashed");
+    assert.equal(adopted.ownerId, "tab-B", "the adopted row is re-stamped to the adopting tab");
+    assert.equal(adopted.heartbeatMs, OWNERSHIP_CLOCK, "the adopted row gets a fresh heartbeat");
+
+    // Having claimed it, tab-B can now clear it as its own row.
+    const cleared = await storeModule.clearLiveSessionStore({
+      ownerId: "tab-B",
+      now: OWNERSHIP_CLOCK + 1000,
+      staleAfterMs: STALE_WINDOW_MS,
+    });
+    assert.equal(cleared.status, "committed");
+    assert.equal(cleared.count, 1, "the adopting tab owns and can clear the adopted row");
+  });
+  assert.equal(
+    disk.stores.get("jobs").records.size,
+    0,
+    "the adopted row was removed by its new owner",
+  );
+}
+
+async function testLegacyRecordIsRestorableAndMigrated() {
+  // A pre-ownership row has no ownerId/heartbeatMs. It is treated as stale-owned:
+  // restorable, and migrated to the restoring tab's ownership on restore.
+  const disk = ownershipDisk([storedRow("legacy", undefined, undefined)]);
+  const asTabB = { ownerId: "tab-B", now: OWNERSHIP_CLOCK, staleAfterMs: STALE_WINDOW_MS };
+
+  await withMockIndexedDb(createMemoryIndexedDb(disk), async () => {
+    const outcome = await storeModule.readLiveSessionJobs(asTabB);
+    assert.equal(outcome.status, "committed", "a legacy (owner-less) row is restorable");
+    assert.deepEqual(outcome.jobs.map((job) => job.id), ["legacy"]);
+    assert.equal(outcome.jobs[0].restored, true);
+    assert.equal(outcome.invalidRecordCount, 0, "a legacy row is migrated, not quarantined");
+  });
+
+  const migrated = disk.stores.get("jobs").records.get("legacy");
+  assert.equal(migrated.ownerId, "tab-B", "the legacy row is migrated to the restoring tab");
+  assert.equal(migrated.heartbeatMs, OWNERSHIP_CLOCK, "the migrated row gets a fresh heartbeat");
+}
+
+async function testHeartbeatRefreshesOnlyOwnRows() {
+  // The periodic heartbeat keeps an active tab's rows fresh without disturbing a
+  // peer's rows.
+  const disk = ownershipDisk([
+    storedRow("mine", "tab-A", OWNERSHIP_CLOCK - 60_000, "2026-07-18T00:00:00.000Z"),
+    storedRow("peer", "tab-B", OWNERSHIP_CLOCK - 60_000, "2026-07-17T00:00:00.000Z"),
+  ]);
+
+  await withMockIndexedDb(createMemoryIndexedDb(disk), async () => {
+    const outcome = await storeModule.refreshLiveSessionHeartbeat({
+      ownerId: "tab-A",
+      now: OWNERSHIP_CLOCK,
+    });
+    assert.equal(outcome.status, "committed");
+    assert.equal(outcome.count, 1, "only the tab's own row is refreshed");
+  });
+  assert.equal(
+    disk.stores.get("jobs").records.get("mine").heartbeatMs,
+    OWNERSHIP_CLOCK,
+    "the tab's own row heartbeat advanced",
+  );
+  assert.equal(
+    disk.stores.get("jobs").records.get("peer").heartbeatMs,
+    OWNERSHIP_CLOCK - 60_000,
+    "a peer's row is left untouched",
+  );
+}
+
 const tests = [
   testStoreDistinguishesUnavailableAndEmpty,
   testBlockedOpenClosesALateSuccessfulConnection,
@@ -1012,6 +1263,12 @@ const tests = [
   testFreshDatabaseMigratesAndRestoresEmpty,
   testV1ToV2MigrationPreservesValidAndQuarantinesInvalid,
   testBoundedRestoreStopsAtLimitNewestFirst,
+  testForeignLiveRecordIsProtected,
+  testAccidentalCloseRecoverySurfacesOwnRows,
+  testForeignLiveInvalidRecordIsLeftInPlace,
+  testCrashedTabRecordIsAdopted,
+  testLegacyRecordIsRestorableAndMigrated,
+  testHeartbeatRefreshesOnlyOwnRows,
   testClearOrdersAfterInflightWriteAndRejectsOldToken,
   testRetryDoesNotNeedAnotherJobsChange,
   testClearCancelsAScheduledOldRetry,

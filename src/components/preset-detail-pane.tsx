@@ -82,7 +82,7 @@ function NumberField({
             "w-full rounded-2xl border px-4 py-3 pr-16 tabular-nums text-[var(--ink)] outline-none transition",
             "focus-visible:border-[var(--accent)] focus-visible:ring-2 focus-visible:ring-[var(--accent)]",
             surface === "surface-0" ? "bg-[var(--surface-0)]" : "bg-[var(--surface-1)]",
-            error ? "border-[var(--danger)]" : "border-[var(--line)]",
+            error ? "border-[var(--danger)]" : "border-[var(--control-line)]",
           )}
         />
         <span

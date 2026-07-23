@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { memo, useMemo, useState } from "react";
 import { ArrowRightLeft, AudioLines, BarChart3, CircleAlert, Target, Waves } from "lucide-react";
 import { getComplianceSummary, type ComplianceState } from "@/audio/compliance";
 import { resolveAnalysisProvenance } from "@/audio/session-file";
@@ -68,6 +68,13 @@ const numberFormatter = new Intl.NumberFormat("en-GB");
 // How many files the "batch range" lanes render before "Show all" is needed
 // (UX-011): the view silently sliced to this count without saying so.
 const LANE_PREVIEW_COUNT = 8;
+// Cards, Reference, and Table are the main content views and render far
+// richer per-file DOM than the compact batch-range lane list above, but a
+// batch of 200+ completed files (well within the 1000-job session cap) still
+// mounts every job unconditionally without this cap. Uses the same disclosed
+// "Show all" affordance as LANE_PREVIEW_COUNT rather than silently
+// truncating.
+const MAIN_VIEW_PAGE_SIZE = 60;
 const TARGETED_VIEWS: Array<{ id: CompareView; label: string; description: string }> = [
   { id: "cards", label: "Ranked Cards", description: "Scan the batch in a richer card view." },
   { id: "board", label: "Status Board", description: "Group files by what needs attention next." },
@@ -371,6 +378,241 @@ function RangeLane({
   );
 }
 
+interface CompareRankedCardProps {
+  job: CompletedAnalysisJob;
+  rank: number;
+  isSelected: boolean;
+  currentTarget: TargetPreset | null;
+  analysisMode: AnalysisMode;
+  onOpenJob: (jobId: string) => void;
+}
+
+// Extracted and memoized (mirrors simple-results-table.tsx's SimpleQueueCard)
+// so a progress tick on an unrelated active job - which gives `sortedJobs` a
+// new array reference every time but leaves untouched job objects
+// referentially identical (see updateJobIfRunCurrent in
+// use-truepeak-analyzer.ts) - does not force every already-rendered card in
+// this unbounded list to re-render and redo its compliance/format work.
+const CompareRankedCard = memo(function CompareRankedCard({
+  job,
+  rank,
+  isSelected,
+  currentTarget,
+  analysisMode,
+  onOpenJob,
+}: CompareRankedCardProps) {
+  const compliance = getComplianceSummary(job.result);
+  const distanceToTarget =
+    currentTarget && job.result.metrics.integratedValid !== false
+      ? Math.abs(job.result.metrics.integratedLufs - currentTarget.loudnessTargetLufs)
+      : null;
+
+  return (
+    <Card
+      className="tp-selected-row overflow-hidden border-[var(--line)] bg-[var(--surface-1)] p-5 [content-visibility:auto] [contain-intrinsic-size:360px]"
+      data-selected={isSelected}
+      aria-current={isSelected ? "true" : undefined}
+    >
+      <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
+        <div className="min-w-0">
+          <div className="flex flex-wrap items-center gap-2">
+            <Badge>#{rank}</Badge>
+            {compliance ? <Badge className={complianceToneClass(compliance.state)}>{compliance.label}</Badge> : job.result.metrics.integratedValid === false ? <Badge className="tone-warning">Integrated unavailable</Badge> : <Badge>Measure Only</Badge>}
+            {isUnverifiedImport(job) ? <Badge className="tone-warning">Unverified import</Badge> : null}
+            {job.result.metrics.normalizationLimited ? <Badge className="tone-warning">Ceiling-limited</Badge> : null}
+          </div>
+          <h3 className="mt-3 break-words text-xl font-semibold text-[var(--ink)]">{job.fileName}</h3>
+          <p className="mt-2 break-words text-sm leading-6 text-[var(--muted)]">{job.result.metadata.channelLayout.name}, {numberFormatter.format(job.result.metadata.sampleRate)} Hz, {job.result.metadata.decoderLabel}</p>
+        </div>
+        <Button type="button" size="sm" variant="secondary" onClick={() => onOpenJob(job.id)} aria-label={`Inspect ${job.fileName}`}>Inspect</Button>
+      </div>
+      <div className="mt-5 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+        <CompareMetricTile label="Integrated" value={formatIntegratedLufs(job.result.metrics)} hint={job.result.metrics.integratedValid === false ? describeIntegratedInvalidReason(job.result.metrics.integratedInvalidReason) : undefined} accent />
+        <CompareMetricTile label="True peak" value={formatPeakDbtp(job.result.metrics.truePeakDbtp)} />
+        <CompareMetricTile label="LRA" value={formatLoudnessRange(job.result.metrics)} />
+        <CompareMetricTile label="Max short-term" value={formatLufs(job.result.metrics.maxShortTermLufs)} />
+      </div>
+      <div className="mt-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
+        <div className="rounded-[20px] border border-[var(--line)] bg-[var(--surface-0)] px-4 py-3">
+          <div className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">{analysisMode === "targeted" ? "Distance to target" : "Ungated loudness"}</div>
+          <div className="mt-2 text-lg font-semibold tabular-nums text-[var(--ink)]">{analysisMode === "targeted" ? formatDb(distanceToTarget, "LU") : formatLufs(job.result.metrics.ungatedLufs)}</div>
+        </div>
+        <div className="rounded-[20px] border border-[var(--line)] bg-[var(--surface-0)] px-4 py-3">
+          <div className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">{analysisMode === "targeted" ? "Gain move" : "Sample peak"}</div>
+          <div className="mt-2 text-lg font-semibold tabular-nums text-[var(--ink)]">{analysisMode === "targeted" ? formatRelativeDb(job.result.metrics.targetDeltaDb) : formatDb(job.result.metrics.samplePeakDbfs, "dBFS")}</div>
+        </div>
+        <div className="rounded-[20px] border border-[var(--line)] bg-[var(--surface-0)] px-4 py-3">
+          <div className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">{analysisMode === "targeted" ? "Projected peak" : "Duration"}</div>
+          <div className="mt-2 text-lg font-semibold tabular-nums text-[var(--ink)]">{analysisMode === "targeted" ? formatPeakDbtp(job.result.metrics.projectedTruePeakDbtp) : formatDuration(job.result.metadata.durationSeconds)}</div>
+        </div>
+      </div>
+    </Card>
+  );
+});
+
+interface CompareReferenceCardProps {
+  job: CompletedAnalysisJob;
+  referenceJob: CompletedAnalysisJob;
+  analysisMode: AnalysisMode;
+  onOpenJob: (jobId: string) => void;
+}
+
+// Same memoization rationale as CompareRankedCard above, for the Reference
+// Delta view's unbounded card list.
+const CompareReferenceCard = memo(function CompareReferenceCard({
+  job,
+  referenceJob,
+  analysisMode,
+  onOpenJob,
+}: CompareReferenceCardProps) {
+  const compliance = getComplianceSummary(job.result);
+  const integratedDelta = job.result.metrics.integratedValid !== false && referenceJob.result.metrics.integratedValid !== false ? job.result.metrics.integratedLufs - referenceJob.result.metrics.integratedLufs : null;
+  const truePeakDelta = job.result.metrics.truePeakDbtp - referenceJob.result.metrics.truePeakDbtp;
+  const lraDeltaUnstable =
+    job.result.metrics.loudnessRangeUnstable === true ||
+    referenceJob.result.metrics.loudnessRangeUnstable === true;
+  const lraDelta = lraDeltaUnstable
+    ? null
+    : job.result.metrics.loudnessRange - referenceJob.result.metrics.loudnessRange;
+  const gainDelta = job.result.metrics.targetDeltaDb == null || referenceJob.result.metrics.targetDeltaDb == null ? null : job.result.metrics.targetDeltaDb - referenceJob.result.metrics.targetDeltaDb;
+  const isReference = job.id === referenceJob.id;
+
+  return (
+    <Card
+      className={cn(
+        "tp-selected-row overflow-hidden border-[var(--line)] p-5 [content-visibility:auto] [contain-intrinsic-size:300px]",
+        isReference ? "bg-[color:var(--accent-soft)] shadow-[var(--shadow-elevated)]" : "bg-[var(--surface-1)]",
+      )}
+      data-selected={isReference}
+      aria-current={isReference ? "true" : undefined}
+    >
+      <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
+        <div className="min-w-0">
+          <div className="flex flex-wrap items-center gap-2">
+            {isReference ? <Badge>Reference</Badge> : null}
+            {compliance ? <Badge className={complianceToneClass(compliance.state)}>{compliance.label}</Badge> : job.result.metrics.integratedValid === false ? <Badge className="tone-warning">Integrated unavailable</Badge> : <Badge>Measure Only</Badge>}
+            {isUnverifiedImport(job) ? <Badge className="tone-warning">Unverified import</Badge> : null}
+          </div>
+          <h3 className="mt-3 break-words text-xl font-semibold text-[var(--ink)]">{job.fileName}</h3>
+          <p className="mt-2 break-words text-sm leading-6 text-[var(--muted)]">Compare this file against {referenceJob.fileName} before making batch-wide decisions.</p>
+        </div>
+        <Button type="button" size="sm" variant="secondary" onClick={() => onOpenJob(job.id)} aria-label={`Inspect ${job.fileName}`} className="shrink-0">Inspect</Button>
+      </div>
+      <div className={cn("mt-5 grid gap-3", analysisMode === "targeted" ? "sm:grid-cols-2" : "sm:grid-cols-3")}>
+        <div className="rounded-[20px] border border-[var(--line)] bg-[var(--surface-0)] px-4 py-3"><div className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">Integrated delta</div><div className={cn("mt-2 text-lg font-semibold tabular-nums", deltaToneClass(integratedDelta))}>{formatRelativeLu(integratedDelta)}</div></div>
+        <div className="rounded-[20px] border border-[var(--line)] bg-[var(--surface-0)] px-4 py-3"><div className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">True peak delta</div><div className={cn("mt-2 text-lg font-semibold tabular-nums", deltaToneClass(truePeakDelta))}>{formatRelativeDb(truePeakDelta)}</div></div>
+        <div className="rounded-[20px] border border-[var(--line)] bg-[var(--surface-0)] px-4 py-3"><div className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">LRA delta</div><div className={cn("mt-2 text-lg font-semibold tabular-nums", deltaToneClass(lraDelta))}>{lraDeltaUnstable ? "Unstable" : formatRelativeLu(lraDelta)}</div></div>
+        {analysisMode === "targeted" ? <div className="rounded-[20px] border border-[var(--line)] bg-[var(--surface-0)] px-4 py-3"><div className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">Gain delta</div><div className={cn("mt-2 text-lg font-semibold tabular-nums", deltaToneClass(gainDelta))}>{formatRelativeDb(gainDelta)}</div></div> : null}
+      </div>
+    </Card>
+  );
+});
+
+interface CompareTableRowProps {
+  job: CompletedAnalysisJob;
+  referenceJob: CompletedAnalysisJob | null;
+  selectedJobId: string | null;
+  analysisMode: AnalysisMode;
+  onOpenJob: (jobId: string) => void;
+}
+
+// Table view mounts both a mobile card list and a desktop table for the same
+// jobs (one hidden with CSS per breakpoint, matching the pattern
+// simple-results-table.tsx already uses for its own dual mobile/desktop
+// rendering). Each row model is still derived independently here - same as
+// SimpleQueueCard/SimpleQueueRow's independent buildJobRowModel calls - but
+// wrapping both in React.memo means that redundant work only runs when a
+// row's own job/reference/selection actually changes, instead of on every
+// re-render triggered by an unrelated job's progress tick.
+const CompareTableMobileRow = memo(function CompareTableMobileRow({
+  job,
+  referenceJob,
+  selectedJobId,
+  analysisMode,
+  onOpenJob,
+}: CompareTableRowProps) {
+  const row = buildTableRowModel(job, referenceJob, selectedJobId);
+
+  return (
+    <article
+      className={cn(
+        "tp-selected-row rounded-[22px] border p-4 text-[var(--ink)] [content-visibility:auto] [contain-intrinsic-size:280px]",
+        row.isSelected ? "border-[color:var(--accent)]/40 bg-[color:var(--accent-soft)]" : "border-[var(--line)] bg-[var(--surface-1)]",
+      )}
+      data-selected={row.isSelected}
+      aria-current={row.isSelected ? "true" : undefined}
+    >
+      <div className="flex flex-wrap items-center gap-2">
+        {row.badges.map((badge) => (
+          <Badge key={badge.key} className={badge.className}>{badge.label}</Badge>
+        ))}
+      </div>
+      <h3 className="mt-3 break-words text-lg font-semibold">{job.fileName}</h3>
+      <div className="mt-4 grid grid-cols-2 gap-3">
+        <div>
+          <div className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">Integrated</div>
+          <div className="mt-1 font-semibold tabular-nums">{row.integratedDisplay}</div>
+        </div>
+        {row.referenceDeltaDisplay != null ? (
+          <div>
+            <div className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">Vs ref</div>
+            <div className={cn("mt-1 font-semibold tabular-nums", row.referenceDeltaToneClass)}>{row.referenceDeltaDisplay}</div>
+          </div>
+        ) : null}
+        {analysisMode === "targeted" ? (
+          <div>
+            <div className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">Gain</div>
+            <div className="mt-1 font-semibold tabular-nums">{row.gainDisplay}</div>
+          </div>
+        ) : null}
+        <div>
+          <div className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">True peak</div>
+          <div className="mt-1 font-semibold tabular-nums">{row.truePeakDisplay}</div>
+        </div>
+        <div>
+          <div className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">LRA</div>
+          <div className="mt-1 font-semibold tabular-nums">{row.lraDisplay}</div>
+        </div>
+        <div>
+          <div className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">Duration</div>
+          <div className="mt-1 font-semibold tabular-nums">{row.durationDisplay}</div>
+        </div>
+      </div>
+      <div className="mt-4 border-t border-[var(--line)]/70 pt-4">
+        <Button type="button" size="sm" variant="secondary" onClick={() => onOpenJob(job.id)} aria-label={`Inspect ${job.fileName}`}>Inspect</Button>
+      </div>
+    </article>
+  );
+});
+
+const CompareTableDesktopRow = memo(function CompareTableDesktopRow({
+  job,
+  referenceJob,
+  selectedJobId,
+  analysisMode,
+  onOpenJob,
+}: CompareTableRowProps) {
+  const row = buildTableRowModel(job, referenceJob, selectedJobId);
+  const showReferenceColumn = referenceJob != null;
+
+  return (
+    <tr
+      className={cn("text-[var(--ink)]", row.isSelected ? "[&>td]:border-[color:var(--accent)]/40 [&>td]:bg-[color:var(--accent-soft)]" : "")}
+      aria-current={row.isSelected ? "true" : undefined}
+    >
+      <td className="rounded-l-[20px] border border-r-0 border-[var(--line)] px-4 py-4"><div className="break-words font-semibold">{job.fileName}</div><div className="mt-2 flex flex-wrap gap-2">{row.badges.map((badge) => <Badge key={badge.key} className={badge.className}>{badge.label}</Badge>)}</div></td>
+      <td className="border border-l-0 border-r-0 border-[var(--line)] px-4 py-4 tabular-nums">{row.integratedDisplay}</td>
+      {showReferenceColumn ? <td className={cn("border border-l-0 border-r-0 border-[var(--line)] px-4 py-4 font-semibold tabular-nums", row.referenceDeltaToneClass)}>{row.referenceDeltaDisplay}</td> : null}
+      {analysisMode === "targeted" ? <td className="border border-l-0 border-r-0 border-[var(--line)] px-4 py-4 tabular-nums">{row.gainDisplay}</td> : null}
+      <td className="border border-l-0 border-r-0 border-[var(--line)] px-4 py-4 tabular-nums">{row.truePeakDisplay}</td>
+      <td className="hidden border border-l-0 border-r-0 border-[var(--line)] px-4 py-4 tabular-nums md:table-cell">{row.lraDisplay}</td>
+      <td className="hidden border border-l-0 border-r-0 border-[var(--line)] px-4 py-4 tabular-nums xl:table-cell">{row.durationDisplay}</td>
+      <td className="hidden break-words border border-l-0 border-r-0 border-[var(--line)] px-4 py-4 2xl:table-cell">{row.decoderLabel}</td>
+      <td className="rounded-r-[20px] border border-l-0 border-[var(--line)] px-4 py-4"><Button type="button" size="sm" variant="ghost" onClick={() => onOpenJob(job.id)} aria-label={`Inspect ${job.fileName}`}>Inspect</Button></td>
+    </tr>
+  );
+});
+
 export function CompareStudio({
   completedJobs,
   currentTarget,
@@ -540,6 +782,16 @@ export function CompareStudio({
     [showAllLaneJobs, sortedJobs],
   );
   const sortLabel = availableSorts.find((option) => option.id === compareSort)?.label ?? "Integrated";
+
+  // Cards, Reference, and Table all walk the same sortedJobs list and, with
+  // it uncapped, mount every completed job's full card/row on every render -
+  // see MAIN_VIEW_PAGE_SIZE above. Windowed the same way as topLaneJobs,
+  // with a matching "Show all" disclosure so truncation is never silent.
+  const [showAllCompareJobs, setShowAllCompareJobs] = useState(false);
+  const visibleJobs = useMemo(
+    () => (showAllCompareJobs ? sortedJobs : sortedJobs.slice(0, MAIN_VIEW_PAGE_SIZE)),
+    [showAllCompareJobs, sortedJobs],
+  );
 
   const superlativeTiles = useMemo(() => {
     if (analysisMode === "targeted") {
@@ -854,7 +1106,7 @@ export function CompareStudio({
                 </div>
                 <div className="mt-3 flex flex-col gap-3 xl:flex-row xl:items-center">
                   <label htmlFor="compare-reference" className="sr-only">Choose a reference file</label>
-                  <select id="compare-reference" name="compare-reference" aria-label="Choose reference file" value={referenceJob?.id ?? "none"} onChange={(event) => onReferenceIdChange(event.target.value === "none" ? null : event.target.value)} className="w-full rounded-full border border-[var(--line)] bg-[var(--surface-0)] px-4 py-3 text-sm text-[var(--ink)] outline-none transition-[border-color,background-color] duration-200 ease-out focus:border-[var(--accent)] xl:max-w-md">
+                  <select id="compare-reference" name="compare-reference" aria-label="Choose reference file" value={referenceJob?.id ?? "none"} onChange={(event) => onReferenceIdChange(event.target.value === "none" ? null : event.target.value)} className="w-full rounded-full border border-[var(--control-line)] bg-[var(--surface-0)] px-4 py-3 text-sm text-[var(--ink)] outline-none transition-[border-color,background-color] duration-200 ease-out focus:border-[var(--accent)] xl:max-w-md">
                     <option value="none">No reference</option>
                     {readyJobs.map((job) => (
                       <option key={job.id} value={job.id}>{job.fileName}</option>
@@ -899,56 +1151,32 @@ export function CompareStudio({
           ))}
         </div>
 
+        {(compareView === "cards" || compareView === "reference" || compareView === "table") && sortedJobs.length > MAIN_VIEW_PAGE_SIZE ? (
+          <div className="mt-5 flex flex-wrap items-center justify-between gap-3 rounded-[16px] border border-[var(--line)]/60 bg-[var(--surface-1)]/50 px-4 py-2.5 text-xs text-[var(--muted)]">
+            <span>
+              Showing {numberFormatter.format(visibleJobs.length)} of {numberFormatter.format(sortedJobs.length)} file{sortedJobs.length === 1 ? "" : "s"} in this view.
+            </span>
+            <Button type="button" size="sm" variant="ghost" onClick={() => setShowAllCompareJobs((value) => !value)}>
+              {showAllCompareJobs ? `Show first ${numberFormatter.format(MAIN_VIEW_PAGE_SIZE)}` : `Show all ${numberFormatter.format(sortedJobs.length)}`}
+            </Button>
+          </div>
+        ) : null}
+
         {sortedJobs.length ? (
           <>
             {compareView === "cards" ? (
               <div className="mt-5 grid gap-4 xl:grid-cols-2">
-                {sortedJobs.map((job, index) => {
-                  const compliance = getComplianceSummary(job.result);
-                  const distanceToTarget = currentTarget && job.result.metrics.integratedValid !== false ? Math.abs(job.result.metrics.integratedLufs - currentTarget.loudnessTargetLufs) : null;
-                  return (
-                    <Card
-                      key={job.id}
-                      className="tp-selected-row overflow-hidden border-[var(--line)] bg-[var(--surface-1)] p-5 [content-visibility:auto] [contain-intrinsic-size:360px]"
-                      data-selected={selectedJobId === job.id}
-                      aria-current={selectedJobId === job.id ? "true" : undefined}
-                    >
-                      <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
-                        <div className="min-w-0">
-                          <div className="flex flex-wrap items-center gap-2">
-                            <Badge>#{index + 1}</Badge>
-                            {compliance ? <Badge className={complianceToneClass(compliance.state)}>{compliance.label}</Badge> : job.result.metrics.integratedValid === false ? <Badge className="tone-warning">Integrated unavailable</Badge> : <Badge>Measure Only</Badge>}
-                            {isUnverifiedImport(job) ? <Badge className="tone-warning">Unverified import</Badge> : null}
-                            {job.result.metrics.normalizationLimited ? <Badge className="tone-warning">Ceiling-limited</Badge> : null}
-                          </div>
-                          <h3 className="mt-3 break-words text-xl font-semibold text-[var(--ink)]">{job.fileName}</h3>
-                          <p className="mt-2 break-words text-sm leading-6 text-[var(--muted)]">{job.result.metadata.channelLayout.name}, {numberFormatter.format(job.result.metadata.sampleRate)} Hz, {job.result.metadata.decoderLabel}</p>
-                        </div>
-                        <Button type="button" size="sm" variant="secondary" onClick={() => onOpenJob(job.id)} aria-label={`Inspect ${job.fileName}`}>Inspect</Button>
-                      </div>
-                      <div className="mt-5 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
-                        <CompareMetricTile label="Integrated" value={formatIntegratedLufs(job.result.metrics)} hint={job.result.metrics.integratedValid === false ? describeIntegratedInvalidReason(job.result.metrics.integratedInvalidReason) : undefined} accent />
-                        <CompareMetricTile label="True peak" value={formatPeakDbtp(job.result.metrics.truePeakDbtp)} />
-                        <CompareMetricTile label="LRA" value={formatLoudnessRange(job.result.metrics)} />
-                        <CompareMetricTile label="Max short-term" value={formatLufs(job.result.metrics.maxShortTermLufs)} />
-                      </div>
-                      <div className="mt-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
-                        <div className="rounded-[20px] border border-[var(--line)] bg-[var(--surface-0)] px-4 py-3">
-                          <div className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">{analysisMode === "targeted" ? "Distance to target" : "Ungated loudness"}</div>
-                          <div className="mt-2 text-lg font-semibold tabular-nums text-[var(--ink)]">{analysisMode === "targeted" ? formatDb(distanceToTarget, "LU") : formatLufs(job.result.metrics.ungatedLufs)}</div>
-                        </div>
-                        <div className="rounded-[20px] border border-[var(--line)] bg-[var(--surface-0)] px-4 py-3">
-                          <div className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">{analysisMode === "targeted" ? "Gain move" : "Sample peak"}</div>
-                          <div className="mt-2 text-lg font-semibold tabular-nums text-[var(--ink)]">{analysisMode === "targeted" ? formatRelativeDb(job.result.metrics.targetDeltaDb) : formatDb(job.result.metrics.samplePeakDbfs, "dBFS")}</div>
-                        </div>
-                        <div className="rounded-[20px] border border-[var(--line)] bg-[var(--surface-0)] px-4 py-3">
-                          <div className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">{analysisMode === "targeted" ? "Projected peak" : "Duration"}</div>
-                          <div className="mt-2 text-lg font-semibold tabular-nums text-[var(--ink)]">{analysisMode === "targeted" ? formatPeakDbtp(job.result.metrics.projectedTruePeakDbtp) : formatDuration(job.result.metadata.durationSeconds)}</div>
-                        </div>
-                      </div>
-                    </Card>
-                  );
-                })}
+                {visibleJobs.map((job, index) => (
+                  <CompareRankedCard
+                    key={job.id}
+                    job={job}
+                    rank={index + 1}
+                    isSelected={selectedJobId === job.id}
+                    currentTarget={currentTarget}
+                    analysisMode={analysisMode}
+                    onOpenJob={onOpenJob}
+                  />
+                ))}
               </div>
             ) : null}
 
@@ -1008,49 +1236,15 @@ export function CompareStudio({
             {compareView === "reference" ? (
               referenceJob ? (
                 <div className="mt-5 grid gap-4 xl:grid-cols-2">
-                  {sortedJobs.map((job) => {
-                    const compliance = getComplianceSummary(job.result);
-                    const integratedDelta = job.result.metrics.integratedValid !== false && referenceJob.result.metrics.integratedValid !== false ? job.result.metrics.integratedLufs - referenceJob.result.metrics.integratedLufs : null;
-                    const truePeakDelta = job.result.metrics.truePeakDbtp - referenceJob.result.metrics.truePeakDbtp;
-                    const lraDeltaUnstable =
-                      job.result.metrics.loudnessRangeUnstable === true ||
-                      referenceJob.result.metrics.loudnessRangeUnstable === true;
-                    const lraDelta = lraDeltaUnstable
-                      ? null
-                      : job.result.metrics.loudnessRange - referenceJob.result.metrics.loudnessRange;
-                    const gainDelta = job.result.metrics.targetDeltaDb == null || referenceJob.result.metrics.targetDeltaDb == null ? null : job.result.metrics.targetDeltaDb - referenceJob.result.metrics.targetDeltaDb;
-                    const isReference = job.id === referenceJob.id;
-                    return (
-                      <Card
-                        key={job.id}
-                        className={cn(
-                          "tp-selected-row overflow-hidden border-[var(--line)] p-5 [content-visibility:auto] [contain-intrinsic-size:300px]",
-                          isReference ? "bg-[color:var(--accent-soft)] shadow-[var(--shadow-elevated)]" : "bg-[var(--surface-1)]",
-                        )}
-                        data-selected={isReference}
-                        aria-current={isReference ? "true" : undefined}
-                      >
-                        <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
-                          <div className="min-w-0">
-                            <div className="flex flex-wrap items-center gap-2">
-                              {isReference ? <Badge>Reference</Badge> : null}
-                              {compliance ? <Badge className={complianceToneClass(compliance.state)}>{compliance.label}</Badge> : job.result.metrics.integratedValid === false ? <Badge className="tone-warning">Integrated unavailable</Badge> : <Badge>Measure Only</Badge>}
-                              {isUnverifiedImport(job) ? <Badge className="tone-warning">Unverified import</Badge> : null}
-                            </div>
-                            <h3 className="mt-3 break-words text-xl font-semibold text-[var(--ink)]">{job.fileName}</h3>
-                            <p className="mt-2 break-words text-sm leading-6 text-[var(--muted)]">Compare this file against {referenceJob.fileName} before making batch-wide decisions.</p>
-                          </div>
-                          <Button type="button" size="sm" variant="secondary" onClick={() => onOpenJob(job.id)} aria-label={`Inspect ${job.fileName}`} className="shrink-0">Inspect</Button>
-                        </div>
-                        <div className={cn("mt-5 grid gap-3", analysisMode === "targeted" ? "sm:grid-cols-2" : "sm:grid-cols-3")}>
-                          <div className="rounded-[20px] border border-[var(--line)] bg-[var(--surface-0)] px-4 py-3"><div className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">Integrated delta</div><div className={cn("mt-2 text-lg font-semibold tabular-nums", deltaToneClass(integratedDelta))}>{formatRelativeLu(integratedDelta)}</div></div>
-                          <div className="rounded-[20px] border border-[var(--line)] bg-[var(--surface-0)] px-4 py-3"><div className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">True peak delta</div><div className={cn("mt-2 text-lg font-semibold tabular-nums", deltaToneClass(truePeakDelta))}>{formatRelativeDb(truePeakDelta)}</div></div>
-                          <div className="rounded-[20px] border border-[var(--line)] bg-[var(--surface-0)] px-4 py-3"><div className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">LRA delta</div><div className={cn("mt-2 text-lg font-semibold tabular-nums", deltaToneClass(lraDelta))}>{lraDeltaUnstable ? "Unstable" : formatRelativeLu(lraDelta)}</div></div>
-                          {analysisMode === "targeted" ? <div className="rounded-[20px] border border-[var(--line)] bg-[var(--surface-0)] px-4 py-3"><div className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">Gain delta</div><div className={cn("mt-2 text-lg font-semibold tabular-nums", deltaToneClass(gainDelta))}>{formatRelativeDb(gainDelta)}</div></div> : null}
-                        </div>
-                      </Card>
-                    );
-                  })}
+                  {visibleJobs.map((job) => (
+                    <CompareReferenceCard
+                      key={job.id}
+                      job={job}
+                      referenceJob={referenceJob}
+                      analysisMode={analysisMode}
+                      onOpenJob={onOpenJob}
+                    />
+                  ))}
                 </div>
               ) : (
                 <div className="mt-5 rounded-[22px] border border-dashed border-[var(--line)] bg-[var(--surface-1)] p-6 text-sm leading-6 text-[var(--muted)]">
@@ -1078,69 +1272,28 @@ export function CompareStudio({
             {compareView === "table" ? (
               <>
               {/* The mobile card list and the desktop table below both walk
-                  every job in sortedJobs and render one hidden with CSS -
+                  every job in visibleJobs and render one hidden with CSS -
                   buildTableRowModel (UX-031) is the one place that derives
-                  badges/deltas, so the two presentations can't drift. */}
+                  badges/deltas, so the two presentations can't drift. Each
+                  row is its own memoized component (CompareTableMobileRow /
+                  CompareTableDesktopRow) so an unrelated job's progress tick
+                  does not force every row to redo that derivation. */}
               <div className="mt-5 grid gap-3 md:hidden">
-                {sortedJobs.map((job) => {
-                  const row = buildTableRowModel(job, referenceJob, selectedJobId);
-                  return (
-                    <article
-                      key={job.id}
-                      className={cn(
-                        "tp-selected-row rounded-[22px] border p-4 text-[var(--ink)] [content-visibility:auto] [contain-intrinsic-size:280px]",
-                        row.isSelected ? "border-[color:var(--accent)]/40 bg-[color:var(--accent-soft)]" : "border-[var(--line)] bg-[var(--surface-1)]",
-                      )}
-                      data-selected={row.isSelected}
-                      aria-current={row.isSelected ? "true" : undefined}
-                    >
-                      <div className="flex flex-wrap items-center gap-2">
-                        {row.badges.map((badge) => (
-                          <Badge key={badge.key} className={badge.className}>{badge.label}</Badge>
-                        ))}
-                      </div>
-                      <h3 className="mt-3 break-words text-lg font-semibold">{job.fileName}</h3>
-                      <div className="mt-4 grid grid-cols-2 gap-3">
-                        <div>
-                          <div className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">Integrated</div>
-                          <div className="mt-1 font-semibold tabular-nums">{row.integratedDisplay}</div>
-                        </div>
-                        {row.referenceDeltaDisplay != null ? (
-                          <div>
-                            <div className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">Vs ref</div>
-                            <div className={cn("mt-1 font-semibold tabular-nums", row.referenceDeltaToneClass)}>{row.referenceDeltaDisplay}</div>
-                          </div>
-                        ) : null}
-                        {analysisMode === "targeted" ? (
-                          <div>
-                            <div className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">Gain</div>
-                            <div className="mt-1 font-semibold tabular-nums">{row.gainDisplay}</div>
-                          </div>
-                        ) : null}
-                        <div>
-                          <div className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">True peak</div>
-                          <div className="mt-1 font-semibold tabular-nums">{row.truePeakDisplay}</div>
-                        </div>
-                        <div>
-                          <div className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">LRA</div>
-                          <div className="mt-1 font-semibold tabular-nums">{row.lraDisplay}</div>
-                        </div>
-                        <div>
-                          <div className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">Duration</div>
-                          <div className="mt-1 font-semibold tabular-nums">{row.durationDisplay}</div>
-                        </div>
-                      </div>
-                      <div className="mt-4 border-t border-[var(--line)]/70 pt-4">
-                        <Button type="button" size="sm" variant="secondary" onClick={() => onOpenJob(job.id)} aria-label={`Inspect ${job.fileName}`}>Inspect</Button>
-                      </div>
-                    </article>
-                  );
-                })}
+                {visibleJobs.map((job) => (
+                  <CompareTableMobileRow
+                    key={job.id}
+                    job={job}
+                    referenceJob={referenceJob}
+                    selectedJobId={selectedJobId}
+                    analysisMode={analysisMode}
+                    onOpenJob={onOpenJob}
+                  />
+                ))}
               </div>
               <div className="mt-5 hidden overflow-x-auto md:block">
                 <table className="w-full min-w-[640px] border-separate border-spacing-y-3 text-sm lg:min-w-[760px] xl:min-w-[860px]">
                   <caption className="sr-only">
-                    Comparison table for {sortedJobs.length} file{sortedJobs.length === 1 ? "" : "s"}, sorted by {sortLabel} (
+                    Comparison table for {visibleJobs.length === sortedJobs.length ? `${sortedJobs.length} file${sortedJobs.length === 1 ? "" : "s"}` : `${visibleJobs.length} of ${sortedJobs.length} files`}, sorted by {sortLabel} (
                     {formatSortDirection(compareDirection).toLowerCase()}){referenceJob ? `, relative to reference file ${referenceJob.fileName}` : ""}.
                   </caption>
                   {/* Shares --sticky-toolbar-offset with the queue table
@@ -1159,26 +1312,16 @@ export function CompareStudio({
                     </tr>
                   </thead>
                   <tbody>
-                    {sortedJobs.map((job) => {
-                      const row = buildTableRowModel(job, referenceJob, selectedJobId);
-                      return (
-                        <tr
-                          key={job.id}
-                          className={cn("text-[var(--ink)]", row.isSelected ? "[&>td]:border-[color:var(--accent)]/40 [&>td]:bg-[color:var(--accent-soft)]" : "")}
-                          aria-current={row.isSelected ? "true" : undefined}
-                        >
-                          <td className="rounded-l-[20px] border border-r-0 border-[var(--line)] px-4 py-4"><div className="break-words font-semibold">{job.fileName}</div><div className="mt-2 flex flex-wrap gap-2">{row.badges.map((badge) => <Badge key={badge.key} className={badge.className}>{badge.label}</Badge>)}</div></td>
-                          <td className="border border-l-0 border-r-0 border-[var(--line)] px-4 py-4 tabular-nums">{row.integratedDisplay}</td>
-                          {referenceJob ? <td className={cn("border border-l-0 border-r-0 border-[var(--line)] px-4 py-4 font-semibold tabular-nums", row.referenceDeltaToneClass)}>{row.referenceDeltaDisplay}</td> : null}
-                          {analysisMode === "targeted" ? <td className="border border-l-0 border-r-0 border-[var(--line)] px-4 py-4 tabular-nums">{row.gainDisplay}</td> : null}
-                          <td className="border border-l-0 border-r-0 border-[var(--line)] px-4 py-4 tabular-nums">{row.truePeakDisplay}</td>
-                          <td className="hidden border border-l-0 border-r-0 border-[var(--line)] px-4 py-4 tabular-nums md:table-cell">{row.lraDisplay}</td>
-                          <td className="hidden border border-l-0 border-r-0 border-[var(--line)] px-4 py-4 tabular-nums xl:table-cell">{row.durationDisplay}</td>
-                          <td className="hidden break-words border border-l-0 border-r-0 border-[var(--line)] px-4 py-4 2xl:table-cell">{row.decoderLabel}</td>
-                          <td className="rounded-r-[20px] border border-l-0 border-[var(--line)] px-4 py-4"><Button type="button" size="sm" variant="ghost" onClick={() => onOpenJob(job.id)} aria-label={`Inspect ${job.fileName}`}>Inspect</Button></td>
-                        </tr>
-                      );
-                    })}
+                    {visibleJobs.map((job) => (
+                      <CompareTableDesktopRow
+                        key={job.id}
+                        job={job}
+                        referenceJob={referenceJob}
+                        selectedJobId={selectedJobId}
+                        analysisMode={analysisMode}
+                        onOpenJob={onOpenJob}
+                      />
+                    ))}
                   </tbody>
                 </table>
               </div>

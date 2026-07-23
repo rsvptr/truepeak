@@ -59,6 +59,11 @@ export function TimelineChart({ timeline }: TimelineChartProps) {
   const loudnessPlotRef = useRef<uPlot | null>(null);
   const peakPlotRef = useRef<uPlot | null>(null);
   const xDomainRef = useRef<XDomain | null>(null);
+  // Tracks which `timeline` the charts were last built from, so a
+  // theme-toggle-only (or pointer-type-only) re-instantiation can tell it
+  // isn't looking at new data and should keep the user's current zoom/pan
+  // instead of snapping back to the full range.
+  const lastTimelineRef = useRef<AnalysisTimeline | null>(null);
 
   const summaryId = useId();
   const tableId = useId();
@@ -172,6 +177,19 @@ export function TimelineChart({ timeline }: TimelineChartProps) {
       return;
     }
 
+    // Only reset the view when the underlying timeline data actually
+    // changed (a new file/result). A theme toggle or pointer-type change
+    // still destroys and recreates the uPlot instances (they read colours
+    // from CSS variables once, at creation), but should restyle the same
+    // view rather than silently discarding the user's zoom/pan.
+    const timelineChanged = lastTimelineRef.current !== timeline;
+    lastTimelineRef.current = timeline;
+    const previousPlot = loudnessPlotRef.current;
+    const preservedScale =
+      !timelineChanged && previousPlot && previousPlot.scales.x.min != null && previousPlot.scales.x.max != null
+        ? { min: previousPlot.scales.x.min, max: previousPlot.scales.x.max }
+        : null;
+
     loudnessPlotRef.current?.destroy();
     peakPlotRef.current?.destroy();
     loudnessContainer.innerHTML = "";
@@ -197,7 +215,9 @@ export function TimelineChart({ timeline }: TimelineChartProps) {
       max: x.length > 0 ? x[x.length - 1] : 0,
     };
     xDomainRef.current = domain;
-    setIsZoomed(false);
+    if (timelineChanged) {
+      setIsZoomed(false);
+    }
 
     // Keep both charts' x-axis in lockstep: dragging to zoom on either one
     // (or the explicit Zoom In/Out/Reset controls below) updates the other,
@@ -308,6 +328,17 @@ export function TimelineChart({ timeline }: TimelineChartProps) {
       [x, truePeak],
       peakContainer,
     );
+
+    // Reapply the pre-recreation zoom/pan (if any) now that both fresh
+    // instances exist. This runs through the same setScale path as a manual
+    // zoom, so the sync hook mirrors it onto the other chart and restores
+    // `isZoomed` to match.
+    if (preservedScale) {
+      loudnessPlotRef.current.setScale("x", {
+        min: clamp(preservedScale.min, domain.min, domain.max),
+        max: clamp(preservedScale.max, domain.min, domain.max),
+      });
+    }
 
     const resizeObserver = new ResizeObserver(() => {
       if (!loudnessContainerRef.current || !peakContainerRef.current) {

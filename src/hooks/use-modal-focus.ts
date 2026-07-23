@@ -18,6 +18,21 @@ function getFocusableElements(container: HTMLElement | null) {
   );
 }
 
+// Snapshot of an element's ancestor chain (immediate parent first, stopping
+// before <body>), captured while the element is still attached. If the
+// element itself is later removed from the document (e.g. a deleted queue
+// row), this lets focus restoration fall back to the nearest ancestor that
+// is still attached, instead of reverting to <body>.
+function collectFocusAncestors(element: HTMLElement | null): HTMLElement[] {
+  const ancestors: HTMLElement[] = [];
+  let node = element?.parentElement ?? null;
+  while (node && node !== document.body) {
+    ancestors.push(node);
+    node = node.parentElement;
+  }
+  return ancestors;
+}
+
 interface UseModalFocusOptions {
   open: boolean;
   panelRef: RefObject<HTMLElement | null>;
@@ -300,6 +315,7 @@ export function useModalFocus({
   const latestOnCloseRef = useRef(onClose);
   const latestInitialFocusRef = useRef(getInitialFocus);
   const previousFocusRef = useRef<HTMLElement | null>(null);
+  const previousFocusAncestorsRef = useRef<HTMLElement[]>([]);
 
   useEffect(() => {
     latestOnCloseRef.current = onClose;
@@ -313,6 +329,7 @@ export function useModalFocus({
 
     previousFocusRef.current =
       document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    previousFocusAncestorsRef.current = collectFocusAncestors(previousFocusRef.current);
 
     const entry: StackEntry = {
       panelRef,
@@ -331,15 +348,100 @@ export function useModalFocus({
     return () => {
       window.clearTimeout(focusInitial);
       popStackEntry(entry);
-      // Only restore focus if the trigger is still in the document; a removed
-      // element (e.g. a deleted row) would otherwise drop focus to <body>.
-      // By the time we get here, popStackEntry has already re-derived
-      // inertness, so a now-top lower layer is no longer inert and can
-      // legitimately receive focus back.
+      // Only restore focus directly to the trigger if it's still in the
+      // document; a removed element (e.g. a deleted row) would otherwise
+      // drop focus to <body>. By the time we get here, popStackEntry has
+      // already re-derived inertness, so a now-top lower layer is no longer
+      // inert and can legitimately receive focus back.
       const restoreTarget = previousFocusRef.current;
       if (restoreTarget && document.contains(restoreTarget)) {
         restoreTarget.focus();
+        return;
+      }
+
+      // The trigger itself is gone (e.g. its whole row was removed after a
+      // confirmed destructive action). Fall back to the nearest ancestor
+      // that is still attached so a keyboard/screen-reader user lands on a
+      // sensible surviving surface (the list/section that used to contain
+      // the trigger) instead of silently losing focus to <body>.
+      const fallback = previousFocusAncestorsRef.current.find((ancestor) => document.contains(ancestor));
+      if (!fallback) {
+        return;
+      }
+
+      const hadTabIndex = fallback.hasAttribute("tabindex");
+      if (!hadTabIndex) {
+        fallback.setAttribute("tabindex", "-1");
+      }
+      fallback.focus();
+      if (!hadTabIndex) {
+        // Programmatic-only focus target: drop the temporary tabindex once
+        // focus moves on so it doesn't linger in the page's Tab order.
+        const clearTemporaryTabIndex = () => {
+          fallback.removeAttribute("tabindex");
+          fallback.removeEventListener("blur", clearTemporaryTabIndex);
+        };
+        fallback.addEventListener("blur", clearTemporaryTabIndex, { once: true });
       }
     };
   }, [open, panelRef, containerRef]);
+}
+
+// For UI that renders a modal-STYLED overlay (a full-screen backdrop plus a
+// panel) but intentionally keeps its own bespoke, non-dialog interaction
+// model — e.g. a role="menu" bottom sheet with roving-tabindex and
+// Tab-closes-the-menu behavior, rather than a Tab-trapped dialog — adopting
+// the full useModalFocus stack (its own Escape/Tab trapping) would fight
+// with that model. useBackgroundInert covers just the two pieces still
+// needed to make the overlay actually block the page the way it visually
+// implies: every sibling along the path from `rootRef` up to <body> gets
+// `inert` (so a screen reader's virtual cursor, not just Tab order, cannot
+// reach the background) and body scroll is locked (via the same
+// reference-counted lock the full modal stack uses), for as long as
+// `active` is true. It does not touch focus, Escape, or Tab handling —
+// callers keep whatever interaction model they already have.
+export function useBackgroundInert(active: boolean, rootRef: RefObject<HTMLElement | null>) {
+  useEffect(() => {
+    if (!active) {
+      return;
+    }
+
+    const root = rootRef.current;
+    if (!root) {
+      return;
+    }
+
+    const locallyInerted = new Map<HTMLElement, boolean>();
+    let node: HTMLElement | null = root;
+    while (node && node !== document.body) {
+      const parent: HTMLElement | null = node.parentElement;
+      if (!parent) {
+        break;
+      }
+      for (const child of Array.from(parent.children)) {
+        if (child === node || !(child instanceof HTMLElement)) {
+          continue;
+        }
+        if (isLiveRegion(child)) {
+          continue;
+        }
+        if (!locallyInerted.has(child)) {
+          locallyInerted.set(child, child.hasAttribute("inert"));
+        }
+        child.setAttribute("inert", "");
+      }
+      node = parent;
+    }
+
+    acquireScrollLock();
+
+    return () => {
+      releaseScrollLock();
+      locallyInerted.forEach((hadInertBefore, element) => {
+        if (!hadInertBefore) {
+          element.removeAttribute("inert");
+        }
+      });
+    };
+  }, [active, rootRef]);
 }

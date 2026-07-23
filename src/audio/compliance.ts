@@ -24,8 +24,27 @@ export function getComplianceSummary(result: AnalysisResult): ComplianceSummary 
 
   const deltaFromTargetLufs = result.metrics.integratedLufs - result.target.loudnessTargetLufs;
   const window = Math.max(0.1, result.target.toleranceLufs);
+  const withinTolerance = Math.abs(deltaFromTargetLufs) <= window;
+  const exceedsCeiling = result.metrics.truePeakDbtp > result.target.truePeakCeilingDbtp;
 
-  if (Math.abs(deltaFromTargetLufs) <= window) {
+  // The verdict must reflect the WORST of the loudness-vs-tolerance and
+  // true-peak-vs-ceiling axes. It keys off the MEASURED true peak, not the
+  // normalizationLimited flag alone: a file already inside the loudness tolerance
+  // whose measured peak sits under/at the ceiling is fully deliverable and reads
+  // on-target even when the residual move to hit dead-centre target was capped
+  // (that cap is cosmetic — the file is already compliant). Only a measured peak
+  // that actually EXCEEDS the ceiling turns an otherwise on-target file into a
+  // ceiling breach that must not hide behind the loudness read.
+  if (withinTolerance) {
+    if (exceedsCeiling) {
+      return {
+        state: "ceiling-limited",
+        label: "Ceiling-limited",
+        description:
+          "Measured true peak exceeds the selected ceiling even though integrated loudness is on target.",
+        deltaFromTargetLufs,
+      };
+    }
     return {
       state: "on-target",
       label: "On target",
@@ -34,6 +53,9 @@ export function getComplianceSummary(result: AnalysisResult): ComplianceSummary 
     };
   }
 
+  // Out of tolerance: a capped normalization move means the loudness target and the
+  // peak ceiling cannot both be reached, so surface that as the binding constraint
+  // rather than a plain below/above verdict.
   if (result.metrics.normalizationLimited) {
     return {
       state: "ceiling-limited",

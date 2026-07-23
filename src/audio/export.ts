@@ -20,6 +20,13 @@ export interface IntegratedMeasurementPresentation {
 }
 
 const EXPORT_BASENAME = "truepeak-analysis";
+// Excel on Windows opens a double-clicked .csv using the system ANSI codepage
+// (e.g. Windows-1252) unless the file begins with a UTF-8 byte-order mark, which
+// mojibakes any non-ASCII cell such as a "Café Été.wav" filename. The Blob's
+// `charset=utf-8` MIME type does not influence a locally-saved file, so the BOM
+// must live in the bytes. It is scoped to CSV only: JSON must not carry a BOM
+// (strict parsers reject it) and Markdown does not need one.
+const UTF8_BOM = "\uFEFF";
 const SPREADSHEET_FORMULA_PREFIX = /^[=+\-@\t\r\n]/;
 const UNVERIFIED_IMPORT_WARNING =
   "Unverified imported result; re-analyze the source audio before relying on it for compliance or delivery.";
@@ -221,7 +228,7 @@ export function buildCsvExport(jobs: AnalysisJob[]) {
       .join(",");
   });
 
-  return [header.join(","), ...rows].join("\n");
+  return UTF8_BOM + [header.join(","), ...rows].join("\n");
 }
 
 export function buildJsonExport(jobs: AnalysisJob[]) {

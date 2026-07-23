@@ -25,8 +25,18 @@ const enableVercelInsights =
 const APP_DESCRIPTION =
   "Loudness and true peak analysis in your browser, for mastering, delivery checks, and quick file review.";
 
+// Forks and self-hosted deployments should get OG/canonical URLs that point at
+// their own origin, not the original author's. Prefer an explicit site URL,
+// fall back to Vercel's auto-injected deployment URL (unprefixed on purpose:
+// it is read at build/request time on the server, never shipped to the
+// client), and only fall back to the canonical deployment as a last resort.
+const SITE_URL =
+  process.env.NEXT_PUBLIC_SITE_URL ??
+  (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : undefined) ??
+  "https://true-peak.vercel.app";
+
 export const metadata: Metadata = {
-  metadataBase: new URL("https://true-peak.vercel.app"),
+  metadataBase: new URL(SITE_URL),
   title: "TruePeak",
   description: APP_DESCRIPTION,
   applicationName: "TruePeak",
@@ -34,7 +44,10 @@ export const metadata: Metadata = {
   keywords: ["TruePeak", "LUFS", "loudness", "true peak", "R128", "audio analysis", "mastering"],
   manifest: "/manifest.webmanifest",
   icons: {
-    icon: [{ url: "/favicon.png", type: "image/png", sizes: "192x192" }],
+    icon: [
+      { url: "/favicon.png", type: "image/png", sizes: "192x192" },
+      { url: "/logo.png", type: "image/png", sizes: "512x512" },
+    ],
     apple: [{ url: "/favicon.png", type: "image/png", sizes: "192x192" }],
     shortcut: ["/favicon.png"],
   },

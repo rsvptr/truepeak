@@ -119,6 +119,7 @@ export function parseAiffBuffer(
   }
 
   let offset = 12;
+  let chunksVisited = 0;
   let commOffset = 0;
   let commSize = 0;
   let ssndOffset = 0;
@@ -126,10 +127,20 @@ export function parseAiffBuffer(
   let fverOffset = 0;
   let fverSize = 0;
 
-  while (offset + 8 <= view.byteLength) {
+  // Bound the chunk walk exactly the way inspectAiff (decode-budget.ts) already
+  // caps its sibling pre-flight scan. A legitimate AIFF/AIFC carries COMM, SSND,
+  // and (for AIFC) its mandatory FVER within the first handful of chunks, so
+  // 100k iterations is far more than any real file needs. Without this cap an
+  // AIFC with COMM+SSND early, no FVER, and a huge padded tail of size-0 chunks
+  // (which still fits inside the decode budget and passes the inspector) forces
+  // this synchronous loop to march to EOF one 4-char allocation per chunk before
+  // finally throwing "missing FVER" — freezing the decoder lane for seconds and
+  // bypassing the maxDecodeMs budget, which cannot interrupt a synchronous loop.
+  while (offset + 8 <= view.byteLength && chunksVisited < 100_000) {
     const chunkId = readAscii(view, offset, 4);
     const chunkSize = view.getUint32(offset + 4, false);
     const dataOffset = offset + 8;
+    chunksVisited += 1;
 
     if (chunkId === "FVER") {
       fverOffset = dataOffset;
@@ -149,7 +160,9 @@ export function parseAiffBuffer(
     // A valid AIFF is described by COMM + SSND; a valid AIFC additionally requires
     // the mandatory FVER version chunk. Stop scanning once the required chunks are
     // known so attacker-padded chunk tails can't burn time. FVER may legitimately
-    // appear after COMM/SSND, so for AIFC keep scanning until it is found or EOF.
+    // appear after COMM/SSND, so for AIFC keep scanning until it is found — but the
+    // chunksVisited cap above guarantees the walk still terminates cheaply on a
+    // crafted FVER-absent flood instead of running all the way to EOF.
     if (commOffset && ssndOffset && (formType !== "AIFC" || fverOffset)) {
       break;
     }

@@ -4,6 +4,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { getComplianceSummary } from "@/audio/compliance";
 import {
   decodeAudioFileInBrowser,
+  isBrowserDecodeDrainTimeout,
   shouldPreferBrowserDecoder,
 } from "@/audio/browser-decode";
 import {
@@ -11,7 +12,9 @@ import {
   assertDecodedFootprint,
   assertSourceWithinBudget,
   checkedResourceByteSum,
+  classifyReservationContention,
   conservativeDecodePeakBytes,
+  declaredDecodeCorroboratedByFileSize,
   decodePeakResidentBytes,
   decodeFailureDetails,
   growDecodePeakReservation,
@@ -22,6 +25,11 @@ import {
   validatePlanarChannels,
   type DecodeBudget,
 } from "@/audio/decode-budget";
+import {
+  browserDecodeWindowCapacity,
+  createCountingSemaphore,
+  type CountingSemaphore,
+} from "@/audio/decode-window";
 import {
   buildCsvExport,
   buildJsonExport,
@@ -103,7 +111,22 @@ type JobResourcePlan =
   | { kind: "preparing" }
   | { kind: "known"; decodedBytes: number; trustedNative: boolean }
   | { kind: "unknown" }
-  | { kind: "rejected"; error: string };
+  | { kind: "rejected"; error: string }
+  // A job that hit reservation contention mid-run and was flipped back to
+  // "queued". It carries the exact reservation and exclusivity it must be
+  // re-admitted under, and the single decode route it must run on re-admission
+  // (no fallback chain), so fillLanes bypasses the preflight admission model
+  // and runJob honors the pinned route. `escalations` caps runJob-time requeues
+  // so a job can never loop forever; `decodedBytes` is carried from a prior
+  // known plan for labels only and does not drive admission.
+  | {
+      kind: "escalated";
+      reservationPeakBytes: number;
+      exclusive: boolean;
+      route: "browser-only" | "compatibility-only";
+      decodedBytes: number | null;
+      escalations: number;
+    };
 
 // A lane is an independent decoder+analyzer worker pair that owns at most one
 // job at a time. Multiple lanes let the queue process files in parallel while
@@ -530,6 +553,22 @@ export function useTruePeakAnalyzer(
   const aggregatePeakBytesRef = useRef(
     conservativeDecodePeakBytes(resolveDecodeBudget()),
   );
+  // Bounds how many untrusted browser decodeAudioData allocations run at once
+  // so their combined transient footprint stays inside the aggregate cap, even
+  // when their steady byte reservations are individually small. Orthogonal to
+  // the reservation model: reservations bound RETAINED memory, this bounds the
+  // concurrent TRANSIENT decode allocation. Seeded from the conservative
+  // default tier (capacity 1); the budget effect below re-resolves it to the
+  // device's real capacity (2 on the capable large tier) via setCapacity,
+  // exactly as it re-resolves the aggregate cap.
+  const browserDecodeWindowRef = useRef<CountingSemaphore>(
+    createCountingSemaphore(
+      browserDecodeWindowCapacity(
+        conservativeDecodePeakBytes(resolveDecodeBudget()),
+        resolveDecodeBudget(),
+      ),
+    ),
+  );
   const reservedPeakBytesRef = useRef(0);
   const resourcePlansRef = useRef(new Map<string, JobResourcePlan>());
   const idleTeardownRef = useRef<number | null>(null);
@@ -581,7 +620,27 @@ export function useTruePeakAnalyzer(
     };
   });
 
-  const completedJobs = useMemo(() => getCompletedAnalysisJobs(jobs), [jobs]);
+  const filteredCompletedJobs = useMemo(() => getCompletedAnalysisJobs(jobs), [jobs]);
+  // Referential stability across pure progress ticks, without a render-phase ref
+  // read (which the project's react-hooks/refs rule forbids). `jobs` is a
+  // brand-new array on every tick from any active lane; handing a new
+  // completedJobs array to Compare/Insights each time would force their
+  // completedJobs-keyed memos to fully recompute even though no completed result
+  // changed. Instead hold the last emitted completed list in state and swap it
+  // only when the completed set actually differs by object identity — a real
+  // completion, removal, or retarget (all immutable updates). On a pure progress
+  // tick the filter yields the same completed objects, so the guard is false, no
+  // state update is scheduled, and consumers keep the same reference. This is
+  // React's blessed "adjust state during render" pattern (the setState is
+  // guarded, so it cannot loop). (Finding [15].)
+  const [stableCompletedJobs, setStableCompletedJobs] = useState(filteredCompletedJobs);
+  const completedSetChanged =
+    filteredCompletedJobs.length !== stableCompletedJobs.length ||
+    filteredCompletedJobs.some((job, index) => job !== stableCompletedJobs[index]);
+  if (completedSetChanged) {
+    setStableCompletedJobs(filteredCompletedJobs);
+  }
+  const completedJobs = completedSetChanged ? filteredCompletedJobs : stableCompletedJobs;
   const hasActiveJobs = useMemo(() => jobs.some(isActiveJob), [jobs]);
 
   const pushNotice = useCallback((message: string | null) => {
@@ -1039,6 +1098,15 @@ export function useTruePeakAnalyzer(
     aggregatePeakBytesRef.current = resolveAggregatePeakBytes(
       decodeBudgetRef.current,
     );
+    // Keep the browser-decode window sized to the same aggregate/budget that
+    // was just re-resolved: capacity = floor(aggregate / browserPeak), >= 1.
+    // Adjusting in place preserves any slots currently held or waited on.
+    browserDecodeWindowRef.current.setCapacity(
+      browserDecodeWindowCapacity(
+        aggregatePeakBytesRef.current,
+        decodeBudgetRef.current,
+      ),
+    );
     setParallelLimit(limit);
     // Shrink immediately if the new budget is lower; busy lanes finish their
     // current file first (no new work lands on them past the limit).
@@ -1401,7 +1469,15 @@ export function useTruePeakAnalyzer(
       return;
     }
 
-    const fingerprint = completedHistoryFingerprint(jobs);
+    // Keyed on the referentially-stable completedJobs (Finding [15]) rather than
+    // `jobs`, so this effect — and the O(completed-jobs) fingerprint rebuild
+    // below — no longer runs on every progress tick, only when the completed set
+    // actually changes (a new result, a removal, or a retarget). The fingerprint
+    // still gates the write, so a reference change carrying identical persisted
+    // content stays a no-op. completedHistoryFingerprint and persistRecentSessions
+    // both filter to results internally, so completedJobs is equivalent to `jobs`
+    // here and persistence behavior is unchanged. (Finding [17].)
+    const fingerprint = completedHistoryFingerprint(completedJobs);
     if (!fingerprint) {
       historyFingerprintRef.current = "";
       return;
@@ -1412,9 +1488,9 @@ export function useTruePeakAnalyzer(
     }
 
     historyFingerprintRef.current = fingerprint;
-    persistRecentSessions(jobs);
+    persistRecentSessions(completedJobs);
     setRecentSessions(loadRecentSessions());
-  }, [jobs, persistHistory]);
+  }, [completedJobs, persistHistory]);
 
   useEffect(() => {
     if (analysisBlocked) {
@@ -1444,11 +1520,13 @@ export function useTruePeakAnalyzer(
         assertSourceWithinBudget(file.size, budget);
 
         // FLAC STREAMINFO, WAV fmt/data headers, and AIFF COMM/SSND all live
-        // near the start, so a bounded header slice is enough; the inspector
-        // validates declared payload bounds against the real file size. Truly
-        // opaque sources (MP3, AAC and friends) stay unknown and reserve the
-        // conservative per-job peak instead. A header that lies about its
-        // footprint is caught after decode, where the actual buffers exceed
+        // near the start, so a bounded header slice is enough. For uncompressed
+        // WAV/AIFF the inspector bounds the declared payload against the real
+        // file size; FLAC is compressed, so its declared length is corroborated
+        // against the file size below before it is trusted for concurrency.
+        // Truly opaque sources (MP3, AAC and friends) stay unknown and reserve
+        // the conservative per-job peak instead. A header that still lies about
+        // its footprint is caught after decode, where the actual buffers exceed
         // the planned reservation and the job falls back to the conservative
         // exclusive posture.
         const preflightBytes =
@@ -1457,17 +1535,37 @@ export function useTruePeakAnalyzer(
             : Math.min(file.size, 256 * 1024);
         const header = await file.slice(0, preflightBytes).arrayBuffer();
         const metadata = inspectAudioContainer(header, file.size);
-        const plan: JobResourcePlan = metadata
-          ? {
-              kind: "known",
-              decodedBytes: assertDecodedFootprint(
-                metadata,
-                budget,
-                "Container preflight",
-              ).decodedBytes,
-              trustedNative: metadata.nativeDecodeSafe,
-            }
-          : { kind: "unknown" };
+        let plan: JobResourcePlan;
+        if (metadata) {
+          const decodedBytes = assertDecodedFootprint(
+            metadata,
+            budget,
+            "Container preflight",
+          ).decodedBytes;
+          // FLAC is the only compressed container admitted on the strength of
+          // its declared footprint, and the browser codec decodes every frame
+          // present regardless of the STREAMINFO sample count. An under-declared
+          // header would hand admission a peak reservation far below the real
+          // decode, so several such files could decode at once and breach the
+          // aggregate peak cap before the post-decode footprint check fires
+          // (WAV/AIFF cannot: their declared payload is already bounded by the
+          // real file size and the decoder reads exactly that uncompressed
+          // chunk). When a FLAC footprint is too small to account for the file's
+          // bytes, treat the source as opaque (conservative, and exclusive when
+          // large) rather than trusting the declared length for concurrency.
+          const footprintTrusted =
+            metadata.container !== "flac" ||
+            declaredDecodeCorroboratedByFileSize(decodedBytes, file.size);
+          plan = footprintTrusted
+            ? {
+                kind: "known",
+                decodedBytes,
+                trustedNative: metadata.nativeDecodeSafe,
+              }
+            : { kind: "unknown" };
+        } else {
+          plan = { kind: "unknown" };
+        }
 
         if (
           filesRef.current.get(jobId) === file &&
@@ -1552,19 +1650,47 @@ export function useTruePeakAnalyzer(
             candidate !== lane && candidate.lease !== null,
         )
       ) {
+        // Contention, not an over-budget condition: another lease is still
+        // active, so the exclusive reservation cannot be taken yet. This state
+        // clears as the batch drains, so it is retryable — runJob catches it and
+        // requeues the job instead of failing it.
         throw new DecodeResourceError(
-          "decoded-budget-exceeded",
-          "The fallback decoder needs an exclusive peak-memory reservation, but another decode is still active. Retry after the current batch advances.",
+          "decoder-busy",
+          "Waiting for the current batch to finish so this file can reserve exclusive decode memory.",
+          true,
         );
       }
 
       const reservation = lease.reservation;
-      const nextTotal = growDecodePeakReservation(
-        reservedPeakBytesRef.current,
-        reservation.peakBytes,
-        requiredPeakBytes,
-        aggregatePeakBytesRef.current,
-      );
+      let nextTotal: number;
+      try {
+        nextTotal = growDecodePeakReservation(
+          reservedPeakBytesRef.current,
+          reservation.peakBytes,
+          requiredPeakBytes,
+          aggregatePeakBytesRef.current,
+        );
+      } catch (error) {
+        // Separate a momentarily full aggregate (transient: this reservation
+        // would fit an otherwise-empty batch, so wait and retry) from a route
+        // that can never fit the aggregate at all (permanent over-budget). Only
+        // the former becomes a retryable requeue.
+        if (
+          error instanceof DecodeResourceError &&
+          error.code === "decoded-budget-exceeded" &&
+          classifyReservationContention(
+            requiredPeakBytes,
+            aggregatePeakBytesRef.current,
+          ) === "retryable"
+        ) {
+          throw new DecodeResourceError(
+            "decoder-busy",
+            "Waiting for decode memory to free up before this file can continue.",
+            true,
+          );
+        }
+        throw error;
+      }
 
       // All validation happens above. Mutate the aggregate and its lease as one
       // synchronous step so no route can begin between the capacity check and
@@ -1884,33 +2010,219 @@ export function useTruePeakAnalyzer(
           (currentDecodePreference === "auto" &&
             shouldPreferBrowserDecoder(file.name, mimeType));
 
-        if (browserFirst) {
-          growLeasePeakReservation(
-            lane,
-            lease,
-            conservativeDecodePeakBytes(decodeBudgetRef.current),
-            true,
+        // A job that was requeued after reservation contention carries a pinned
+        // single route it must run this time, plus the reservation it was
+        // re-admitted under. Non-escalated plans keep the usual
+        // browser-first/native ordering and fallback chains.
+        const activePlan = resourcePlansRef.current.get(jobId);
+        const escalatedRoute =
+          activePlan?.kind === "escalated" ? activePlan.route : null;
+
+        // Flip a contended job back to "queued" so the scheduler re-admits it
+        // once the batch frees the memory it needs, recording the reservation,
+        // exclusivity and route the retry must use. Returns "failed" only when
+        // the requeue cap trips (belt-and-braces: an escalated re-admission
+        // already holds its reservation before runJob starts, so a second
+        // same-or-lower requeue should be unreachable).
+        const requeueForContention = (
+          reservationPeakBytes: number,
+          exclusive: boolean,
+          route: "browser-only" | "compatibility-only",
+        ): "requeued" | "failed" | "stale" => {
+          // Guard the plan mutation on run-currency itself rather than trusting
+          // that no caller ever awaits between its last leaseIsCurrent check and
+          // this call. If a concurrent cancel/remove/retry has invalidated the
+          // run token or handed the lane to a newer job, a stale requeue must
+          // not resurrect a resource plan for a job that has moved on (retryJob
+          // and removeJob delete the plan; overwriting it here would leak an
+          // escalated plan or clobber a fresh preflight).
+          if (!isJobRunCurrent(jobId, runToken) || lane.lease !== lease) {
+            return "stale";
+          }
+
+          const priorPlan = resourcePlansRef.current.get(jobId);
+          const priorEscalations =
+            priorPlan?.kind === "escalated" ? priorPlan.escalations : 0;
+          const carriedDecodedBytes =
+            priorPlan?.kind === "known"
+              ? priorPlan.decodedBytes
+              : priorPlan?.kind === "escalated"
+                ? priorPlan.decodedBytes
+                : null;
+
+          if (
+            priorPlan?.kind === "escalated" &&
+            reservationPeakBytes <= priorPlan.reservationPeakBytes &&
+            (!exclusive || priorPlan.exclusive)
+          ) {
+            updateJobIfRunCurrent(jobId, runToken, (job) => ({
+              ...job,
+              status: "failed",
+              error:
+                "TruePeak could not reserve enough memory to analyze this file alongside the rest of the batch. Remove some files or retry once the batch finishes.",
+              progressLabel: "Failed",
+              progressPercent: 1,
+              finishedAtMs: Date.now(),
+            }));
+            return "failed";
+          }
+
+          resourcePlansRef.current.set(jobId, {
+            kind: "escalated",
+            reservationPeakBytes,
+            exclusive,
+            route,
+            decodedBytes: carriedDecodedBytes,
+            escalations: priorEscalations + 1,
+          });
+          updateJobIfRunCurrent(jobId, runToken, (job) => ({
+            ...job,
+            status: "queued",
+            progressPercent: 0,
+            progressLabel: "Waiting for memory reservation",
+            error: undefined,
+            startedAtMs: undefined,
+            finishedAtMs: undefined,
+          }));
+          return "requeued";
+        };
+
+        // Grow the lease reservation for a fallback/true-up route. Returns true
+        // when runJob must stop: transient contention requeued the job, or the
+        // requeue cap failed it. A retryable decoder-busy is handled HERE and
+        // never propagates into the decode fallback chains, so it can never be
+        // swallowed by canTryAlternateDecoder. Any other error propagates
+        // unchanged (a stale lease is caught by the outer leaseIsCurrent gate).
+        const escalateReservationOrBail = (
+          reservationPeakBytes: number,
+          exclusive: boolean,
+          route: "browser-only" | "compatibility-only",
+        ): boolean => {
+          try {
+            growLeasePeakReservation(lane, lease, reservationPeakBytes, exclusive);
+            return false;
+          } catch (error) {
+            if (
+              error instanceof DecodeResourceError &&
+              error.code === "decoder-busy"
+            ) {
+              requeueForContention(reservationPeakBytes, exclusive, route);
+              return true;
+            }
+            throw error;
+          }
+        };
+
+        // Every browser decode holds a window slot for the duration of the
+        // decode call, so at most `capacity` untrusted decodeAudioData
+        // allocations run at once (capacity x browser peak <= aggregate cap by
+        // construction). This is orthogonal to the byte reservations: those
+        // bound retained memory, this bounds the concurrent transient decode
+        // allocation, which an under-declared header could otherwise slip past
+        // admission. The lease's abort signal is passed so a cancel/remove
+        // while waiting leaves the FIFO queue WITHOUT leaking a slot or a
+        // waiter. The slot is released in a finally AFTER the decode promise
+        // settles: like waitForBrowserDecodeDrain, the un-abortable browser
+        // decode may still be draining, and its transient memory is only surely
+        // freed once the wrapper resolves or rejects. Unlike a reservation
+        // contention this wait never requeues and cannot deadlock: a slot is
+        // ALWAYS freed eventually because the browser decode either settles or,
+        // if its promise never settles, is abandoned by the bounded post-abort
+        // drain grace in waitForBrowserDecodeDrain (a terminal
+        // BrowserDecodeDrainTimeoutError). On that rare zombie path the slot is
+        // still freed by the finally and the lane is retired below so the
+        // still-draining decode never overlaps a future job.
+        const browserDecodeWindow = browserDecodeWindowRef.current;
+        const decodeInBrowserWindow = async (
+          primaryError: string | undefined,
+          decodingLabel: string,
+          decodingProgress: number,
+        ): Promise<DecodedAudioTransfer> => {
+          // Surface the waiting label only while the window is actually full so
+          // an uncontended decode does not flash it. The check and the acquire
+          // run with no await between them, so this branch matches what acquire
+          // then does (grab immediately vs. queue).
+          if (browserDecodeWindow.available <= 0) {
+            updateJobIfRunCurrent(jobId, runToken, (job) => ({
+              ...job,
+              status: "decoding",
+              progressLabel: "Waiting for a browser decode slot",
+            }));
+          }
+          const releaseSlot = await browserDecodeWindow.acquire(
+            lease.browserAbortController.signal,
           );
+          try {
+            // Each browser decode/fallback restarts its own 0..1 scale, so the
+            // decode checkpoint is set directly (as before the window wrap), not
+            // clamped to a possibly-higher value left by a failed prior route.
+            updateJobIfRunCurrent(jobId, runToken, (job) => ({
+              ...job,
+              status: "decoding",
+              progressPercent: decodingProgress,
+              progressLabel: decodingLabel,
+            }));
+            browserDecodeHeartbeat = startBrowserDecodeHeartbeat(jobId, runToken);
+            return await decodeAudioFileInBrowser(file, primaryError, undefined, {
+              signal: lease.browserAbortController.signal,
+              budget: decodeBudgetRef.current,
+            });
+          } catch (error) {
+            // A browser decode whose post-abort drain grace expired may still be
+            // running on the main thread (decodeAudioData is unabortable). Retire
+            // this lane so no future job shares it — or the transient memory the
+            // zombie decode may still hold. Marked here, not in the outer catch,
+            // because a user cancel takes an early-return path that skips the
+            // outer catch; the slot is freed by the finally below in every case.
+            // (Finding [3].)
+            if (isBrowserDecodeDrainTimeout(error)) {
+              lane.retireAfterRelease = true;
+            }
+            throw error;
+          } finally {
+            releaseSlot();
+          }
+        };
+
+        if (escalatedRoute === "browser-only") {
+          // Re-admitted under an escalated plan: run only the browser decoder,
+          // under the reservation this run already holds. No fallback.
+          decoded = await decodeInBrowserWindow(
+            undefined,
+            "Decoding locally",
+            0.16,
+          );
+          decodedByBrowser = true;
+        } else if (escalatedRoute === "compatibility-only") {
+          // Re-admitted under an escalated plan: run only the compatibility
+          // decoder, under the reservation this run already holds. No fallback.
           updateJobIfRunCurrent(jobId, runToken, (job) => ({
             ...job,
             status: "decoding",
             progressPercent: 0.16,
-            progressLabel:
+            progressLabel: "Decoding with the compatibility decoder",
+          }));
+          const workerResult = await decodeInWorker(lane, lease, file, mimeType);
+          decoded = workerResult.asset;
+          workerUsage = workerResult.usage;
+          decodedByBrowser = false;
+        } else if (browserFirst) {
+          // Admission already reserved the browser-route peak for this job (2x
+          // decoded bytes for a known footprint, the conservative peak for an
+          // unknown one), so the browser decode proceeds under that reservation
+          // directly. The window slot (acquired inside decodeInBrowserWindow)
+          // is held only for the browser decode and released before the compat
+          // fallback below, so a failed browser attempt never keeps a slot from
+          // the compatibility route. Post-decode validateDecodedAssetForLease
+          // trues up the actual peak and escalates only if the decode exceeded
+          // its plan.
+          try {
+            decoded = await decodeInBrowserWindow(
+              undefined,
               currentDecodePreference === "browser-first"
                 ? "Using browser decoder preference"
                 : "Trying browser decoder first",
-          }));
-          browserDecodeHeartbeat = startBrowserDecodeHeartbeat(jobId, runToken);
-
-          try {
-            decoded = await decodeAudioFileInBrowser(
-              file,
-              undefined,
-              undefined,
-              {
-                signal: lease.browserAbortController.signal,
-                budget: decodeBudgetRef.current,
-              },
+              0.16,
             );
             decodedByBrowser = true;
           } catch (browserError) {
@@ -1926,6 +2238,22 @@ export function useTruePeakAnalyzer(
               browserError instanceof Error
                 ? browserError.message
                 : "The browser decoder could not read this file.";
+
+            // FFmpeg working memory is not modeled per file, so the
+            // compatibility route needs the conservative per-job reservation
+            // (but NOT exclusivity — the aggregate cap decides how many
+            // conservative routes coexist). Grow it BEFORE decoding and OUTSIDE
+            // the compat try/catch below, so a retryable contention requeues the
+            // job rather than being swallowed into another decode attempt.
+            if (
+              escalateReservationOrBail(
+                conservativeDecodePeakBytes(decodeBudgetRef.current),
+                false,
+                "compatibility-only",
+              )
+            ) {
+              return;
+            }
 
             updateJobIfRunCurrent(jobId, runToken, (job) => ({
               ...job,
@@ -1975,38 +2303,34 @@ export function useTruePeakAnalyzer(
               throw decodeError;
             }
 
-            // The native route had a smaller checked reservation. Promote it
-            // atomically to the conservative exclusive peak before invoking a
-            // browser fallback that will allocate AudioBuffer + planar PCM.
-            growLeasePeakReservation(
-              lane,
-              lease,
-              conservativeDecodePeakBytes(decodeBudgetRef.current),
-              true,
-            );
+            // The native route had a smaller checked reservation. Grow it to the
+            // conservative peak (NON-exclusive — native decode failing means the
+            // header may not be trustworthy, but the aggregate cap still governs
+            // how many conservative routes coexist) before the browser fallback
+            // allocates AudioBuffer + planar PCM. Post-decode validation still
+            // catches actual exceedance. Done OUTSIDE the browser try/catch below
+            // so a retryable contention requeues instead of chaining into
+            // another decode attempt.
+            if (
+              escalateReservationOrBail(
+                conservativeDecodePeakBytes(decodeBudgetRef.current),
+                false,
+                "browser-only",
+              )
+            ) {
+              return;
+            }
 
             const primaryMessage =
               decodeError instanceof Error
                 ? decodeError.message
                 : "The primary decoder could not read this file.";
 
-            updateJobIfRunCurrent(jobId, runToken, (job) => ({
-              ...job,
-              status: "decoding",
-              progressPercent: 0.78,
-              progressLabel: "Trying browser decoder fallback",
-            }));
-
             try {
-              browserDecodeHeartbeat = startBrowserDecodeHeartbeat(jobId, runToken);
-              decoded = await decodeAudioFileInBrowser(
-                file,
+              decoded = await decodeInBrowserWindow(
                 primaryMessage,
-                undefined,
-                {
-                  signal: lease.browserAbortController.signal,
-                  budget: decodeBudgetRef.current,
-                },
+                "Trying browser decoder fallback",
+                0.78,
               );
               decodedByBrowser = true;
             } catch (fallbackError) {
@@ -2032,13 +2356,35 @@ export function useTruePeakAnalyzer(
         if (!leaseIsCurrent()) {
           return;
         }
-        validateDecodedAssetForLease(
-          lane,
-          lease,
-          decoded,
-          workerUsage,
-          decodedByBrowser,
-        );
+        try {
+          validateDecodedAssetForLease(
+            lane,
+            lease,
+            decoded,
+            workerUsage,
+            decodedByBrowser,
+          );
+        } catch (error) {
+          // A header that lied about its footprint makes the decode exceed its
+          // plan; validateDecodedAssetForLease escalates to the conservative
+          // exclusive posture. If that escalation hits contention, requeue the
+          // job pinned to the route that just decoded so it re-runs alone once
+          // the batch drains (the decoded buffers are discarded and re-decoded).
+          // Genuine budget violations are not decoder-busy and propagate to the
+          // failure handler unchanged.
+          if (
+            error instanceof DecodeResourceError &&
+            error.code === "decoder-busy"
+          ) {
+            requeueForContention(
+              conservativeDecodePeakBytes(decodeBudgetRef.current),
+              true,
+              decodedByBrowser ? "browser-only" : "compatibility-only",
+            );
+            return;
+          }
+          throw error;
+        }
 
         updateJobIfRunCurrent(jobId, runToken, (job) => ({
           ...job,
@@ -2222,29 +2568,42 @@ export function useTruePeakAnalyzer(
 
       const settings = settingsRef.current;
       const mimeType = file.type || "application/octet-stream";
-      const browserFirst =
-        settings.decodePreference === "browser-first" ||
-        (settings.decodePreference === "auto" &&
-          shouldPreferBrowserDecoder(file.name, mimeType));
-      const admission = planLaneAdmission({
-        fileSizeBytes: file.size,
-        heavyFileBytes: heavyFileBytesRef.current,
-        browserFirst,
-        plan,
-        budget: decodeBudgetRef.current,
-      });
-      const exclusive = admission.exclusive;
+      // A job requeued after reservation contention carries the exact
+      // reservation and exclusivity it must be re-admitted under; use those
+      // directly and bypass the preflight admission model. Everything else
+      // plans admission from its known/unknown footprint as usual.
+      let reservationPeakBytes: number;
+      let exclusive: boolean;
+      if (plan.kind === "escalated") {
+        reservationPeakBytes = plan.reservationPeakBytes;
+        exclusive = plan.exclusive;
+      } else {
+        const browserFirst =
+          settings.decodePreference === "browser-first" ||
+          (settings.decodePreference === "auto" &&
+            shouldPreferBrowserDecoder(file.name, mimeType));
+        const admission = planLaneAdmission({
+          fileSizeBytes: file.size,
+          heavyFileBytes: heavyFileBytesRef.current,
+          browserFirst,
+          plan,
+          budget: decodeBudgetRef.current,
+        });
+        reservationPeakBytes = admission.reservationPeakBytes;
+        exclusive = admission.exclusive;
+      }
+
       if (
         exclusive &&
         lanesRef.current.some((lane) => lane.lease !== null)
       ) {
-        // Heavy files drain the batch and run alone. Stopping the scan here is
-        // deliberate: admitting later jobs past a waiting heavy file would
-        // starve it, because lanes might never all be idle at once again.
+        // Heavy files (and requeued exclusive escalations) drain the batch and
+        // run alone. Stopping the scan here is deliberate: admitting later jobs
+        // past a waiting exclusive job would starve it, because lanes might
+        // never all be idle at once again.
         break;
       }
 
-      const reservationPeakBytes = admission.reservationPeakBytes;
       let nextReservedPeakBytes: number;
       try {
         nextReservedPeakBytes = growDecodePeakReservation(

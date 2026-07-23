@@ -33,6 +33,18 @@ export const INVALID_INTEGRATED_BELOW_GATE_WARNING =
 export const LRA_UNSTABLE_WARNING =
   "Programme is shorter than 60 s; Loudness Range is not statistically stable (EBU Tech 3341 §2.4).";
 
+// ITU-R BS.1770 defines K-weighting against a 48 kHz reference. Below ~24 kHz
+// the tan-prewarped bilinear re-derivation steepens the high-shelf transition
+// near Nyquist, so K-weighted loudness (integrated/momentary/short-term) reads
+// progressively hotter than the same programme at 48 kHz: up to ~0.4 LU at
+// 8 kHz with strong top-octave energy, ~0.08 LU by 22.05 kHz, and under
+// ~0.01 LU at 44.1/48 kHz. Surfaced as a warning so a low-rate reading is not
+// presented as an exact standards match; rates used for loudness-compliant
+// delivery (44.1/48 kHz and above) never cross the threshold.
+export const LOW_SAMPLE_RATE_KWEIGHTING_THRESHOLD = 24000;
+export const LOW_SAMPLE_RATE_KWEIGHTING_WARNING =
+  "Sample rate is below 24 kHz; K-weighted loudness can read up to ~0.4 LU high versus the 48 kHz ITU-R BS.1770 reference near Nyquist.";
+
 const TRUE_PEAK_FIR = [
   [0.001708984375, 0.010986328125, -0.0196533203125, 0.033203125, -0.0594482421875, 0.1373291015625, 0.97216796875, -0.102294921875, 0.047607421875, -0.026611328125, 0.014892578125, -0.00830078125],
   [-0.0291748046875, 0.029296875, -0.0517578125, 0.089111328125, -0.16650390625, 0.465087890625, 0.77978515625, -0.2003173828125, 0.1015625, -0.0582275390625, 0.0330810546875, -0.0189208984375],
@@ -638,6 +650,12 @@ export function analyzeDecodedAsset(
   }
   if (loudnessRangeUnstable) {
     warnings.push(LRA_UNSTABLE_WARNING);
+  }
+  // Documented low-rate limitation: the K-weighting response diverges from the
+  // 48 kHz reference near Nyquist below ~24 kHz. Warn rather than silently
+  // presenting a hotter-than-reference reading as an exact standards match.
+  if (asset.sampleRate < LOW_SAMPLE_RATE_KWEIGHTING_THRESHOLD) {
+    warnings.push(LOW_SAMPLE_RATE_KWEIGHTING_WARNING);
   }
 
   const baseMetrics: LoudnessMetrics = {

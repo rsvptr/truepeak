@@ -12,6 +12,7 @@ register("./alias-loader.mjs", import.meta.url);
 
 const P = await import("../../src/audio/presets.ts");
 const { getComplianceSummary } = await import("../../src/audio/compliance.ts");
+const { applyTargetToMetrics } = await import("../../src/audio/targeting.ts");
 
 const {
   CUSTOM_PRESET_ID,
@@ -62,6 +63,36 @@ function resultWithTarget(target, integratedLufs) {
       integratedValid: true,
       normalizationLimited: false,
     },
+  };
+}
+
+// Build a targeted result whose target-derived metrics (targetDeltaDb,
+// normalizationLimited, projectedTruePeakDbtp) come from the REAL targeting
+// engine, so the compliance verdict is exercised against production wiring
+// rather than hand-set flags. `truePeakDbtp` is the measured true peak.
+function targetedResult(target, integratedLufs, truePeakDbtp) {
+  const baseMetrics = {
+    integratedLufs,
+    integratedValid: true,
+    ungatedLufs: integratedLufs,
+    loudnessRange: 5,
+    maxMomentaryLufs: integratedLufs + 2,
+    maxShortTermLufs: integratedLufs + 1,
+    samplePeakDbfs: truePeakDbtp - 0.1,
+    truePeakDbtp,
+    unclampedTargetDeltaDb: null,
+    targetDeltaDb: null,
+    projectedTruePeakDbtp: null,
+    normalizationLimited: false,
+    timeline: { stepDurationSeconds: 0.1, timeSeconds: [], momentaryLufs: [], shortTermLufs: [], truePeakDbtp: [] },
+    warnings: [],
+  };
+  return {
+    analysisMode: "targeted",
+    target,
+    analyzedAt: "2026-07-19T00:00:00.000Z",
+    metadata: { fileName: "probe.wav" },
+    metrics: applyTargetToMetrics(baseMetrics, target),
   };
 }
 
@@ -128,6 +159,63 @@ console.log("\n[A2] UX-001 — the selected tolerance drives the compliance wind
   const atsc = resolveActiveTarget(atscState.committed);
   const atscDelta = getComplianceSummary(resultWithTarget(atsc, atsc.loudnessTargetLufs + 1.5));
   check("ATSC 2 LU: +1.5 delta IS on-target", atscDelta && atscDelta.state === "on-target", atscDelta && atscDelta.state);
+}
+
+// ---------------------------------------------------------------------------
+console.log("\n[A3] Compliance verdict = WORST of loudness-vs-tolerance and true-peak-vs-ceiling");
+// A true-peak ceiling breach must never hide behind an on-target loudness read.
+{
+  const spotifyNormal = TARGET_PRESETS.find((p) => p.id === "spotify-normal"); // -14 / -1 / tol 1, protect-true-peak
+  const spotifyLoud = TARGET_PRESETS.find((p) => p.id === "spotify-loud"); // -11 / -1 / tol 1, loudness-first
+
+  // Acceptance repro (finding [1]): loudness inside tolerance (-14.2 vs -14, tol 1)
+  // but the measured true peak (-0.3) is over the -1 ceiling. Must NOT read compliant.
+  const hotMaster = targetedResult(spotifyNormal, -14.2, -0.3);
+  const hotSummary = getComplianceSummary(hotMaster);
+  check("hot master: engine flags normalizationLimited", hotMaster.metrics.normalizationLimited === true);
+  check("loudness-pass + TP-over-ceiling is NOT on-target (acceptance repro)", hotSummary?.state !== "on-target", hotSummary?.state);
+  check("loudness-pass + TP-over-ceiling reads ceiling-limited", hotSummary?.state === "ceiling-limited", hotSummary?.state);
+
+  // Raw-peak axis is independent of normalizationLimited: a slightly-hot-but-in-tolerance
+  // file (-13.8) whose peak (-0.9) is over -1 has normalizationLimited === false
+  // (attenuating to exact target would clear it), yet its measured peak is still over
+  // the ceiling, so it must read ceiling-limited.
+  const inTolHotPeak = targetedResult(spotifyNormal, -13.8, -0.9);
+  const inTolSummary = getComplianceSummary(inTolHotPeak);
+  check("in-tolerance-over-ceiling: normalizationLimited=false", inTolHotPeak.metrics.normalizationLimited === false);
+  check("in-tolerance file with raw peak over ceiling reads ceiling-limited", inTolSummary?.state === "ceiling-limited", inTolSummary?.state);
+
+  // Boundary: exactly at the ceiling is compliant; a hair over is not.
+  const atCeiling = getComplianceSummary(targetedResult(spotifyNormal, -14, -1));
+  check("true peak EXACTLY at the ceiling (on target) reads on-target", atCeiling?.state === "on-target", atCeiling?.state);
+  const overCeiling = getComplianceSummary(targetedResult(spotifyNormal, -14, -0.99));
+  check("true peak a hair over the ceiling (on target) reads ceiling-limited", overCeiling?.state === "ceiling-limited", overCeiling?.state);
+
+  // Control: on target and comfortably under the ceiling stays on-target (the fix must
+  // not turn every targeted file ceiling-limited).
+  const underCeiling = getComplianceSummary(targetedResult(spotifyNormal, -14, -3));
+  check("on target + peak well under ceiling stays on-target", underCeiling?.state === "on-target", underCeiling?.state);
+
+  // No hijack: an out-of-tolerance too-hot file whose peak is over the ceiling keeps its
+  // actionable above-target verdict (attenuating to target also clears the peak).
+  const tooHot = targetedResult(spotifyNormal, -8, -0.2);
+  const tooHotSummary = getComplianceSummary(tooHot);
+  check("too-hot-over-ceiling: normalizationLimited=false", tooHot.metrics.normalizationLimited === false);
+  check("out-of-tolerance too-hot file stays above-target (no ceiling hijack)", tooHotSummary?.state === "above-target", tooHotSummary?.state);
+
+  // Preserved: an out-of-tolerance quiet file that cannot be normalized up without
+  // breaching the ceiling stays ceiling-limited (existing normalizationLimited path).
+  const quietCapped = targetedResult(spotifyNormal, -20, -0.5);
+  const quietSummary = getComplianceSummary(quietCapped);
+  check("quiet-but-capped: normalizationLimited=true", quietCapped.metrics.normalizationLimited === true);
+  check("out-of-tolerance quiet-but-capped file reads ceiling-limited", quietSummary?.state === "ceiling-limited", quietSummary?.state);
+
+  // loudness-first policy never sets normalizationLimited, so the raw-peak axis is the
+  // ONLY thing that can surface an on-target-loudness ceiling breach here.
+  const loudFirst = targetedResult(spotifyLoud, -11.5, -0.5);
+  const loudFirstSummary = getComplianceSummary(loudFirst);
+  check("loudness-first leaves normalizationLimited=false", loudFirst.metrics.normalizationLimited === false);
+  check("loudness-first on-target-loudness with peak over ceiling reads ceiling-limited", loudFirstSummary?.state === "ceiling-limited", loudFirstSummary?.state);
 }
 
 // ---------------------------------------------------------------------------
