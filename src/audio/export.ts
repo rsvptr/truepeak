@@ -142,7 +142,9 @@ function markdownEscape(value: string): string {
 }
 
 export function getExportFileName(format: ExportFormat) {
-  const base = `${EXPORT_BASENAME}-${fileNameTimestamp()}`;
+  // Scope per format: a CSV and a JSON export in the same second differ by
+  // extension already, so only same-format repeats need a discriminator.
+  const base = `${EXPORT_BASENAME}-${fileNameTimestamp(`analysis-${format}`)}`;
   switch (format) {
     case "csv":
       return `${base}.csv`;

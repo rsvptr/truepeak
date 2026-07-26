@@ -59,7 +59,7 @@ import { DEFAULT_TARGET_PRESET } from "@/audio/presets";
 import { mergeImportedJobs, reconcileSessionJobs } from "@/audio/session-reconciliation";
 import { retargetAnalysisResult } from "@/audio/targeting";
 import { getCompletedAnalysisJobs, isActiveJob, isIssueJob } from "@/lib/session-selectors";
-import { makeId } from "@/lib/utils";
+import { downloadTextFile, makeId } from "@/lib/utils";
 import { fileIdentityKey } from "@/lib/file-identity";
 import type { ParallelLanesPreference } from "@/lib/workspace-preferences";
 import type {
@@ -156,6 +156,18 @@ class WorkerTransportError extends Error {
 // After this many consecutive worker failures the lane retires and the worker
 // circuit remains open until the user explicitly queues or retries work.
 const MAX_LANE_FAILURE_STREAK = 3;
+
+// One shape for a cancelled row, applied both to jobsRef (synchronously) and
+// through setJobs, so the two can never describe the row differently.
+function markJobCanceled(job: AnalysisJob): AnalysisJob {
+  return {
+    ...job,
+    status: "canceled",
+    progressPercent: 1,
+    progressLabel: "Canceled",
+    error: undefined,
+  };
+}
 
 // Where analysis begins on the job's overall progress bar (read+decode owns
 // everything before it). Analyzer worker fractions are mapped above this.
@@ -353,31 +365,6 @@ interface AnalyzerSettings {
   target: TargetPreset | null;
 }
 
-function downloadTextFile(fileName: string, content: string, contentType: string) {
-  let url: string | null = null;
-  let anchor: HTMLAnchorElement | null = null;
-
-  try {
-    const blob = new Blob([content], { type: contentType });
-    url = URL.createObjectURL(blob);
-    anchor = document.createElement("a");
-    anchor.href = url;
-    anchor.download = fileName;
-    anchor.style.display = "none";
-    document.body.appendChild(anchor);
-    anchor.click();
-  } finally {
-    const targetUrl = url;
-    const targetAnchor = anchor;
-    window.setTimeout(() => {
-      targetAnchor?.remove();
-      if (targetUrl) {
-        URL.revokeObjectURL(targetUrl);
-      }
-    }, 0);
-  }
-}
-
 function normalizeDecodeFailure(message: string, decodePreference: DecodePreference) {
   const lower = message.toLowerCase();
 
@@ -571,6 +558,10 @@ export function useTruePeakAnalyzer(
   );
   const reservedPeakBytesRef = useRef(0);
   const resourcePlansRef = useRef(new Map<string, JobResourcePlan>());
+  // How many preflights are in flight right now. Maintained alongside the
+  // "preparing" entries in resourcePlansRef so fillLanes can read the pool size
+  // in O(1) instead of scanning the whole map once per unplanned job.
+  const preparingPlanCountRef = useRef(0);
   const idleTeardownRef = useRef<number | null>(null);
   const laneByJobRef = useRef(new Map<string, WorkerLane>());
   const heavyJobActiveRef = useRef<string | null>(null);
@@ -584,6 +575,11 @@ export function useTruePeakAnalyzer(
   // id -> analyzedAt of results already written to the live-session store.
   const persistedResultsRef = useRef(new Map<string, string>());
   const didRestoreRef = useRef(false);
+  // False until the live-session restore has settled (committed, empty, or
+  // failed). Consumers that reconcile URL state against `jobs` must wait for it,
+  // because `jobs` is empty on the first client commit and the restore is an
+  // async IndexedDB round trip it can never win.
+  const [restoreSettled, setRestoreSettled] = useState(false);
   // Bumped by clearSession so a restore still resolving from IndexedDB cannot
   // resurrect rows into a session the user just cleared.
   const restoreGenerationRef = useRef(0);
@@ -1271,6 +1267,20 @@ export function useTruePeakAnalyzer(
       persistenceFailureEpochRef.current += 1;
       setPersistenceIssue(message);
       pushNotice(message);
+    }).finally(() => {
+      // Settled means "the restore has had its chance", success or not. Callers
+      // that prune URL state against the job list have to wait for this: on the
+      // first client commit `jobs` is always empty, so pruning then strips
+      // ?job/?drawer/?reference for rows the restore is about to add back under
+      // their original ids.
+      //
+      // Deliberately NOT gated on `cancelled`. didRestoreRef makes this a
+      // once-per-mount read, so if an effect re-run were ever to cancel this
+      // instance (React StrictMode's double invoke, were it enabled) no later
+      // instance would issue another read, and a cancelled latch would leave
+      // pruning disabled for the rest of the session. The flag is one-way and
+      // only enables work, so setting it late is harmless.
+      setRestoreSettled(true);
     });
 
     return () => {
@@ -1515,6 +1525,7 @@ export function useTruePeakAnalyzer(
       }
 
       resourcePlansRef.current.set(jobId, { kind: "preparing" });
+      preparingPlanCountRef.current += 1;
       try {
         const budget = decodeBudgetRef.current;
         assertSourceWithinBudget(file.size, budget);
@@ -1597,6 +1608,7 @@ export function useTruePeakAnalyzer(
           );
         }
       } finally {
+        preparingPlanCountRef.current = Math.max(0, preparingPlanCountRef.current - 1);
         fillLanesRef.current();
       }
     },
@@ -1990,6 +2002,20 @@ export function useTruePeakAnalyzer(
           browserDecodeHeartbeat = null;
         }
       };
+
+      // Defence in depth, not the fix for the stale-admission race: fillLanes
+      // mints this lease's run token immediately before calling runJob, so on
+      // every current path the gate passes. What actually stops a cancelled job
+      // being admitted is cancelJob/cancelActiveJobs writing the cancel into
+      // jobsRef synchronously. This gate is what keeps that guarantee cheap to
+      // hold: any future caller that hands runJob a lease built from a stale
+      // view releases here instead of reading and fully decoding the file, and
+      // every other leaseIsCurrent check sits past the decode.
+      if (!leaseIsCurrent()) {
+        releaseLane(lane, lease, false);
+        fillLanesRef.current();
+        return;
+      }
 
       try {
         updateJobIfRunCurrent(jobId, runToken, (job) => ({
@@ -2553,10 +2579,11 @@ export function useTruePeakAnalyzer(
         // finished preflight re-runs fillLanes, so pending jobs are retried
         // promptly and in queue order.
         if (!plan) {
-          const preparingCount = [...resourcePlansRef.current.values()].filter(
-            (candidate) => candidate.kind === "preparing",
-          ).length;
-          if (preparingCount < 4) {
+          // Counted incrementally rather than derived by materialising and
+          // filtering the whole plan map. The count is loop-invariant except
+          // where this very loop starts a preflight, so deriving it paid
+          // O(|plans|) per unplanned job and made a single queue scan O(n^2).
+          if (preparingPlanCountRef.current < 4) {
             void prepareResourcePlan(job.id, file);
           }
         }
@@ -2776,18 +2803,24 @@ export function useTruePeakAnalyzer(
 
   const cancelJob = useCallback((jobId: string) => {
     invalidateJobRun(jobId);
+
+    // Mirror the cancel into jobsRef before anything reads it again. React
+    // applies state updaters lazily, so interruptLane's rejection microtasks
+    // (which run releaseLane -> fillLanes) and the fillLanes call below both
+    // observe jobsRef.current in this same tick. With only the setJobs write
+    // they still saw the row as "queued" and admitted it to a lane, minting a
+    // fresh run token that superseded the invalidateJobRun above and decoding a
+    // file the user had just cancelled.
+    jobsRef.current = jobsRef.current.map((job) =>
+      job.id === jobId ? markJobCanceled(job) : job,
+    );
+
     const lane = laneByJobRef.current.get(jobId);
     if (lane) {
       interruptLane(lane, "Job canceled.");
     }
 
-    updateJob(jobId, (job) => ({
-      ...job,
-      status: "canceled",
-      progressPercent: 1,
-      progressLabel: "Canceled",
-      error: undefined,
-    }));
+    updateJob(jobId, markJobCanceled);
     fillLanesRef.current();
   }, [interruptLane, invalidateJobRun, updateJob]);
 
@@ -2801,6 +2834,15 @@ export function useTruePeakAnalyzer(
     }
 
     activeIds.forEach(invalidateJobRun);
+
+    // Same ordering requirement as cancelJob: jobsRef has to show the cancels
+    // before interruptLane runs, because each rejection queues a runJob finally
+    // block that calls releaseLane -> fillLanes, and those microtasks drain
+    // before the setJobs below is ever applied.
+    jobsRef.current = jobsRef.current.map((job) =>
+      activeIds.has(job.id) ? markJobCanceled(job) : job,
+    );
+
     lanesRef.current.forEach((lane) => {
       if (lane.lease !== null && activeIds.has(lane.lease.jobId)) {
         interruptLane(lane, "Jobs canceled.");
@@ -2809,15 +2851,7 @@ export function useTruePeakAnalyzer(
 
     setJobs((current) => {
       const next: AnalysisJob[] = current.map((job) =>
-        activeIds.has(job.id)
-          ? {
-              ...job,
-              status: "canceled",
-              progressPercent: 1,
-              progressLabel: "Canceled",
-              error: undefined,
-            }
-          : job,
+        activeIds.has(job.id) ? markJobCanceled(job) : job,
       );
       jobsRef.current = next;
       return next;
@@ -3105,6 +3139,7 @@ export function useTruePeakAnalyzer(
   return {
     jobs,
     completedJobs,
+    restoreSettled,
     recentSessions,
     notice,
     persistenceIssue,

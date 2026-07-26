@@ -156,7 +156,9 @@ check(
 
 check(
   "session filename is timestamped and keeps the .truepeak.json suffix",
-  /^truepeak-session-\d{8}-\d{6}\.truepeak\.json$/.test(getSessionFileName()),
+  // Same second-resolution stamp as the CSV/JSON/Markdown exports, so a repeat
+  // inside one wall-clock second carries a "-2", "-3", ... discriminator.
+  /^truepeak-session-\d{8}-\d{6}(-\d+)?\.truepeak\.json$/.test(getSessionFileName()),
 );
 
 console.log("\n[B] H-02/Tc fields + legacy v1 compatibility");

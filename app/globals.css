@@ -29,6 +29,22 @@
   --success: #55d59c;
   --warning: #f7b756;
   --info: #6fc3ef;
+  /* Chip fill and border for the semantic tones, written as explicit rgb()
+     with an alpha channel instead of color-mix(). Lightning CSS compiles a
+     color-mix() declaration down to the *solid* token for engines that lack
+     it, which paints tone-coloured text on a tone-coloured chip. Firefox
+     111-112 sit inside this build's declared browser target (Next's default
+     is chrome 111 / edge 111 / firefox 111 / safari 16.4) and only gained
+     color-mix in 113, so that fallback is reachable. */
+  --danger-soft: rgb(255 123 136 / 0.12);
+  --danger-line: rgb(255 123 136 / 0.32);
+  --success-soft: rgb(85 213 156 / 0.12);
+  --success-line: rgb(85 213 156 / 0.32);
+  --warning-soft: rgb(247 183 86 / 0.13);
+  --warning-line: rgb(247 183 86 / 0.34);
+  --info-soft: rgb(111 195 239 / 0.12);
+  --info-line: rgb(111 195 239 / 0.32);
+  --selection-bg: rgb(55 210 190 / 0.24);
   --shadow-elevated: 0 24px 100px rgba(0, 0, 0, 0.34);
   --chart-axis: #95aca8;
   --chart-grid: rgba(160, 194, 187, 0.14);
@@ -54,12 +70,28 @@
   --accent-text: #0c7568;
   /* Light theme's filled controls use white text; lightening the fill on
      hover (as dark theme does) drops white-text contrast to ~3.67:1. Darken
-     instead so hover stays comfortably above 4.5:1. */
-  --accent-hover: color-mix(in srgb, var(--accent-strong) 88%, black 12%);
-  --danger: #bc2740;
-  --success: #11744e;
-  --warning: #8a5a00;
-  --info: #1f6f9e;
+     instead so hover stays comfortably above 4.5:1. Written literally rather
+     than as color-mix(--accent-strong 88%, black 12%) so engines without
+     color-mix get the darkened value instead of falling back to the base. */
+  --accent-hover: #0b675c;
+  /* Each tone doubles as chip text on a 12-13% tint of itself. At the previous
+     values that composite measured 4.07-4.34:1 against --surface-2, under the
+     4.5:1 AA floor for the 11px badge text it carries. These are the smallest
+     darkenings that clear 4.55:1 as chip text on every surface in use and
+     5.4:1 as plain text. */
+  --danger: #b5263e;
+  --success: #106e4a;
+  --warning: #845600;
+  --info: #1d6691;
+  --danger-soft: rgb(181 38 62 / 0.12);
+  --danger-line: rgb(181 38 62 / 0.32);
+  --success-soft: rgb(16 110 74 / 0.12);
+  --success-line: rgb(16 110 74 / 0.32);
+  --warning-soft: rgb(132 86 0 / 0.13);
+  --warning-line: rgb(132 86 0 / 0.34);
+  --info-soft: rgb(29 102 145 / 0.12);
+  --info-line: rgb(29 102 145 / 0.32);
+  --selection-bg: rgb(15 150 132 / 0.24);
   --shadow-elevated: 0 24px 80px rgba(10, 55, 49, 0.13);
   --chart-axis: #55706b;
   --chart-grid: rgba(13, 49, 44, 0.1);
@@ -76,6 +108,13 @@
 html {
   scroll-behavior: smooth;
   background: var(--page-bg);
+  /* The session toolbar is sticky at the top of the scroll root. Without
+     scroll-padding the browser aligns a newly focused element with the viewport
+     top, i.e. underneath the toolbar, which fails WCAG 2.2 SC 2.4.11 on
+     backwards keyboard navigation and on any scrollIntoView. --tp-toolbar-height
+     is published by StudioToolbar from a ResizeObserver; the literal covers the
+     first paint and every screen where the toolbar is not mounted. */
+  scroll-padding-top: calc(var(--tp-toolbar-height, 7rem) + 1rem);
 }
 
 body {
@@ -122,7 +161,7 @@ summary,
 }
 
 ::selection {
-  background: color-mix(in srgb, var(--accent) 24%, transparent);
+  background: var(--selection-bg);
 }
 
 .uplot {
@@ -220,29 +259,32 @@ summary,
   min-height: 100dvh;
 }
 
-/* Semantic status tones — theme-aware so chips stay legible in light *and* dark.
-   Border + soft fill are mixed from the token; text uses the solid token. */
+/* Semantic status tones, theme-aware so chips stay legible in light and dark.
+   Border and fill come from the pre-mixed *-line / *-soft tokens; text uses the
+   solid token. Do not put color-mix() back in here: the compiled fallback for
+   engines without it resolves to the solid token, which makes the text and the
+   chip the same colour. */
 .tone-success {
-  border-color: color-mix(in srgb, var(--success) 32%, transparent);
-  background-color: color-mix(in srgb, var(--success) 12%, transparent);
+  border-color: var(--success-line);
+  background-color: var(--success-soft);
   color: var(--success);
 }
 
 .tone-danger {
-  border-color: color-mix(in srgb, var(--danger) 32%, transparent);
-  background-color: color-mix(in srgb, var(--danger) 12%, transparent);
+  border-color: var(--danger-line);
+  background-color: var(--danger-soft);
   color: var(--danger);
 }
 
 .tone-warning {
-  border-color: color-mix(in srgb, var(--warning) 34%, transparent);
-  background-color: color-mix(in srgb, var(--warning) 13%, transparent);
+  border-color: var(--warning-line);
+  background-color: var(--warning-soft);
   color: var(--warning);
 }
 
 .tone-info {
-  border-color: color-mix(in srgb, var(--info) 32%, transparent);
-  background-color: color-mix(in srgb, var(--info) 12%, transparent);
+  border-color: var(--info-line);
+  background-color: var(--info-soft);
   color: var(--info);
 }
 
@@ -295,9 +337,11 @@ summary,
     padding-block: 0.5rem;
   }
 
+  /* No display change here. A <summary> is display: list-item by default, and
+     that is what paints the disclosure triangle; switching it to flex removed
+     the marker in Chrome, Firefox and Safari. min-height and padding-block,
+     which are the whole point of this rule, apply to list-item already. */
   summary {
-    display: flex;
-    align-items: center;
     min-height: 44px;
     padding-block: 0.5rem;
   }

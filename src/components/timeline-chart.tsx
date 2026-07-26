@@ -4,6 +4,7 @@ import { useEffect, useId, useMemo, useRef, useState } from "react";
 import uPlot from "uplot";
 import { ChevronDown, ChevronUp, Download, RotateCcw, ZoomIn, ZoomOut } from "lucide-react";
 import { fileNameTimestamp, formatDuration, formatLufs, formatPeakDbtp } from "@/lib/format";
+import { downloadTextFile } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import type { AnalysisTimeline } from "@/types/audio";
 
@@ -15,6 +16,12 @@ interface XDomain {
   min: number;
   max: number;
 }
+
+// Order matches the loudness plot's series 1 and 2.
+const LOUDNESS_SERIES = [
+  { label: "Momentary", token: "--chart-momentary" },
+  { label: "Short-term", token: "--chart-shortterm" },
+] as const;
 
 // Rows shown in the on-screen data table are downsampled to a readable count;
 // the CSV download always covers every sample.
@@ -64,12 +71,29 @@ export function TimelineChart({ timeline }: TimelineChartProps) {
   // isn't looking at new data and should keep the user's current zoom/pan
   // instead of snapping back to the full range.
   const lastTimelineRef = useRef<AnalysisTimeline | null>(null);
+  // Zoom/pan carried across a rebuild (theme toggle, pointer-type change).
+  // Written by the effect's cleanup, read by the next effect body.
+  const lastScaleRef = useRef<XDomain | null>(null);
 
   const summaryId = useId();
   const tableId = useId();
 
   const [isZoomed, setIsZoomed] = useState(false);
   const [tableOpen, setTableOpen] = useState(false);
+  // uPlot binds a click handler to each legend cell to toggle that series, and
+  // styles the cells as pointers, but a <th> is not focusable and uPlot attaches
+  // no key handler. The mount is also role="img", which hides those cells from
+  // assistive tech entirely. These buttons give the same capability a keyboard
+  // path (WCAG SC 2.1.1); the setSeries hook below keeps them in step when the
+  // legend is clicked with a mouse, so there is still one source of truth.
+  const [loudnessSeriesShown, setLoudnessSeriesShown] = useState<[boolean, boolean]>([true, true]);
+  // Read inside the plot-building effect without making it a dependency: a
+  // toggle must not tear down and rebuild both charts. Kept in sync from an
+  // effect rather than during render.
+  const loudnessSeriesShownRef = useRef(loudnessSeriesShown);
+  useEffect(() => {
+    loudnessSeriesShownRef.current = loudnessSeriesShown;
+  }, [loudnessSeriesShown]);
 
   // Drag-to-zoom on a touch screen fights with native scroll panning, so it's
   // disabled for coarse pointers in favour of the explicit zoom buttons
@@ -184,11 +208,12 @@ export function TimelineChart({ timeline }: TimelineChartProps) {
     // view rather than silently discarding the user's zoom/pan.
     const timelineChanged = lastTimelineRef.current !== timeline;
     lastTimelineRef.current = timeline;
-    const previousPlot = loudnessPlotRef.current;
-    const preservedScale =
-      !timelineChanged && previousPlot && previousPlot.scales.x.min != null && previousPlot.scales.x.max != null
-        ? { min: previousPlot.scales.x.min, max: previousPlot.scales.x.max }
-        : null;
+    // Read the scale the cleanup stashed, not the plot refs. React runs the
+    // previous effect's cleanup before this body, and that cleanup nulls both
+    // plot refs, so reading loudnessPlotRef.current here always saw null and the
+    // whole preservation path was dead: a theme toggle silently reset the zoom.
+    const preservedScale = timelineChanged ? null : lastScaleRef.current;
+    lastScaleRef.current = null;
 
     loudnessPlotRef.current?.destroy();
     peakPlotRef.current?.destroy();
@@ -272,16 +297,31 @@ export function TimelineChart({ timeline }: TimelineChartProps) {
             stroke: readThemeToken("--chart-momentary", "#37d2be"),
             width: 2,
             spanGaps: false,
+            show: loudnessSeriesShownRef.current[0],
           },
           {
             label: "Short-term (LUFS)",
             stroke: readThemeToken("--chart-shortterm", "#f7b756"),
             width: 2,
             spanGaps: false,
+            show: loudnessSeriesShownRef.current[1],
           },
         ],
         hooks: {
           setScale: [makeSyncHook(() => peakPlotRef.current)],
+          // Mirror a legend click back into React so the accessible toggles
+          // below never disagree with what the chart is actually drawing.
+          setSeries: [
+            (plot) => {
+              const next: [boolean, boolean] = [
+                plot.series[1]?.show !== false,
+                plot.series[2]?.show !== false,
+              ];
+              setLoudnessSeriesShown((current) =>
+                current[0] === next[0] && current[1] === next[1] ? current : next,
+              );
+            },
+          ],
         },
       },
       [x, momentary, shortTerm],
@@ -359,6 +399,14 @@ export function TimelineChart({ timeline }: TimelineChartProps) {
     resizeObserver.observe(peakContainer);
     return () => {
       resizeObserver.disconnect();
+      // Stash the current zoom before the instances go away. This is the only
+      // point at which it is still readable: the next effect body runs after
+      // this cleanup has already nulled the refs.
+      const plot = loudnessPlotRef.current;
+      lastScaleRef.current =
+        plot && plot.scales.x.min != null && plot.scales.x.max != null
+          ? { min: plot.scales.x.min, max: plot.scales.x.max }
+          : null;
       loudnessPlotRef.current?.destroy();
       peakPlotRef.current?.destroy();
       loudnessPlotRef.current = null;
@@ -406,6 +454,19 @@ export function TimelineChart({ timeline }: TimelineChartProps) {
     loudnessPlotRef.current.setScale("x", { min: domain.min, max: domain.max });
   };
 
+  const toggleLoudnessSeries = (seriesIndex: 0 | 1) => {
+    const next = !loudnessSeriesShown[seriesIndex];
+    // These buttons never hide both: an empty chart is not a useful state to be
+    // one click away from. uPlot's own legend cells still allow it, which is its
+    // stock behaviour and is left alone; the buttons stay in step either way
+    // through the setSeries hook.
+    if (!next && !loudnessSeriesShown[seriesIndex === 0 ? 1 : 0]) {
+      return;
+    }
+    // setSeries fires the hook above, which is what updates React state.
+    loudnessPlotRef.current?.setSeries(seriesIndex + 1, { show: next });
+  };
+
   const downloadTimelineCsv = () => {
     const { timeSeconds, momentaryLufs, shortTermLufs, truePeakDbtp } = timeline;
     const rows = timeSeconds.map((time, index) => {
@@ -420,15 +481,11 @@ export function TimelineChart({ timeline }: TimelineChartProps) {
       ].join(",");
     });
     const csv = ["time_seconds,momentary_lufs,short_term_lufs,true_peak_dbtp", ...rows].join("\n");
-    const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
-    const url = URL.createObjectURL(blob);
-    const anchor = document.createElement("a");
-    anchor.href = url;
-    anchor.download = `truepeak-timeline-${fileNameTimestamp()}.csv`;
-    document.body.appendChild(anchor);
-    anchor.click();
-    document.body.removeChild(anchor);
-    URL.revokeObjectURL(url);
+    downloadTextFile(
+      `truepeak-timeline-${fileNameTimestamp("timeline")}.csv`,
+      csv,
+      "text/csv;charset=utf-8",
+    );
   };
 
   return (
@@ -454,6 +511,29 @@ export function TimelineChart({ timeline }: TimelineChartProps) {
             Reset Zoom
           </Button>
         </div>
+      </div>
+
+      <div className="flex flex-wrap items-center gap-1.5" role="group" aria-label="Loudness chart series">
+        {LOUDNESS_SERIES.map((series, index) => (
+          <Button
+            key={series.label}
+            type="button"
+            size="sm"
+            variant="ghost"
+            aria-pressed={loudnessSeriesShown[index]}
+            onClick={() => toggleLoudnessSeries(index as 0 | 1)}
+            className={loudnessSeriesShown[index] ? undefined : "opacity-60"}
+          >
+            <span
+              aria-hidden="true"
+              className="h-2.5 w-2.5 rounded-full"
+              style={{
+                backgroundColor: loudnessSeriesShown[index] ? `var(${series.token})` : "var(--muted)",
+              }}
+            />
+            {series.label}
+          </Button>
+        ))}
       </div>
 
       <p id={summaryId} className="sr-only">

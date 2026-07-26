@@ -332,6 +332,56 @@ function CompareMetricTile({
   );
 }
 
+/**
+ * One file inside a Status Board column. Memoized like the ranked/reference/table
+ * rows, which the board branch previously skipped: it built every card as inline
+ * JSX, so a 500-file session re-created and reconciled roughly 12,500 elements on
+ * every progress tick while the other three views cost 60 memo prop comparisons.
+ */
+const CompareBoardCard = memo(function CompareBoardCard({
+  job,
+  isSelected,
+  onOpenJob,
+}: {
+  job: CompletedAnalysisJob;
+  isSelected: boolean;
+  onOpenJob: (jobId: string) => void;
+}) {
+  const compliance = getComplianceSummary(job.result);
+  return (
+    <div
+      className={cn(
+        "@container tp-selected-row overflow-hidden rounded-[20px] border p-4 [content-visibility:auto] [contain-intrinsic-size:260px]",
+        isSelected ? "border-[color:var(--accent)]/35 bg-[color:var(--accent-soft)]" : "border-[var(--line)] bg-[var(--surface-0)]",
+      )}
+      data-selected={isSelected}
+      aria-current={isSelected ? "true" : undefined}
+    >
+      <div className="flex flex-col gap-3 @[26rem]:flex-row @[26rem]:items-start @[26rem]:justify-between">
+        <div className="min-w-0">
+          <div className="break-words text-sm font-semibold text-[var(--ink)]">{job.fileName}</div>
+          <div className="mt-2 flex flex-wrap gap-2">
+            {compliance ? <Badge className={complianceToneClass(compliance.state)}>{compliance.label}</Badge> : null}
+            {job.result.metrics.integratedValid === false ? <Badge className="tone-warning">Integrated unavailable</Badge> : null}
+            {isUnverifiedImport(job) ? <Badge className="tone-warning">Unverified import</Badge> : null}
+            <Badge className="max-w-full break-words border-[var(--line)] bg-[var(--surface-1)] text-[var(--muted)]">{job.result.metadata.decoderLabel}</Badge>
+          </div>
+        </div>
+        <Button type="button" size="sm" variant="ghost" onClick={() => onOpenJob(job.id)} aria-label={`Inspect ${job.fileName}`} className="shrink-0">Inspect</Button>
+      </div>
+      {/* Container query, not sm:. At 2xl the board is five columns wide, so this
+          card is about 205px across while the viewport is >=1536px: a viewport
+          breakpoint put three tiles into ~60px columns each and the labels
+          overprinted the values. */}
+      <div className="mt-4 grid gap-3 @[24rem]:grid-cols-3">
+        <CompareMetricTile label="Integrated" value={formatIntegratedLufs(job.result.metrics)} accent />
+        <CompareMetricTile label="True peak" value={formatPeakDbtp(job.result.metrics.truePeakDbtp)} />
+        <CompareMetricTile label="Gain" value={formatRelativeDb(job.result.metrics.targetDeltaDb)} />
+      </div>
+    </div>
+  );
+});
+
 function RangeLane({
   label,
   valueLabel,
@@ -1151,10 +1201,14 @@ export function CompareStudio({
           ))}
         </div>
 
-        {(compareView === "cards" || compareView === "reference" || compareView === "table") && sortedJobs.length > MAIN_VIEW_PAGE_SIZE ? (
+        {(compareView === "cards" || compareView === "reference" || compareView === "table" || compareView === "board") && sortedJobs.length > MAIN_VIEW_PAGE_SIZE ? (
           <div className="mt-5 flex flex-wrap items-center justify-between gap-3 rounded-[16px] border border-[var(--line)]/60 bg-[var(--surface-1)]/50 px-4 py-2.5 text-xs text-[var(--muted)]">
             <span>
-              Showing {numberFormatter.format(visibleJobs.length)} of {numberFormatter.format(sortedJobs.length)} file{sortedJobs.length === 1 ? "" : "s"} in this view.
+              {compareView === "board"
+                ? showAllCompareJobs
+                  ? `Showing all ${numberFormatter.format(sortedJobs.length)} files across the columns.`
+                  : `Showing up to ${numberFormatter.format(MAIN_VIEW_PAGE_SIZE)} files per column, out of ${numberFormatter.format(sortedJobs.length)} in this view.`
+                : `Showing ${numberFormatter.format(visibleJobs.length)} of ${numberFormatter.format(sortedJobs.length)} file${sortedJobs.length === 1 ? "" : "s"} in this view.`}
             </span>
             <Button type="button" size="sm" variant="ghost" onClick={() => setShowAllCompareJobs((value) => !value)}>
               {showAllCompareJobs ? `Show first ${numberFormatter.format(MAIN_VIEW_PAGE_SIZE)}` : `Show all ${numberFormatter.format(sortedJobs.length)}`}
@@ -1193,39 +1247,23 @@ export function CompareStudio({
                     </div>
                     {group.jobs.length ? (
                       <div className="mt-4 space-y-3">
-                        {group.jobs.map((job) => {
-                          const compliance = getComplianceSummary(job.result);
-                          const isSelected = selectedJobId === job.id;
-                          return (
-                            <div
-                              key={job.id}
-                              className={cn(
-                                "tp-selected-row overflow-hidden rounded-[20px] border p-4 [content-visibility:auto] [contain-intrinsic-size:260px]",
-                                isSelected ? "border-[color:var(--accent)]/35 bg-[color:var(--accent-soft)]" : "border-[var(--line)] bg-[var(--surface-0)]",
-                              )}
-                              data-selected={isSelected}
-                              aria-current={isSelected ? "true" : undefined}
-                            >
-                              <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
-                                <div className="min-w-0">
-                                  <div className="break-words text-sm font-semibold text-[var(--ink)]">{job.fileName}</div>
-                                  <div className="mt-2 flex flex-wrap gap-2">
-                                    {compliance ? <Badge className={complianceToneClass(compliance.state)}>{compliance.label}</Badge> : null}
-                                    {job.result.metrics.integratedValid === false ? <Badge className="tone-warning">Integrated unavailable</Badge> : null}
-                                    {isUnverifiedImport(job) ? <Badge className="tone-warning">Unverified import</Badge> : null}
-                                    <Badge className="max-w-full break-words border-[var(--line)] bg-[var(--surface-1)] text-[var(--muted)]">{job.result.metadata.decoderLabel}</Badge>
-                                  </div>
-                                </div>
-                                <Button type="button" size="sm" variant="ghost" onClick={() => onOpenJob(job.id)} aria-label={`Inspect ${job.fileName}`} className="shrink-0">Inspect</Button>
-                              </div>
-                              <div className="mt-4 grid gap-3 sm:grid-cols-3">
-                                <CompareMetricTile label="Integrated" value={formatIntegratedLufs(job.result.metrics)} accent />
-                                <CompareMetricTile label="True peak" value={formatPeakDbtp(job.result.metrics.truePeakDbtp)} />
-                                <CompareMetricTile label="Gain" value={formatRelativeDb(job.result.metrics.targetDeltaDb)} />
-                              </div>
-                            </div>
-                          );
-                        })}
+                        {/* Windowed like every other view. The board used to
+                            render group.jobs uncapped, and the "Show all"
+                            disclosure above deliberately excluded it, so a large
+                            session had no way to bound this column at all. */}
+                        {(showAllCompareJobs ? group.jobs : group.jobs.slice(0, MAIN_VIEW_PAGE_SIZE)).map((job) => (
+                          <CompareBoardCard
+                            key={job.id}
+                            job={job}
+                            isSelected={selectedJobId === job.id}
+                            onOpenJob={onOpenJob}
+                          />
+                        ))}
+                        {!showAllCompareJobs && group.jobs.length > MAIN_VIEW_PAGE_SIZE ? (
+                          <p className="rounded-[16px] border border-[var(--line)]/60 bg-[var(--surface-1)]/50 px-4 py-2.5 text-xs leading-5 text-[var(--muted)]">
+                            Showing {numberFormatter.format(MAIN_VIEW_PAGE_SIZE)} of {numberFormatter.format(group.jobs.length)} files in this column. Use Show all above to list them.
+                          </p>
+                        ) : null}
                       </div>
                     ) : <div className="mt-4 rounded-[18px] border border-dashed border-[var(--line)] bg-[var(--surface-0)] px-4 py-5 text-sm leading-6 text-[var(--muted)]">No files land in this state for the current filter.</div>}
                   </Card>

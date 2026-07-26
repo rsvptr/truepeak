@@ -1,3 +1,4 @@
+import { TOLERANCE_RANGE } from "@/audio/presets";
 import { fileNameTimestamp } from "@/lib/format";
 import type {
   AnalysisJob,
@@ -24,7 +25,7 @@ export const SESSION_VERSION = 2;
 const LEGACY_SESSION_VERSION = 1;
 
 export function getSessionFileName() {
-  return `truepeak-session-${fileNameTimestamp()}.truepeak.json`;
+  return `truepeak-session-${fileNameTimestamp("session")}.truepeak.json`;
 }
 
 // The single authoritative session limit. MAX_SESSION_JOBS is shared by every
@@ -384,7 +385,13 @@ function normalizeTarget(raw: unknown): TargetPreset | null {
     !isFiniteNumber(target.loudnessTargetLufs) ||
     !isFiniteNumber(target.truePeakCeilingDbtp) ||
     !isFiniteNumber(target.toleranceLufs) ||
-    target.toleranceLufs < 0 ||
+    // Match the UI contract exactly (TOLERANCE_RANGE is (0, 10], min-exclusive).
+    // This used to accept 0, which the app itself can never produce. It went
+    // unnoticed while getComplianceSummary floored the window at 0.1 LU; now
+    // that the verdict uses the stored tolerance directly, a zero-tolerance
+    // import would mark every file out of tolerance unless it matched exactly.
+    target.toleranceLufs <= TOLERANCE_RANGE.min ||
+    target.toleranceLufs > TOLERANCE_RANGE.max ||
     (target.policy !== "protect-true-peak" && target.policy !== "loudness-first")
   ) {
     return null;

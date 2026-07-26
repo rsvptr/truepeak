@@ -284,7 +284,7 @@ const SimpleQueueRow = memo(function SimpleQueueRow({
               <div className="mt-3 text-xs leading-5 text-[var(--danger)]">
                 {model.errorDisplay.summary}
                 {model.errorDisplay.detail ? (
-                  <details className="mt-2 rounded-[16px] border border-[color:var(--danger)]/20 bg-[color:var(--danger)]/10 px-3 py-2 text-[11px] leading-5 text-[var(--ink)]/85">
+                  <details className="mt-2 rounded-[16px] border border-[var(--danger-line)] bg-[var(--danger-soft)] px-3 py-2 text-[11px] leading-5 text-[var(--ink)]/85">
                     <summary className="cursor-pointer font-semibold uppercase tracking-[0.14em] text-[var(--danger)]">
                       Why it failed
                     </summary>

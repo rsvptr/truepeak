@@ -163,11 +163,37 @@ export function formatTimestamp(value: string | number | Date | null | undefined
   return timestampFormatter.format(timestamp);
 }
 
-// Compact local-time stamp for download filenames (YYYYMMDD-HHMMSS), so
-// repeated exports never overwrite or "(1)"-suffix each other.
-export function fileNameTimestamp(now = new Date()) {
+// Last stamp handed out per filename scope, so a second call inside the same
+// wall-clock second can be disambiguated. The stamp is second-resolution with no
+// counter otherwise, so two exports of the same kind one after another produced
+// byte-identical filenames and the browser silently overwrote or "(1)"-suffixed
+// the first, which is exactly what stamping the filename was meant to avoid.
+//
+// Scoped rather than global because only same-scope names can actually collide:
+// a CSV export and a JSON export in the same second already differ by extension,
+// and a shared counter would hang a spurious "-2" on the second one.
+const lastFileNameStamps = new Map<string, { base: string; repeat: number }>();
+
+/**
+ * Compact local-time stamp for download filenames (YYYYMMDD-HHMMSS).
+ *
+ * `scope` identifies the family of filenames this stamp belongs to (one per
+ * distinct basename plus extension). A repeat within the same second and scope
+ * gains a "-2", "-3", ... suffix; the plain form is what every ordinary export
+ * gets.
+ */
+export function fileNameTimestamp(scope = "default", now = new Date()) {
   const pad = (value: number) => String(value).padStart(2, "0");
-  return `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
+  const base = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
+
+  const previous = lastFileNameStamps.get(scope);
+  if (previous && previous.base === base) {
+    previous.repeat += 1;
+    return `${base}-${previous.repeat + 1}`;
+  }
+
+  lastFileNameStamps.set(scope, { base, repeat: 0 });
+  return base;
 }
 
 export function peakToDb(value: number) {

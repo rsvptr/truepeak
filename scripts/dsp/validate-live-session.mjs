@@ -1255,6 +1255,71 @@ async function testHeartbeatRefreshesOnlyOwnRows() {
   );
 }
 
+async function testRestoreRefreshesOwnRowHeartbeats() {
+  // The ordinary same-tab refresh: the reloaded tab owns its rows already, so the
+  // autosave diff is empty and no write ever happens. Restore therefore has to
+  // refresh the heartbeat itself. Without that the rows kept their pre-refresh
+  // timestamp, went stale two minutes later while the tab was open and showing
+  // them, and a peer's Clear Session then deleted the live tab's only recovery
+  // copy.
+  const staleHeartbeat = OWNERSHIP_CLOCK - 5 * 60_000;
+  const disk = ownershipDisk([storedRow("mine", "tab-A", staleHeartbeat)]);
+  const asTabA = { ownerId: "tab-A", now: OWNERSHIP_CLOCK, staleAfterMs: STALE_WINDOW_MS };
+
+  await withMockIndexedDb(createMemoryIndexedDb(disk), async () => {
+    const outcome = await storeModule.readLiveSessionJobs(asTabA);
+    assert.equal(outcome.status, "committed", "the tab's own row is restored");
+    assert.deepEqual(outcome.jobs.map((job) => job.id), ["mine"]);
+    // The restore schedules the refresh from the transaction's completion, so
+    // let the microtask queue drain before asserting on the stored row.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  });
+
+  assert.equal(
+    disk.stores.get("jobs").records.get("mine").heartbeatMs,
+    OWNERSHIP_CLOCK,
+    "a restored own row leaves the restore with a fresh heartbeat, not the pre-refresh one",
+  );
+}
+
+async function testClearAlsoEmptiesQuarantine() {
+  // Records set aside during a restore used to survive every Clear Session:
+  // clearLiveSessionStore scoped its transaction to the jobs store alone, and
+  // nothing else in the codebase ever deletes from quarantine, so the only way
+  // out was clearing site data.
+  const disk = ownershipDisk([storedRow("mine", "tab-A", OWNERSHIP_CLOCK)]);
+  disk.stores.get("quarantine").records.set(
+    "bad",
+    storedRow("bad", "tab-A", OWNERSHIP_CLOCK),
+  );
+  disk.stores.get("quarantine").records.set(
+    "peer-bad",
+    storedRow("peer-bad", "tab-B", OWNERSHIP_CLOCK),
+  );
+
+  await withMockIndexedDb(createMemoryIndexedDb(disk), async () => {
+    const outcome = await storeModule.clearLiveSessionStore({
+      ownerId: "tab-A",
+      now: OWNERSHIP_CLOCK,
+      staleAfterMs: STALE_WINDOW_MS,
+    });
+    assert.equal(outcome.status, "committed");
+    assert.equal(outcome.count, 1, "the count reports live rows only, not quarantined ones");
+  });
+
+  assert.equal(disk.stores.get("jobs").records.size, 0, "the tab's live row is cleared");
+  assert.equal(
+    disk.stores.get("quarantine").records.has("bad"),
+    false,
+    "the tab's own quarantined row is cleared too",
+  );
+  assert.equal(
+    disk.stores.get("quarantine").records.has("peer-bad"),
+    true,
+    "a live peer's quarantined row is left alone, same ownership rule as the jobs store",
+  );
+}
+
 const tests = [
   testStoreDistinguishesUnavailableAndEmpty,
   testBlockedOpenClosesALateSuccessfulConnection,
@@ -1269,6 +1334,8 @@ const tests = [
   testCrashedTabRecordIsAdopted,
   testLegacyRecordIsRestorableAndMigrated,
   testHeartbeatRefreshesOnlyOwnRows,
+  testRestoreRefreshesOwnRowHeartbeats,
+  testClearAlsoEmptiesQuarantine,
   testClearOrdersAfterInflightWriteAndRejectsOldToken,
   testRetryDoesNotNeedAnotherJobsChange,
   testClearCancelsAScheduledOldRetry,

@@ -492,10 +492,10 @@ const AdvancedQueueRow = memo(function AdvancedQueueRow({
       ) : null}
 
       {errorDisplay ? (
-        <div className="border-t border-[color:var(--danger)]/20 px-3 pb-3 pt-2 text-sm leading-6 text-[var(--danger)]">
+        <div className="border-t border-[var(--danger-line)] px-3 pb-3 pt-2 text-sm leading-6 text-[var(--danger)]">
           {errorDisplay.summary}
           {errorDisplay.detail ? (
-            <details className="mt-2 rounded-[14px] border border-[color:var(--danger)]/20 bg-[color:var(--danger)]/10 px-3 py-2 text-xs leading-5 text-[var(--ink)]/85">
+            <details className="mt-2 rounded-[14px] border border-[var(--danger-line)] bg-[var(--danger-soft)] px-3 py-2 text-xs leading-5 text-[var(--ink)]/85">
               <summary className="cursor-pointer font-semibold uppercase tracking-[0.14em] text-[var(--danger)]">
                 Why it failed
               </summary>
@@ -728,7 +728,18 @@ export function TruePeakWorkbench() {
   const [queueSearchDraft, setQueueSearchDraft] = useState(searchQuery);
   const deferredSearchQuery = useDeferredValue(queueSearchDraft.trim().toLowerCase());
 
+  // The last value this component pushed into ?search. Next applies the patched
+  // history.replaceState inside startTransition, so the resulting searchQuery
+  // arrives at transition priority, after any keystrokes that landed in the
+  // meantime. Echoing that back into the draft overwrote those characters
+  // permanently. Only a genuinely external change (Back/Forward, resetQueueView,
+  // selectJob) should reach the input.
+  const lastWrittenSearchRef = useRef(searchQuery);
   useEffect(() => {
+    if (searchQuery === lastWrittenSearchRef.current) {
+      return;
+    }
+    lastWrittenSearchRef.current = searchQuery;
     setQueueSearchDraft((current) => (current === searchQuery ? current : searchQuery));
   }, [searchQuery]);
 
@@ -907,6 +918,9 @@ export function TruePeakWorkbench() {
         nextParams.delete("search");
       }
 
+      // Record what we are about to write so the sync effect above can tell this
+      // echo apart from a real external navigation.
+      lastWrittenSearchRef.current = trimmedDraft ? queueSearchDraft : "";
       const nextQuery = nextParams.toString();
       window.history.replaceState(null, "", nextQuery ? `${pathname}?${nextQuery}` : pathname);
     }, 120);
@@ -1029,6 +1043,7 @@ export function TruePeakWorkbench() {
   const {
     jobs,
     completedJobs,
+    restoreSettled,
     recentSessions,
     notice,
     persistenceIssue,
@@ -1272,6 +1287,16 @@ export function TruePeakWorkbench() {
     !useInlineInspector;
 
   useEffect(() => {
+    // Wait for the live-session restore to settle before pruning URL state
+    // against the job list. On the first client commit `jobs` is unconditionally
+    // empty and the restore is an async IndexedDB round trip, so pruning here
+    // used to strip ?job/?drawer/?reference a few hundred ms before the restore
+    // added those exact ids back: reloading with the inspector open always
+    // closed it and reset the selection to the first row.
+    if (!restoreSettled) {
+      return;
+    }
+
     const updates: Record<string, string | null> = {};
 
     if (selectedJobId && !jobs.some((job) => job.id === selectedJobId)) {
@@ -1288,7 +1313,7 @@ export function TruePeakWorkbench() {
     if (Object.keys(updates).length) {
       updateWorkspaceRoute(updates);
     }
-  }, [completedJobs, jobs, referenceId, resolvedSelectedJobId, selectedJobId, updateWorkspaceRoute, workspaceDrawer]);
+  }, [completedJobs, jobs, referenceId, resolvedSelectedJobId, restoreSettled, selectedJobId, updateWorkspaceRoute, workspaceDrawer]);
 
   useEffect(() => {
     const updates: Record<string, string | null> = {};
@@ -1337,11 +1362,17 @@ export function TruePeakWorkbench() {
       updates.drawer = null;
     }
 
-    if (
-      drawerIsInspector &&
-      (workspaceScreen === "home" || showInlineInspector || activeWorkspaceTab !== "queue" || !selectedJob)
-    ) {
-      updates.drawer = null;
+    if (drawerIsInspector) {
+      // Screen and tab are URL state, known on the first commit.
+      const routeDisallows = workspaceScreen === "home" || activeWorkspaceTab !== "queue";
+      // These two read `selectedJob`, which is null until the live-session
+      // restore lands. Closing the drawer on that empty first commit is the same
+      // race the ?job pruning above guards: reloading with the inspector open
+      // would always close it a few hundred ms before the row came back.
+      const selectionDisallows = restoreSettled && (showInlineInspector || !selectedJob);
+      if (routeDisallows || selectionDisallows) {
+        updates.drawer = null;
+      }
     }
 
     if (Object.keys(updates).length) {
@@ -1359,6 +1390,7 @@ export function TruePeakWorkbench() {
     queueFilterParam,
     queueSortParam,
     referenceParam,
+    restoreSettled,
     searchQuery,
     selectedJobId,
     selectedJob,
@@ -1440,7 +1472,7 @@ export function TruePeakWorkbench() {
         <Info className="mt-0.5 h-4 w-4 shrink-0 text-[var(--accent-text)]" aria-hidden="true" />
         <div className="min-w-0 flex-1">
           <span>
-            {"Hidden by the current search or filter — still showing "}
+            {"Hidden by the current search or filter. Still showing "}
             <strong className="font-semibold">{selectedJob.fileName}</strong>
             {"."}
           </span>
@@ -2228,7 +2260,12 @@ export function TruePeakWorkbench() {
                     ref={advancedInspectorSectionRef}
                     id="selected-file-details"
                     aria-labelledby="selected-file-details-heading"
-                    className="min-w-0 scroll-mt-28 focus:outline-none"
+                    // No scroll-mt here: html carries scroll-padding-top sized
+                    // from the toolbar's measured height, and scroll-padding on
+                    // the scroll root and scroll-margin on the target both apply,
+                    // which would push this section down by roughly twice the
+                    // bar's height on every Inspect click.
+                    className="min-w-0 focus:outline-none"
                   >
                   {selectionHiddenNotice}
                   <InspectorPanel

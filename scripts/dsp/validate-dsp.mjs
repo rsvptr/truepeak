@@ -334,6 +334,124 @@ function fakeResult(metrics, target) {
     summary ? summary.state : "null",
   );
 }
+// A quiet file whose MEASURED peak is already over the ceiling, under a
+// loudness-first target. normalizationLimited is only ever set for
+// protect-true-peak, so this used to read "Needs gain" with a large positive
+// suggested move and a projected peak far past the ceiling, with the breach
+// reported nowhere at all.
+{
+  const target = targetPresetFixture({ policy: "loudness-first", toleranceLufs: 1 });
+  const applied = applyTargetToMetrics(
+    baseMetricsFixture({ integratedLufs: -20, truePeakDbtp: -0.5 }),
+    target,
+  );
+  const summary = getComplianceSummary(fakeResult(applied, target));
+  assertOk(
+    "loudness-first leaves normalizationLimited false",
+    applied.normalizationLimited === false,
+  );
+  assertOk(
+    "loudness-first quiet file with measured peak over the ceiling -> 'ceiling-limited'",
+    summary != null && summary.state === "ceiling-limited",
+    summary ? summary.state : "null",
+  );
+}
+// The same peak breach must NOT hijack a too-hot file when attenuating to target
+// clears the loudness axis and the peak axis together: -8 against a -14 target
+// moves -6 dB, taking a -0.2 dBTP peak to -6.2, well inside a -1 dBTP ceiling.
+{
+  const target = targetPresetFixture({ policy: "loudness-first", toleranceLufs: 1 });
+  const applied = applyTargetToMetrics(
+    baseMetricsFixture({ integratedLufs: -8, truePeakDbtp: -0.2 }),
+    target,
+  );
+  const summary = getComplianceSummary(fakeResult(applied, target));
+  assertOk(
+    "too-hot file whose attenuation also clears the ceiling keeps 'above-target'",
+    summary != null && summary.state === "above-target",
+    summary ? summary.state : "null",
+  );
+}
+// A too-hot file whose PEAK excess exceeds its LOUDNESS excess is the same trap
+// in the other direction: attenuating by the loudness gap is not enough to clear
+// the ceiling. Shipped preset shape (loudness-first, tolerance 1 LU): -9.5 LUFS
+// against a -11 target attenuates 1.5 dB, taking a +1.5 dBTP peak to 0.0 dBTP,
+// still 1 dB over a -1 dBTP ceiling.
+{
+  const target = targetPresetFixture({
+    policy: "loudness-first",
+    loudnessTargetLufs: -11,
+    toleranceLufs: 1,
+  });
+  const applied = applyTargetToMetrics(
+    baseMetricsFixture({ integratedLufs: -9.5, truePeakDbtp: 1.5 }),
+    target,
+  );
+  const summary = getComplianceSummary(fakeResult(applied, target));
+  assertOk(
+    "peak excess larger than loudness excess -> attenuation leaves the peak over",
+    Math.abs((applied.projectedTruePeakDbtp ?? 0) - 0) < 1e-9,
+    String(applied.projectedTruePeakDbtp),
+  );
+  assertOk(
+    "too-hot file whose attenuation cannot clear the ceiling reads 'ceiling-limited'",
+    summary != null && summary.state === "ceiling-limited",
+    summary ? summary.state : "null",
+  );
+}
+// ...and a SMALL overshoot does not clear a large peak excess. -13.5 against a
+// -14 target moves only -0.5 dB, so a -0.1 dBTP peak lands at -0.6, still over a
+// -1 dBTP ceiling. Reporting "Too hot" alone would hand the user a gain move that
+// leaves the file non-compliant.
+{
+  const target = targetPresetFixture({ policy: "loudness-first", toleranceLufs: 0.2 });
+  const applied = applyTargetToMetrics(
+    baseMetricsFixture({ integratedLufs: -13.5, truePeakDbtp: -0.1 }),
+    target,
+  );
+  const summary = getComplianceSummary(fakeResult(applied, target));
+  assertOk(
+    "the suggested attenuation is the one that decides the peak axis",
+    Math.abs((applied.projectedTruePeakDbtp ?? 0) - -0.6) < 1e-9,
+    String(applied.projectedTruePeakDbtp),
+  );
+  assertOk(
+    "too-hot file whose attenuation still leaves the peak over the ceiling reads 'ceiling-limited'",
+    summary != null && summary.state === "ceiling-limited",
+    summary ? summary.state : "null",
+  );
+}
+// The verdict window is the tolerance the user actually chose. A 0.1 LU floor
+// used to widen anything tighter, while CSV/JSON exported the unclamped value
+// next to a verdict never evaluated against it.
+{
+  const target = targetPresetFixture({ toleranceLufs: 0.05 });
+  const applied = applyTargetToMetrics(
+    baseMetricsFixture({ integratedLufs: -14.09, truePeakDbtp: -3 }),
+    target,
+  );
+  const summary = getComplianceSummary(fakeResult(applied, target));
+  assertOk(
+    "a 0.09 LU miss against a 0.05 LU tolerance is NOT on-target",
+    summary != null && summary.state !== "on-target",
+    summary ? summary.state : "null",
+  );
+  const inside = applyTargetToMetrics(
+    baseMetricsFixture({ integratedLufs: -14.04, truePeakDbtp: -3 }),
+    target,
+  );
+  const insideSummary = getComplianceSummary(fakeResult(inside, target));
+  assertOk(
+    "a 0.04 LU miss against a 0.05 LU tolerance IS on-target",
+    insideSummary != null && insideSummary.state === "on-target",
+    insideSummary ? insideSummary.state : "null",
+  );
+  assertOk(
+    "the reported window is the chosen tolerance, not a floored one",
+    insideSummary != null && insideSummary.description.includes("0.05"),
+    insideSummary ? insideSummary.description : "null",
+  );
+}
 // integratedValid === false -> all gain/projection fields null, no cap warning, compliance null.
 {
   const target = targetPresetFixture();
@@ -466,6 +584,84 @@ for (const [label, exp] of Object.entries(weightTable)) {
   const quadWeights = layout.labels.map((label) => getLoudnessWeight(label));
   assertOk("mask 0x33 (quad) -> weights [1,1,1,1] (true rears, not surrounds)", JSON.stringify(quadWeights) === JSON.stringify([1, 1, 1, 1]), JSON.stringify(quadWeights));
   assertOk("mask 0x33 (quad) -> no ambiguity note (no back->surround remap)", describeLayoutRisk(layout) === null);
+}
+{
+  // The count-only fallback (AIFF, the browser decode route, and any WAVE with a
+  // plain 16-byte fmt chunk) must weight quad the same way the 0x33 mask path
+  // does. It used to label a maskless 4-channel stream L/R/Ls/Rs, giving two
+  // channels the sqrt(2) surround boost, so identical PCM read 0.82 LU louder
+  // without a speaker mask than with one.
+  const masked = deriveChannelLayout(4, 0x33);
+  const fallback = deriveChannelLayout(4, null);
+  assertOk("maskless quad -> labels L,R,Lb,Rb", fallback.labels.join(",") === "L,R,Lb,Rb", fallback.labels.join(","));
+  assertOk("maskless quad -> guessed", fallback.guessed === true);
+  const maskedWeights = masked.labels.map((label) => getLoudnessWeight(label));
+  const fallbackWeights = fallback.labels.map((label) => getLoudnessWeight(label));
+  assertOk(
+    "maskless quad weights match the 0x33 mask path exactly",
+    JSON.stringify(fallbackWeights) === JSON.stringify(maskedWeights),
+    `${JSON.stringify(fallbackWeights)} vs ${JSON.stringify(maskedWeights)}`,
+  );
+
+  // The same PCM through both layouts must land on the same integrated reading.
+  const n = Math.round(3 * 48000);
+  const tone = new Float32Array(n);
+  for (let i = 0; i < n; i += 1) tone[i] = 0.0708 * Math.sin((2 * Math.PI * 1000 * i) / 48000);
+  const quadChannels = () => [tone.slice(), tone.slice(), tone.slice(), tone.slice()];
+  const withMask = analyzeDecodedAsset(
+    makeAsset(quadChannels(), { layout: masked }),
+    null,
+  ).metrics.integratedLufs;
+  const withoutMask = analyzeDecodedAsset(
+    makeAsset(quadChannels(), { layout: fallback }),
+    null,
+  ).metrics.integratedLufs;
+  assertOk(
+    "quad measures identically with and without a speaker mask",
+    Math.abs(withMask - withoutMask) < 1e-9,
+    `${withMask.toFixed(4)} vs ${withoutMask.toFixed(4)}`,
+  );
+}
+{
+  // Same invariant across every count-only fallback that has a canonical mask
+  // equivalent. The weight VECTOR must match position for position, not just as
+  // a multiset: weights are applied per channel index, so a fallback listing
+  // Ls/Rs where the mask puts Lb/Rb boosts the wrong two channels.
+  //
+  // The WAVE convention is the one compared here, because that is the only
+  // container that can present the same file with and without a mask. AIFF and
+  // the browser route always pass "coreaudio" and never have a mask to disagree
+  // with, so their 7.1 order (sides at 4/5) is checked separately below.
+  const maskByCount = { 4: 0x33, 6: 0x3f, 8: 0x63f };
+  for (const [count, mask] of Object.entries(maskByCount)) {
+    const channels = Number(count);
+    const masked = deriveChannelLayout(channels, mask);
+    const fallback = deriveChannelLayout(channels, null, "wave");
+    const maskedWeights = masked.labels.map((label) => getLoudnessWeight(label));
+    const fallbackWeights = fallback.labels.map((label) => getLoudnessWeight(label));
+    assertOk(
+      `${channels}-channel WAVE fallback weights match mask 0x${mask.toString(16)} position for position`,
+      JSON.stringify(fallbackWeights) === JSON.stringify(maskedWeights),
+      `${fallback.labels.join(",")} ${JSON.stringify(fallbackWeights)} vs ${masked.labels.join(",")} ${JSON.stringify(maskedWeights)}`,
+    );
+  }
+
+  // The two conventions genuinely differ at 8 channels, and the default must
+  // stay CoreAudio/MPEG so AIFF and browser-decoded 7.1 keep the sides at
+  // indices 4 and 5. Pinning both directions stops a future "make them agree"
+  // change from silently reweighting one of the two container families.
+  const coreAudio8 = deriveChannelLayout(8, null);
+  const wave8 = deriveChannelLayout(8, null, "wave");
+  assertOk(
+    "the default 8-channel fallback follows CoreAudio/MPEG order (sides at 4/5)",
+    coreAudio8.labels.join(",") === "L,R,C,LFE,Ls,Rs,Lb,Rb",
+    coreAudio8.labels.join(","),
+  );
+  assertOk(
+    "the WAVE 8-channel fallback follows WAVE order (rears at 4/5)",
+    wave8.labels.join(",") === "L,R,C,LFE,Lb,Rb,Ls,Rs",
+    wave8.labels.join(","),
+  );
 }
 {
   // 5.1-style mask (front centre + back bits, no side bits) -> back remapped to Ls/Rs, ambiguity note.

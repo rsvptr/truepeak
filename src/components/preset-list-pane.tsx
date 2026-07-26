@@ -1,6 +1,6 @@
 "use client";
 
-import type { Ref } from "react";
+import { useRef, type Ref } from "react";
 import { CUSTOM_PRESET_ID } from "@/audio/presets";
 import { Badge } from "@/components/ui/badge";
 import {
@@ -27,6 +27,7 @@ interface PresetRowProps {
   label: string;
   selected: boolean;
   onSelect: (presetId: string) => void;
+  onPointerActivate: () => void;
   provenance: string;
   provenanceTone: string;
   sourceLabel?: string;
@@ -40,6 +41,7 @@ function PresetRow({
   label,
   selected,
   onSelect,
+  onPointerActivate,
   provenance,
   provenanceTone,
   sourceLabel,
@@ -49,6 +51,15 @@ function PresetRow({
 }: PresetRowProps) {
   return (
     <label
+      // Only pointerdown sets the flag. Clicking a <label> runs its activation
+      // behaviour AFTER the click event finishes propagating, so the order is
+      // pointerdown -> click (label) -> click (input) -> change: clearing the
+      // flag on click would clear it before onChange ever reads it, and every
+      // tap would look like a keyboard selection. The flag is consumed and
+      // cleared inside handleSelect instead, and a keydown on the list clears it
+      // so a click on an already-selected row (which fires no change) cannot
+      // leave it set for a later arrow key.
+      onPointerDown={onPointerActivate}
       className={cn(
         "flex cursor-pointer gap-3 rounded-2xl border p-3 transition",
         "has-[:focus-visible]:outline-none has-[:focus-visible]:ring-2 has-[:focus-visible]:ring-[var(--accent)] has-[:focus-visible]:ring-offset-2 has-[:focus-visible]:ring-offset-[var(--surface-1)]",
@@ -91,7 +102,13 @@ function PresetRow({
 
 interface PresetListPaneProps {
   selectedPresetId: string;
-  onSelect: (presetId: string) => void;
+  /**
+   * `viaPointer` is false for native radio arrow-key navigation. The narrow
+   * master/detail flow must not navigate away from the list on those, or the
+   * group becomes unusable by keyboard: hiding the list pane display:none's the
+   * radio that currently holds focus.
+   */
+  onSelect: (presetId: string, viaPointer: boolean) => void;
   /** Ref to the scroll container so the mobile flow can preserve list position. */
   scrollRef: Ref<HTMLDivElement>;
   className?: string;
@@ -104,9 +121,23 @@ interface PresetListPaneProps {
  * detail pane so the list stays scannable (UX-006/UX-007).
  */
 export function PresetListPane({ selectedPresetId, onSelect, scrollRef, className }: PresetListPaneProps) {
+  const pointerSelectRef = useRef(false);
+  const handleSelect = (presetId: string) => {
+    const viaPointer = pointerSelectRef.current;
+    pointerSelectRef.current = false;
+    onSelect(presetId, viaPointer);
+  };
+  const markPointer = () => {
+    pointerSelectRef.current = true;
+  };
+  const clearPointer = () => {
+    pointerSelectRef.current = false;
+  };
+
   return (
     <div
       ref={scrollRef}
+      onKeyDown={clearPointer}
       className={cn("min-w-0 space-y-5 overflow-y-auto overscroll-contain pr-1", className)}
     >
       {GROUPED_PRESETS.map((group) => (
@@ -122,7 +153,8 @@ export function PresetListPane({ selectedPresetId, onSelect, scrollRef, classNam
                 id={preset.id}
                 label={preset.label}
                 selected={selectedPresetId === preset.id}
-                onSelect={onSelect}
+                onSelect={handleSelect}
+                onPointerActivate={markPointer}
                 provenance={provenanceLabel(preset.evidence)}
                 provenanceTone={provenanceToneClass(preset.evidence)}
                 sourceLabel={preset.sourceLabel}
@@ -144,7 +176,8 @@ export function PresetListPane({ selectedPresetId, onSelect, scrollRef, classNam
             id={CUSTOM_PRESET_ID}
             label="Custom Target"
             selected={selectedPresetId === CUSTOM_PRESET_ID}
-            onSelect={onSelect}
+            onSelect={handleSelect}
+            onPointerActivate={markPointer}
             provenance={provenanceLabel("custom")}
             provenanceTone={provenanceToneClass("custom")}
             blurb="Set your own loudness target and true peak limit."

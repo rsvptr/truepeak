@@ -449,7 +449,8 @@ async function withDatabase<
 function runMutation<Operation extends LiveSessionMutationOperation>(
   database: IDBDatabase,
   operation: Operation,
-  apply: (store: IDBObjectStore, committed: { count: number }) => void,
+  apply: (store: IDBObjectStore, committed: { count: number }, transaction: IDBTransaction) => void,
+  storeNames: string | string[] = STORE_NAME,
 ): Promise<LiveSessionMutationOutcome<Operation>> {
   return new Promise((resolve) => {
     let settled = false;
@@ -462,7 +463,7 @@ function runMutation<Operation extends LiveSessionMutationOperation>(
     };
 
     try {
-      const transaction = database.transaction(STORE_NAME, "readwrite");
+      const transaction = database.transaction(storeNames, "readwrite");
 
       transaction.oncomplete = () => {
         finish({ operation, status: "committed", count: committed.count });
@@ -483,7 +484,7 @@ function runMutation<Operation extends LiveSessionMutationOperation>(
       };
 
       try {
-        apply(transaction.objectStore(STORE_NAME), committed);
+        apply(transaction.objectStore(STORE_NAME), committed, transaction);
       } catch (error) {
         try {
           transaction.abort();
@@ -604,24 +605,54 @@ export async function clearLiveSessionStore(
     // leave live peers' rows intact. A blind store.clear() here would destroy
     // another open tab's only crash-recovery copy. Success is exclusively the
     // transaction's confirmed commit; the count reports rows actually removed.
-    runMutation(database, "clear", (store, committed) => {
-      const cursorRequest = store.openCursor();
-      cursorRequest.onsuccess = () => {
-        const cursor = cursorRequest.result;
-        if (!cursor) {
-          return;
-        }
-        const record = cursor.value as Record<string, unknown> | null | undefined;
-        if (
-          record &&
-          typeof record === "object" &&
-          isClaimable(record, ownerId, now, staleAfterMs)
-        ) {
-          cursor.delete();
-          committed.count += 1;
-        }
-        cursor.continue();
-      };
+    //
+    // The transaction spans the quarantine store as well. Nothing else ever
+    // deletes from it, so records set aside during a restore used to survive
+    // every Clear Session and could only be removed by clearing site data. Both
+    // stores are cleared under the same ownership rule, in one transaction, so a
+    // failure rolls the whole thing back rather than half-clearing.
+    runMutation(
+      database,
+      "clear",
+      (store, committed, transaction) => {
+        const clearClaimable = (target: IDBObjectStore, counts: boolean) => {
+          const cursorRequest = target.openCursor();
+          cursorRequest.onsuccess = () => {
+            const cursor = cursorRequest.result;
+            if (!cursor) {
+              return;
+            }
+            const record = cursor.value as Record<string, unknown> | null | undefined;
+            if (
+              record &&
+              typeof record === "object" &&
+              isClaimable(record, ownerId, now, staleAfterMs)
+            ) {
+              cursor.delete();
+              if (counts) {
+                // Only live rows count towards the reported total: quarantined
+                // rows were already removed from the visible session when they
+                // were set aside, so counting them again would overstate what
+                // the user just cleared.
+                committed.count += 1;
+              }
+            }
+            cursor.continue();
+          };
+        };
+
+        clearClaimable(store, true);
+        clearClaimable(transaction.objectStore(QUARANTINE_STORE_NAME), false);
+      },
+      [STORE_NAME, QUARANTINE_STORE_NAME],
+    ).then((outcome) => {
+      // Only retire the keep-alive once the clear has actually committed. Doing
+      // it inside apply() would stop the heartbeat on a transaction that then
+      // aborts, leaving the surviving rows unrefreshed and adoptable by a peer.
+      if (outcome.status === "committed") {
+        stopHeartbeatTimer();
+      }
+      return outcome;
     }),
   );
 }
@@ -639,6 +670,10 @@ export async function readLiveSessionJobs(
       const jobs: AnalysisJob[] = [];
       let totalRecordCount = 0;
       let quarantinedCount = 0;
+      // Rows this restore claimed for the tab (own, legacy, or crashed-peer).
+      // Local to the read rather than module state so a concurrent write cannot
+      // race it, and so nothing outside this transaction can go stale on it.
+      let claimedRecordCount = 0;
       // Invalid rows a live peer owns: left strictly in place (not restored,
       // quarantined, or deleted) and excluded from the overflow tally. VALID
       // live-peer rows are surfaced view-only rather than skipped, so they land
@@ -712,8 +747,15 @@ export async function readLiveSessionJobs(
             // effectively re-stamped fresh too. A live peer's fresh row is
             // surfaced above but deliberately NOT re-stamped -- leaving the peer
             // its ownership and thus its delete/clear authority over the row.
-            if (claimable && recordOwnerId(record as Record<string, unknown>) !== ownerId) {
-              cursor.update(stampOwnership(record as Record<string, unknown>, ownerId, now));
+            if (claimable) {
+              if (recordOwnerId(record as Record<string, unknown>) !== ownerId) {
+                cursor.update(stampOwnership(record as Record<string, unknown>, ownerId, now));
+              }
+              // Rows this tab already owns are not re-stamped here (that would
+              // rewrite every restored record inside the restore transaction),
+              // but they still belong to this tab, so the heartbeat must keep
+              // them alive from now on.
+              claimedRecordCount += 1;
             }
             if (jobs.length >= RESTORE_LIMIT) {
               return; // cap filled: leave the remaining overflow untouched
@@ -755,6 +797,17 @@ export async function readLiveSessionJobs(
           });
         };
         transaction.oncomplete = () => {
+          // The rows this restore claimed are now this tab's responsibility, so
+          // start the keep-alive here rather than waiting for a write that a
+          // pure recovery never issues. The immediate refresh closes the gap
+          // before the first interval tick: a tab reopened after more than the
+          // stale window already carries expired heartbeats, and 45 s of that is
+          // long enough for a peer's Clear Session to adopt and delete them.
+          if (claimedRecordCount > 0) {
+            ensureHeartbeatTimer();
+            void refreshLiveSessionHeartbeat(options);
+          }
+
           // Overflow is what the cursor never touched: total minus surfaced,
           // minus quarantined, minus live peers' invalid rows left in place. When
           // the cursor ran to the end this is 0; when it stopped at the cap it is
@@ -785,23 +838,44 @@ export async function readLiveSessionJobs(
 
 let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
 
+function stopHeartbeatTimer(): void {
+  if (heartbeatTimer !== null) {
+    clearInterval(heartbeatTimer);
+    heartbeatTimer = null;
+  }
+}
+
 // While the tab is open, refresh its own rows' heartbeats so a peer never
 // mistakes an idle-but-live tab for a crashed one. Started lazily on the first
-// write and only in a browser, so a background/read-only tab pays nothing and a
-// Node test never starts a timer.
+// write or restore, and only in a browser, so a Node test never starts a timer.
+// Restore has to start it too: a tab that recovers a session and then never
+// writes (the ordinary same-tab refresh, where the autosave diff is empty
+// because every restored row is already persisted) otherwise keeps the frozen
+// pre-refresh heartbeat, and two minutes later a peer's Clear Session deletes
+// the live tab's only recovery copy.
 function ensureHeartbeatTimer(): void {
   if (heartbeatTimer !== null || typeof window === "undefined") {
     return;
   }
+  // Deliberately not self-retiring on an empty tick. A write can claim rows in
+  // the window between the refresh transaction reading the store and its promise
+  // resolving, so "this tick updated nothing" is not proof the tab owns nothing,
+  // and acting on it would silently stop the keep-alive for rows that had just
+  // been written. Clear Session stops the timer explicitly instead, on its
+  // confirmed commit, which is the only point where the tab provably owns no
+  // rows. One small transaction every 45 s is the cost of that certainty.
   heartbeatTimer = setInterval(() => {
     void refreshLiveSessionHeartbeat();
   }, HEARTBEAT_INTERVAL_MS);
 }
 
 // Refresh heartbeatMs on every row this tab owns, in a single transaction; a
-// no-op when the tab owns nothing. Only own rows are touched, so it can never
-// resurrect a cleared row or disturb a peer's data. Exported so tests can drive
-// it deterministically; production calls it from the periodic timer above.
+// no-op when the tab owns nothing. The store is the authority on ownership, so
+// this cursors it rather than trusting any in-memory bookkeeping: rows past the
+// restore cap are owned by this tab too and must not be allowed to go stale.
+// Only own rows are touched, so it can never resurrect a cleared row or disturb
+// a peer's data. Exported so tests can drive it deterministically; production
+// calls it from the periodic timer above.
 export async function refreshLiveSessionHeartbeat(
   options: LiveSessionOwnershipOptions = {},
 ): Promise<LiveSessionMutationOutcome<"write">> {

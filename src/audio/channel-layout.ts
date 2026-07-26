@@ -47,16 +47,59 @@ const SPEAKER_MASK_BITS: Array<[number, ChannelLabel]> = [
   [SPEAKER_TOP_BACK_RIGHT, "Tbr"],
 ];
 
+/**
+ * Which interleave convention a maskless container follows.
+ *
+ * There is no single count-only answer for 8 channels. WAVE orders 7.1 as
+ * FL, FR, FC, LFE, BL, BR, SL, SR (the order SPEAKER_MASK_BITS walks, so
+ * `deriveChannelLayout(8, 0x63F)` yields L, R, C, LFE, Lb, Rb, Ls, Rs), while
+ * AIFF and CoreAudio put the sides at indices 4 and 5 instead. Since the two
+ * disagree about which pair gets the sqrt(2) surround weight, guessing one for
+ * both made an 8-channel file read 1.5 LU hotter through the wrong table. The
+ * caller knows its container, so it says.
+ */
+export type ChannelOrderConvention = "wave" | "coreaudio";
+
+// Count-only fallbacks, used when the container carries no speaker map (AIFF,
+// the browser decode route, and any WAVE with a plain 16-byte `fmt ` chunk).
+// Where a mask equivalent exists, these MUST resolve to the same loudness
+// weighting, or the same PCM measures differently depending on whether a
+// dwChannelMask happened to be present.
+//
+// The 4-channel entry is the one that has to be stated carefully:
+// backBitsAreSurroundChannels only remaps BACK bits to Ls/Rs when a front centre
+// is present, so mask 0x33 (quad) resolves to true rears Lb/Rb at weight 1.0.
+// Labelling a maskless quad L/R/Ls/Rs instead gave those two channels the
+// sqrt(2) surround boost and read 0.82 LU louder than the identical audio with a
+// mask, outside the +/-0.5 LU R128 tolerance and on the headline metric. Both
+// conventions agree that a centre-less 4-channel pair is rears, so 4 is shared.
+// Every centre-present entry (5, 6, 7) uses Ls/Rs, matching the mask path.
 const FALLBACK_LAYOUTS: Record<number, ChannelLabel[]> = {
   1: ["C"],
   2: ["L", "R"],
   3: ["L", "R", "C"],
-  4: ["L", "R", "Ls", "Rs"],
+  4: ["L", "R", "Lb", "Rb"],
   5: ["L", "R", "C", "Ls", "Rs"],
   6: ["L", "R", "C", "LFE", "Ls", "Rs"],
   7: ["L", "R", "C", "LFE", "Ls", "Rs", "Cs"],
+  // CoreAudio / MPEG 7.1: the sides sit at indices 4 and 5.
   8: ["L", "R", "C", "LFE", "Ls", "Rs", "Lb", "Rb"],
 };
+
+// Arities where the WAVE interleave differs from the table above.
+const WAVE_FALLBACK_OVERRIDES: Record<number, ChannelLabel[]> = {
+  8: ["L", "R", "C", "LFE", "Lb", "Rb", "Ls", "Rs"],
+};
+
+function fallbackLabels(
+  channelCount: number,
+  order: ChannelOrderConvention,
+): ChannelLabel[] | undefined {
+  if (order === "wave" && WAVE_FALLBACK_OVERRIDES[channelCount]) {
+    return WAVE_FALLBACK_OVERRIDES[channelCount];
+  }
+  return FALLBACK_LAYOUTS[channelCount];
+}
 
 function labelsToName(labels: ChannelLabel[]) {
   return labels.join(" / ");
@@ -107,7 +150,15 @@ function resolveMaskLabel(bit: number, defaultLabel: ChannelLabel, remapBackToSu
   return defaultLabel;
 }
 
-export function deriveChannelLayout(channelCount: number, speakerMask?: number | null): ChannelLayout {
+export function deriveChannelLayout(
+  channelCount: number,
+  speakerMask?: number | null,
+  // Only consulted when there is no usable mask. Defaults to the CoreAudio/MPEG
+  // interleave, which is what AIFF and the browser decode route produce; WAVE
+  // passes "wave" so a maskless 7.1 file is weighted the same way the 0x63F mask
+  // path weights it.
+  order: ChannelOrderConvention = "coreaudio",
+): ChannelLayout {
   if (speakerMask != null && speakerMask > 0) {
     const remapBackToSurround = backBitsAreSurroundChannels(speakerMask);
     const labels = SPEAKER_MASK_BITS.filter(([bit]) => maskHas(speakerMask, bit)).map(([bit, label]) =>
@@ -123,7 +174,9 @@ export function deriveChannelLayout(channelCount: number, speakerMask?: number |
     }
   }
 
-  const guessed = FALLBACK_LAYOUTS[channelCount] ?? Array.from({ length: channelCount }, () => "Unknown");
+  const guessed =
+    fallbackLabels(channelCount, order) ??
+    Array.from({ length: channelCount }, (): ChannelLabel => "Unknown");
   return {
     name: labelsToName(guessed),
     labels: guessed,
@@ -156,7 +209,7 @@ export function describeLayoutRisk(layout: ChannelLayout) {
       return null;
     }
 
-    return "Channel layout was inferred from channel count because the source metadata did not provide a speaker map.";
+    return "Channel layout was inferred from channel count because the source metadata did not provide a speaker map; the assumed positions decide which channels take the ITU-R BS.1770 surround weighting, so confirm they match the source.";
   }
 
   // Mask-derived layout: note when BACK bits were interpreted as ~110 degree
@@ -165,7 +218,7 @@ export function describeLayoutRisk(layout: ChannelLayout) {
   // flags the position guess. Quad-style masks (e.g. 0x33) keep true rears and get
   // no note.
   if (layout.speakerMask != null && maskHasAmbiguousBackChannels(layout.speakerMask)) {
-    return "WAVE back-left/right speaker bits were interpreted as ~110 degree surround channels (Ls/Rs) because the speaker mask pairs them with a front centre but declares no dedicated side channels (the ITU 5.1 convention); confirm this matches the source layout.";
+    return "WAVE back-left/right speaker bits were interpreted as ~110 degree surround channels (Ls/Rs) because the speaker mask pairs them with a front center but declares no dedicated side channels (the ITU 5.1 convention); confirm this matches the source layout.";
   }
 
   return null;

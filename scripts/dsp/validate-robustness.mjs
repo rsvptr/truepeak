@@ -853,5 +853,77 @@ expectOk(
   (asset) => asset.frameCount > 0 && asset.channels[0].every((v) => Number.isFinite(v)),
 );
 
+// ---- AIFC duplicate COMM/SSND: preflight and parser must agree ----
+// inspectAiff (decode-budget.ts) latches the first COMM+SSND pair and stops. The
+// parser keeps walking for AIFC because FVER may legitimately trail them, so
+// without a first-wins latch a file laid out COMM#1, SSND, COMM#2, FVER had its
+// decode budget approved from COMM#1 while the parser sized its allocation from
+// COMM#2. Both chunks are individually well-formed, so nothing else caught it.
+function buildAiffcDuplicateComm(firstFrames, secondFrames) {
+  const channels = 1;
+  const bits = 8;
+  const audioBytes = secondFrames * channels * (bits / 8);
+  const commBody = 18 + 4 + 1 + 4; // extended COMM: fixed + 'NONE' + pstring("none")
+  // AIFF chunks are word-aligned: an odd body carries a trailing pad byte, and
+  // the parser advances by chunkSize + (chunkSize % 2). commBody is 27 here.
+  const commChunk = 8 + commBody + (commBody % 2);
+  const ssndChunk = 8 + 8 + audioBytes;
+  const fverChunk = 12;
+  const total = 12 + commChunk + ssndChunk + commChunk + fverChunk;
+  const buffer = new ArrayBuffer(total);
+  const view = new DataView(buffer);
+  putAscii(view, 0, "FORM");
+  view.setUint32(4, total - 8, false);
+  putAscii(view, 8, "AIFC");
+
+  const writeComm = (offset, frames) => {
+    putAscii(view, offset, "COMM");
+    view.setUint32(offset + 4, commBody, false);
+    const data = offset + 8;
+    view.setUint16(data, channels, false);
+    view.setUint32(data + 2, frames, false);
+    view.setUint16(data + 6, bits, false);
+    putFloat80(view, data + 8, 48000);
+    putAscii(view, data + 18, "NONE");
+    view.setUint8(data + 22, 4);
+    putAscii(view, data + 23, "none");
+  };
+
+  let o = 12;
+  writeComm(o, firstFrames);
+  o += commChunk;
+  putAscii(view, o, "SSND");
+  view.setUint32(o + 4, 8 + audioBytes, false);
+  view.setUint32(o + 8, 0, false);
+  view.setUint32(o + 12, 0, false);
+  o += ssndChunk;
+  writeComm(o, secondFrames);
+  o += commChunk;
+  putAscii(view, o, "FVER");
+  view.setUint32(o + 4, 4, false);
+  view.setUint32(o + 8, 0xa2805140, false);
+  return buffer;
+}
+
+{
+  const declaredFirst = 1;
+  const declaredSecond = 4096;
+  const asset = parseAiffBuffer(
+    buildAiffcDuplicateComm(declaredFirst, declaredSecond),
+    "dup.aifc",
+    "audio/aiff",
+  );
+  assertBool(
+    "AIFC duplicate COMM: the parser uses the FIRST COMM, matching the preflight",
+    asset.frameCount === declaredFirst,
+    `frameCount ${asset.frameCount}, expected ${declaredFirst}`,
+  );
+  assertBool(
+    "AIFC duplicate COMM: no channel is allocated past the first COMM's frame count",
+    asset.channels.every((channel) => channel.length === declaredFirst),
+    asset.channels.map((channel) => channel.length).join(","),
+  );
+}
+
 console.log(`\n==== Robustness: ${passed} passed, ${failed} failed ====\n`);
 process.exit(failed ? 1 : 0);

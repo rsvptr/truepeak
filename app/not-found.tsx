@@ -12,7 +12,7 @@ export default function NotFound() {
         </p>
         <Link
           href="/"
-          className="mt-5 inline-flex h-9 items-center justify-center gap-2 rounded-full border border-transparent bg-[var(--accent-strong)] px-4 text-xs font-semibold text-[var(--surface-0)] shadow-sm transition-[background-color,box-shadow] duration-200 ease-out hover:bg-[var(--accent-hover)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)] focus-visible:ring-offset-2"
+          className="mt-5 inline-flex h-9 items-center justify-center gap-2 rounded-full border border-transparent bg-[var(--accent-strong)] px-4 text-xs font-semibold text-[var(--surface-0)] shadow-sm transition-[background-color,box-shadow] duration-200 ease-out hover:bg-[var(--accent-hover)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)] focus-visible:ring-offset-2 focus-visible:ring-offset-[var(--surface-1)]"
         >
           Back to the analyzer
         </Link>

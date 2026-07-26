@@ -264,7 +264,7 @@ export function HomeStage({
                   </ToggleButton>
                 </div>
                 <p className="text-sm leading-6 text-[var(--muted)]">
-                  Simple keeps the table at the centre. Advanced adds compare, insights, and deeper controls.
+                  Simple keeps the table at the center. Advanced adds compare, insights, and deeper controls.
                 </p>
               </div>
             </StripSection>
@@ -365,7 +365,7 @@ export function HomeStage({
                     </select>
                   </label>
                   <div className="text-sm leading-6 text-[var(--muted)]">
-                    Pick a decode route when you want to favour speed, browser codecs, or wider format support.
+                    Pick a decode route when you want to favor speed, browser codecs, or wider format support.
                   </div>
                 </div>
               </StripSection>

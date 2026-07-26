@@ -431,6 +431,78 @@ ok(
 );
 ok("truncated known metadata returns no optimistic estimate", inspectAudioContainer(new ArrayBuffer(11)) === null);
 
+// The preflight must never authorize less than a decode will actually allocate.
+// decodePcmToPlanar strides by channelCount * (bitsPerSample / 8) and never
+// reads blockAlign, but blockAlign is an untrusted uint16 from `fmt `, so a file
+// declaring an inflated one used to under-report the footprint by that ratio and
+// the parser then committed the real, far larger buffers before validation ran.
+function encodeHostileBlockAlignWave(payloadBytes, blockAlign, bitsPerSample, channelCount) {
+  const buffer = new ArrayBuffer(44 + payloadBytes);
+  const view = new DataView(buffer);
+  writeAscii(view, 0, "RIFF");
+  view.setUint32(4, buffer.byteLength - 8, true);
+  writeAscii(view, 8, "WAVE");
+  writeAscii(view, 12, "fmt ");
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true); // PCM
+  view.setUint16(22, channelCount, true);
+  view.setUint32(24, 48000, true);
+  view.setUint32(28, 48000, true);
+  view.setUint16(32, blockAlign, true);
+  view.setUint16(34, bitsPerSample, true);
+  writeAscii(view, 36, "data");
+  view.setUint32(40, payloadBytes, true);
+  return buffer;
+}
+
+// Moderate inflation: the OLD code returned a positive but 16x-too-small frame
+// count here, so this case pins the under-reporting itself rather than the
+// incidental "frameCount <= 0 -> null" rejection the extreme case trips.
+{
+  const payloadBytes = 8192;
+  const hostile = inspectAudioContainer(encodeHostileBlockAlignWave(payloadBytes, 16, 8, 1));
+  ok(
+    "a 16x inflated blockAlign cannot under-report the WAVE decode footprint",
+    hostile != null && hostile.frameCount === payloadBytes,
+    `frameCount ${hostile ? hostile.frameCount : "null"} (parser allocates ${payloadBytes} frames)`,
+  );
+  ok(
+    "a blockAlign inconsistent with channels x depth is still not native-decode safe",
+    hostile != null && hostile.nativeDecodeSafe === false,
+  );
+}
+// Extreme inflation, the originally reported case: uint16 max against 8-bit mono.
+{
+  const payloadBytes = 8192;
+  const hostile = inspectAudioContainer(encodeHostileBlockAlignWave(payloadBytes, 65535, 8, 1));
+  ok(
+    "a uint16-max blockAlign cannot under-report the WAVE decode footprint",
+    hostile != null && hostile.frameCount === payloadBytes,
+    `frameCount ${hostile ? hostile.frameCount : "null"}`,
+  );
+}
+// Multi-channel: the parser strides by channelCount * (bitDepth / 8), so the
+// authorized frame count has to follow that, not the declared blockAlign.
+{
+  const payloadBytes = 8192;
+  const hostile = inspectAudioContainer(encodeHostileBlockAlignWave(payloadBytes, 4096, 16, 2));
+  ok(
+    "an inflated blockAlign on stereo 16-bit reports the parser's own frame count",
+    hostile != null && hostile.frameCount === payloadBytes / 4,
+    `frameCount ${hostile ? hostile.frameCount : "null"}, expected ${payloadBytes / 4}`,
+  );
+}
+// A well-formed file must keep the trusted fast path: min(blockAlign, stride)
+// has to be a no-op whenever the two agree.
+{
+  const consistent = inspectAudioContainer(encodeWaveHeader(48000, 2, 1000));
+  ok(
+    "a consistent blockAlign leaves the reported frame count unchanged",
+    consistent != null && consistent.frameCount === 1000 && consistent.nativeDecodeSafe,
+    `frameCount ${consistent ? consistent.frameCount : "null"}`,
+  );
+}
+
 console.log("\nBounded folder traversal");
 const firstFile = new File(["a"], "same.wav", { lastModified: 1 });
 const secondFile = new File(["b"], "same.wav", { lastModified: 1 });

@@ -21,7 +21,7 @@
 
 > **Note**
 >
-> TruePeak is a review tool, not a certified broadcast compliance meter. WAV and AIFF are read directly. Compressed formats are decoded by the browser or by a local copy of ffmpeg.wasm, and codec behaviour can vary a little between browsers. Use it to check your work, not to sign off a broadcast deliverable.
+> TruePeak is a review tool, not a certified broadcast compliance meter. WAV and AIFF are read directly. Compressed formats are decoded by the browser or by a local copy of ffmpeg.wasm, and codec behavior can vary a little between browsers. Use it to check your work, not to sign off a broadcast deliverable.
 
 TruePeak keeps the whole loudness review in one place. Instead of jumping between a meter, a normalization calculator, a file inspector, and a comparison sheet, you get the batch queue, per file detail, timeline charts, target checks, and exports in the same screen. The measurement engine implements ITU-R BS.1770/EBU R128-oriented loudness and true-peak processing and is checked against a documented subset of published EBU reference cases.
 
@@ -76,7 +76,7 @@ If a file cannot be read by any route, the file is marked as failed with a plain
 
 ## Modes and workflows
 
-**Targeted** compares the measured loudness against a delivery target. You pick a preset or enter your own loudness target and true peak ceiling. The app shows how far the file sits from the target, the gain move that would get it there, the projected true peak after that move, and a verdict (on target, needs gain, too hot, or ceiling limited). A file whose loudness sits inside the tolerance but whose measured true peak breaks the ceiling reads as ceiling limited, not on target; the peak check is applied on every gain policy.
+**Targeted** compares the measured loudness against a delivery target. You pick a preset or enter your own loudness target and true peak ceiling. The app shows how far the file sits from the target, the gain move that would get it there, the projected true peak after that move, and a verdict (on target, needs gain, too hot, or ceiling limited). Which true peak the verdict judges depends on what you would do with the file. Inside the loudness tolerance you ship it as measured, so a measured peak over the ceiling reads as ceiling limited rather than on target. Outside the tolerance you would apply the suggested gain first, so the verdict judges the peak that move would leave behind. A quiet file reads ceiling limited whenever its peak is already over, because adding gain only pushes it further past. A too hot file reads too hot when attenuating to target also brings the peak back inside, and ceiling limited when it does not, which happens whenever the peak is further over the ceiling than the loudness is over target. The peak check runs on every gain policy, not only the ones that cap the move, and the tolerance the verdict uses is exactly the one you entered, including values under 0.1 LU.
 
 **Measure only** drops the target and just reports loudness, peaks, range, and the timeline. Use it when you want raw readings without any delivery framing.
 
@@ -92,7 +92,7 @@ Light and dark themes are both supported. The choice is stored in a cookie and r
 
 Three related things, with different jobs.
 
-**Live session restore** is automatic when IndexedDB is available. Completed results are mirrored into this browser as they finish. Saves, retries, deletes, and Clear Session are serialized; the app reports a persistent warning if the browser blocks storage or a transaction cannot be committed. Restored results are view only because the source audio does not survive a reload. The current target, analysis mode, custom target fields, and decoder preference are restored before results are reconciled. If those settings cannot be committed to localStorage, the app keeps a persistent warning and stops adding new results to recovery so a reload cannot silently combine them with stale settings. Removing a file still updates its existing recovery copy, and Clear Session reports success only after deletion commits. With several tabs open at once, each tab owns its recovery copies: restore surfaces everything it can read, but one tab clearing its session leaves the other tabs' copies alone.
+**Live session restore** is automatic when IndexedDB is available. Completed results are mirrored into this browser as they finish. Saves, retries, deletes, and Clear Session are serialized; the app reports a persistent warning if the browser blocks storage or a transaction cannot be committed. Restored results are view only because the source audio does not survive a reload. The current target, analysis mode, custom target fields, and decoder preference are restored before results are reconciled. If those settings cannot be committed to localStorage, the app keeps a persistent warning and stops adding new results to recovery so a reload cannot silently combine them with stale settings. Removing a file still updates its existing recovery copy, and Clear Session reports success only after deletion commits; it also empties this tab's quarantined records, which are the recovery rows that failed validation during a restore. With several tabs open at once, each tab owns its recovery copies: restore surfaces everything it can read, but one tab clearing its session leaves the other tabs' copies alone.
 
 **Local history** is off by default. Turn it on and finished readings are saved as small summary cards in this browser only. It keeps the most recent 20. Turning history off stops new summaries but does not delete existing ones; the count and clear control remain available. Migrated legacy summaries are marked when their original validity/provenance contract is unknown. It is a quick recall list, not a full session restore, and it never leaves your machine.
 
@@ -100,13 +100,13 @@ Three related things, with different jobs.
 
 ## Exports
 
-Completed results export to three formats, each stamped with the export time so repeated exports never overwrite each other:
+Completed results export to three formats, each stamped with the export time so repeated exports never overwrite each other. The stamp has one-second resolution, so a second export of the same kind inside one second gains a `-2`, `-3`, and so on. The counter is per filename family: exporting CSV and then JSON in the same second gives both the plain stamp, because their extensions already differ.
 
 - `truepeak-analysis-YYYYMMDD-HHMMSS.csv`
 - `truepeak-analysis-YYYYMMDD-HHMMSS.json`
 - `truepeak-analysis-YYYYMMDD-HHMMSS.md`
 
-Session saves follow the same pattern (`truepeak-session-YYYYMMDD-HHMMSS.truepeak.json`). The CSV escapes quotes, commas, and line breaks correctly, neutralizes values that a spreadsheet might otherwise treat as a formula, and starts with a UTF-8 byte-order mark so Excel reads accented filenames correctly. The Markdown file reads like a short technical handoff rather than a raw dump.
+Session saves and timeline CSVs follow the same pattern, each with its own counter (`truepeak-session-YYYYMMDD-HHMMSS.truepeak.json`, `truepeak-timeline-YYYYMMDD-HHMMSS.csv`). The CSV escapes quotes, commas, and line breaks correctly, neutralizes values that a spreadsheet might otherwise treat as a formula, and starts with a UTF-8 byte-order mark so Excel reads accented filenames correctly. The Markdown file reads like a short technical handoff rather than a raw dump.
 
 ## Privacy
 
@@ -114,7 +114,7 @@ Audio bytes, decoded PCM, measurements, session recovery data, and optional hist
 
 ## Security
 
-Untrusted input (audio files and imported session files) goes through strict, capped validation, and a fuzzer checks those same paths on every push. Responses carry a tight Content Security Policy and related headers. The ffmpeg.wasm runtime is pinned to known fingerprints at build time, and CI fails when a dependency carries a serious known advisory. The threat model, the protections, the accepted risks, and how to report a problem are all documented in [SECURITY.md](./SECURITY.md).
+Untrusted input (audio files and imported session files) goes through strict, capped validation, and a fuzzer checks those same paths on every push. Responses carry a tight Content Security Policy and related headers. The ffmpeg.wasm runtime is pinned to known fingerprints at build time, and CI fails when a runtime dependency carries a serious known advisory. The threat model, the protections, the accepted risks, and how to report a problem are all documented in [SECURITY.md](./SECURITY.md).
 
 ## Architecture
 
@@ -197,16 +197,16 @@ A good first run: leave it in Simple mode, add a few WAV or AIFF files (drop the
 
 ## Testing
 
-`npm test` runs about 590 fixed assertions plus 1,362 deterministic fuzz cases across nine harnesses in `scripts/dsp/`:
+`npm test` runs 629 fixed assertions plus 1,362 deterministic fuzz cases across nine harnesses in `scripts/dsp/`:
 
-- **DSP:** measures known reference signals, validity boundaries, channel weighting, peak/timeline invariants, repeatability, and targeting/compliance behavior.
+- **DSP:** measures known reference signals, validity boundaries, channel weighting (including the maskless fallbacks agreeing with the speaker-mask path), peak/timeline invariants, repeatability, and targeting/compliance behavior.
 - **EBU reference subset:** reproduces the published EBU Tech 3341 and 3342 cases that can be synthesized from their documented parameters, and asserts the standards' own expected readings. It runs 17 of the 23 Tech 3341 cases and 4 of the 6 Tech 3342 cases. The rest (Tech 3341 cases 7, 8, and 20 to 23, and Tech 3342 cases 5 and 6) need the EBU reference-audio downloads or 4x-fs synthesis and are not reproduced. Passing this subset is not EBU certification.
 - **Session files:** exercises v2 round trips, v1 compatibility, provenance, full-file atomic rejection, cross-field invariants, aggregate timeline limits, UTF-8 size limits, and portable downsampling.
-- **Robustness:** feeds malformed parser/analyzer inputs, unsupported rates, RF64/AIFC edge cases, and hostile resource declarations through fail-closed paths.
-- **Export:** checks measurement-validity wording, provenance, CSV formula neutralization, Markdown/HTML structure escaping, selectors, and timestamped filenames.
+- **Robustness:** feeds malformed parser/analyzer inputs, unsupported rates, RF64/AIFC edge cases, duplicate-chunk containers that would otherwise decode geometry the preflight never saw, and hostile resource declarations through fail-closed paths.
+- **Export:** checks measurement-validity wording, provenance, CSV formula neutralization, Markdown/HTML structure escaping, selectors, and the timestamped filename contract including same-second collisions.
 - **Presets:** checks the delivery presets and the custom-target flow, covering field validation, range boundaries, modified/reset state, and round trips.
-- **Live session:** exercises persistence races, clear/save ordering, and provenance recovery for the IndexedDB-backed live session store.
-- **Runtime:** exercises decoded-resource budgets, reservation contention handling, the browser-decode window, FLAC footprint corroboration, cancellation draining, and bounded folder traversal.
+- **Live session:** exercises persistence races, clear/save ordering, cross-tab ownership and heartbeat refresh, quarantine cleanup, and provenance recovery for the IndexedDB-backed live session store.
+- **Runtime:** exercises decoded-resource budgets, container preflight against inconsistent header geometry, reservation contention handling, the browser-decode window, FLAC footprint corroboration, cancellation draining, and bounded folder traversal.
 - **Fuzz (1,362 cases):** a seeded, reproducible fuzzer mutates valid WAV, AIFF, FLAC, and session files, feeds in raw noise as well, and runs all of it through every parser that touches untrusted bytes. Each case has to fail cleanly or produce sane output inside a time budget. The seed is fixed, so any failure reproduces exactly.
 
 The live session and runtime harnesses (`validate-live-session.mjs` and `validate-runtime.mjs`) are included in `npm test` like the rest, but can also be run directly with Node when you only want that one suite.
@@ -277,7 +277,7 @@ Parallel lanes still improve normal desktop batches, but browser codec support a
 - Restored results and session files store readings and charts, not the source audio, so they cannot be analyzed again.
 - Local history keeps summary cards only, not full sessions.
 - Automatic recovery depends on browser IndexedDB. Storage failures are reported, but a downloaded session file is the portable backup.
-- Compressed format behaviour can vary slightly by browser and codec support.
+- Compressed format behavior can vary slightly by browser and codec support.
 - Telemetry is off by default. Analytics and Speed Insights send visit and performance data only when the build runs on Vercel with `NEXT_PUBLIC_ENABLE_TELEMETRY=1`; audio and measurement content are never sent through those integrations.
 - The EBU harness is a reference subset, not certification. The earlier DSP and parser gaps are now handled (WAVE quad-mask weighting, 400 ms validity at odd rates such as 11,025 Hz, trailing-silence LRA, RF64 declared-size handling, and mandatory AIFC conformance). The suite stays a subset because Tech 3341 cases 7, 8, and 20 to 23, and Tech 3342 cases 5 and 6, need EBU reference-audio downloads or 4x-fs synthesis, so passing it is not a standards conformance guarantee.
 - **Measurement limitations:** the K-weighting filter is re-derived per sample rate with a pre-warped bilinear transform, which matches the 48 kHz reference response almost exactly at normal delivery rates but steepens near Nyquist at low sample rates. For programme sampled below roughly 24 kHz with substantial energy in its top octave, integrated/momentary/short-term loudness can read up to about 0.4 LU higher than the same audio would measure at 48 kHz (for example, roughly +0.42 LU at 8 kHz and +0.15 LU at 16 kHz for a top-octave-heavy signal). 44.1 kHz and 48 kHz and above are effectively unaffected (well under 0.01 LU). True peak measurement is not affected.

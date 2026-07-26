@@ -1,5 +1,6 @@
 "use client";
 
+import type { Ref } from "react";
 import { AlertTriangle, BookOpen, ExternalLink, Info, RotateCcw } from "lucide-react";
 import {
   CUSTOM_PRESET_ID,
@@ -116,7 +117,7 @@ function ViewSourceLink({ url, sourceLabel }: { url: string; sourceLabel: string
       href={url}
       target="_blank"
       rel="noreferrer"
-      className="mt-3 inline-flex min-h-11 items-center gap-2 rounded-full border border-[var(--line)] bg-[var(--surface-0)] px-4 py-2 text-sm font-semibold text-[var(--ink)] transition hover:border-[var(--accent)] hover:text-[var(--accent)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)] focus-visible:ring-offset-2 focus-visible:ring-offset-[var(--surface-1)]"
+      className="mt-3 inline-flex min-h-11 items-center gap-2 rounded-full border border-[var(--line)] bg-[var(--surface-0)] px-4 py-2 text-sm font-semibold text-[var(--ink)] transition hover:border-[var(--accent)] hover:text-[var(--accent-text)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)] focus-visible:ring-offset-2 focus-visible:ring-offset-[var(--surface-1)]"
     >
       View {sourceLabel}
       <span className="sr-only"> (opens in a new tab)</span>
@@ -138,6 +139,8 @@ interface PresetDetailPaneProps {
   onCustomTruePeakChange: (value: string) => void;
   onPolicyChange: (policy: TargetPreset["policy"]) => void;
   onResetToPublished: () => void;
+  /** Focus target for the narrow master/detail step change. */
+  headingRef?: Ref<HTMLHeadingElement>;
   className?: string;
 }
 
@@ -162,6 +165,7 @@ export function PresetDetailPane({
   onCustomTruePeakChange,
   onPolicyChange,
   onResetToPublished,
+  headingRef,
   className,
 }: PresetDetailPaneProps) {
   const isCustom = selectedPresetId === CUSTOM_PRESET_ID;
@@ -188,7 +192,16 @@ export function PresetDetailPane({
       <div className="space-y-3">
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div className="min-w-0">
-            <h3 className="text-lg font-semibold text-[var(--ink)]">
+            {/* tabIndex -1 so the narrow master/detail flow can land focus here
+                after the list pane is hidden. Without a focus target the browser
+                drops focus to <body> when the previously focused radio is
+                display:none'd, and the drawer's focus trap then bounces the next
+                Tab back to Close. */}
+            <h3
+              ref={headingRef}
+              tabIndex={-1}
+              className="text-lg font-semibold text-[var(--ink)] focus:outline-none"
+            >
               {preset ? preset.label : "Custom Target"}
             </h3>
           </div>

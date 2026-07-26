@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
-import { Check, ChevronLeft } from "lucide-react";
+import { Check, ChevronLeft, ChevronRight } from "lucide-react";
 import { CUSTOM_PRESET_ID, TARGET_PRESETS, type TargetDraftErrors } from "@/audio/presets";
 import { DrawerPanel } from "@/components/drawer-panel";
 import { PresetDetailPane } from "@/components/preset-detail-pane";
@@ -96,6 +96,12 @@ export function PresetLibraryDrawer({
   const listScrollRef = useRef<HTMLDivElement | null>(null);
   const listScrollTopRef = useRef(0);
   const pendingFocusRef = useRef<string | null>(null);
+  // Which pane should receive focus after a narrow-layout step change. Switching
+  // steps applies display:none to the pane holding the focused control, so
+  // without an explicit move focus falls to <body> and the drawer's focus trap
+  // sends the next Tab back to Close.
+  const pendingStepFocusRef = useRef<"list" | "detail" | null>(null);
+  const detailHeadingRef = useRef<HTMLHeadingElement | null>(null);
 
   const activeErrors = ERROR_FIELDS.filter((field) => fieldErrors?.[field.key]);
   const hasFieldErrors = activeErrors.length > 0;
@@ -151,21 +157,55 @@ export function PresetLibraryDrawer({
     }
   }, [focusTick]);
 
+  // Land focus on the pane a step change just revealed.
+  useLayoutEffect(() => {
+    const step = pendingStepFocusRef.current;
+    if (!step) {
+      return;
+    }
+    const target =
+      step === "detail"
+        ? detailHeadingRef.current
+        : rootRef.current?.querySelector<HTMLElement>(
+            `input[name="preset-selection"][value="${CSS.escape(selectedPresetId)}"]`,
+          );
+    if (target && target.offsetParent !== null) {
+      target.focus();
+      pendingStepFocusRef.current = null;
+    }
+  }, [focusTick, selectedPresetId]);
+
   const requestFieldFocus = (name: string) => {
     pendingFocusRef.current = name;
     setMobileView("detail");
     setFocusTick((tick) => tick + 1);
   };
 
-  const handleSelect = (presetId: string) => {
+  const handleSelect = (presetId: string, viaPointer: boolean) => {
     // Preserve list scroll before the row navigates to detail on mobile.
     listScrollTopRef.current = listScrollRef.current?.scrollTop ?? 0;
     onSelectPreset(presetId);
+    // Only a pointer activation advances the step. Native radio arrow keys also
+    // fire change, and advancing on those hid the pane holding the focused radio
+    // on the very first ArrowDown, so the group could not be browsed by keyboard
+    // at all. Keyboard users reach the detail step through the explicit button
+    // rendered below the list instead.
+    if (viaPointer) {
+      setMobileView("detail");
+    }
+  };
+
+  const showDetailStep = () => {
+    listScrollTopRef.current = listScrollRef.current?.scrollTop ?? 0;
+    pendingStepFocusRef.current = "detail";
     setMobileView("detail");
+    setFocusTick((tick) => tick + 1);
   };
 
   const handleBack = () => {
+    pendingStepFocusRef.current = "list";
     setMobileView("list");
+    setFocusTick((tick) => tick + 1);
   };
 
   const selectedPreset = TARGET_PRESETS.find((preset) => preset.id === selectedPresetId);
@@ -238,7 +278,7 @@ export function PresetLibraryDrawer({
             <button
               type="button"
               onClick={handleBack}
-              className="-ml-2 inline-flex min-h-11 items-center gap-1.5 rounded-full px-2 py-1 text-sm font-semibold text-[var(--accent)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)]"
+              className="-ml-2 inline-flex min-h-11 items-center gap-1.5 rounded-full px-2 py-1 text-sm font-semibold text-[var(--accent-text)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)]"
             >
               <ChevronLeft className="h-4 w-4" aria-hidden="true" />
               All presets
@@ -270,12 +310,32 @@ export function PresetLibraryDrawer({
             onCustomTruePeakChange={onCustomTruePeakChange}
             onPolicyChange={onPolicyChange}
             onResetToPublished={onResetToPublished}
+            headingRef={detailHeadingRef}
             className={cn(
               "min-h-0 flex-1",
               mobileView === "list" ? "hidden @[46rem]:block" : "block",
             )}
           />
         </div>
+
+        {/* Keyboard (and any non-pointer) route into the detail step. Selecting
+            with the arrow keys deliberately stays on the list, so without this
+            the detail pane would be unreachable below 46rem. Hidden once both
+            panes are on screen together. */}
+        {mobileView === "list" ? (
+          <div className="mt-3 shrink-0 @[46rem]:hidden">
+            <Button
+              type="button"
+              size="sm"
+              variant="secondary"
+              onClick={showDetailStep}
+              className="w-full justify-center"
+            >
+              Open {applyLabel} settings
+              <ChevronRight className="h-4 w-4" aria-hidden="true" />
+            </Button>
+          </div>
+        ) : null}
 
         {/* Polite status region for the valid-but-unapplied preview (UX-004). */}
         <div aria-live="polite" className="shrink-0 empty:hidden">

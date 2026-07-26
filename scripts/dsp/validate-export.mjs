@@ -12,7 +12,7 @@ const {
   getExportFileName,
   getIntegratedMeasurementPresentation,
 } = await import("../../src/audio/export.ts");
-const { formatIntegratedLufs, formatLoudnessRange } = await import("../../src/lib/format.ts");
+const { fileNameTimestamp, formatIntegratedLufs, formatLoudnessRange } = await import("../../src/lib/format.ts");
 const { loadRecentSessions, mergeRecentSessions } = await import("../../src/audio/persistence.ts");
 const {
   readAnalysisSettingsPreference,
@@ -444,8 +444,32 @@ check("json extension", getExportFileName("json").endsWith(".json"));
 check("markdown extension", getExportFileName("markdown").endsWith(".md"));
 check(
   "filenames embed a timestamp",
-  /^truepeak-analysis-\d{8}-\d{6}\.csv$/.test(getExportFileName("csv")),
+  // The stamp is second-resolution, so a repeat inside the same second carries a
+  // "-2", "-3", ... discriminator. Earlier checks in this file already consumed
+  // the csv scope, hence the optional suffix here.
+  /^truepeak-analysis-\d{8}-\d{6}(-\d+)?\.csv$/.test(getExportFileName("csv")),
 );
+{
+  // The stamp contract, on scopes nothing else in this file touches so the
+  // counters are provably at zero.
+  const first = fileNameTimestamp("export-suite-a");
+  check("an ordinary export gets the plain, unsuffixed stamp", /^\d{8}-\d{6}$/.test(first), first);
+
+  // A repeat of the SAME export inside the same second must not collide: that is
+  // the whole point of stamping the filename in the first place.
+  const second = fileNameTimestamp("export-suite-a");
+  check("repeated same-second exports get distinct stamps", first !== second, `${first} vs ${second}`);
+  check("the disambiguated stamp is the base plus a counter", second === `${first}-2`, second);
+  check("a third repeat keeps counting", fileNameTimestamp("export-suite-a") === `${first}-3`);
+
+  // The counter is per filename family. A CSV and a JSON export in the same
+  // second cannot collide (their extensions differ), so the second one must not
+  // inherit a suffix from the first.
+  check(
+    "a different filename family in the same second still gets the plain stamp",
+    /^\d{8}-\d{6}$/.test(fileNameTimestamp("export-suite-b")),
+  );
+}
 
 console.log(`\n==== Export: ${passed} passed, ${failed} failed ====\n`);
 process.exit(failed ? 1 : 0);

@@ -252,7 +252,10 @@ export function parseWavBuffer(
     throw new Error("Wave file does not contain decoded audio frames.");
   }
 
-  const channelLayout = deriveChannelLayout(channelCount, speakerMask);
+  // "wave" so a plain 16-byte `fmt ` chunk (no dwChannelMask) is laid out the
+  // way WAVE interleaves, matching what the mask path resolves for the same file
+  // when the mask is present.
+  const channelLayout = deriveChannelLayout(channelCount, speakerMask, "wave");
 
   if (sourceFormat === "rf64") {
     warnings.push(

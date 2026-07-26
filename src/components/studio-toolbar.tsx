@@ -194,6 +194,34 @@ export function StudioToolbar({
     return () => window.removeEventListener("resize", updatePlacement);
   }, [menuOpen, isCompactMenu]);
 
+  // Publish the sticky bar's real height so globals.css can reserve it as
+  // scroll-padding on the scroll root. The toolbar stacks to two rows below xl
+  // and grows again while a batch progress row is showing, so a hard-coded
+  // offset is wrong at most widths: measure instead. Anything that scrolls into
+  // view (focus, scrollIntoView, anchor jumps) then clears the bar rather than
+  // parking underneath it.
+  useEffect(() => {
+    const wrapper = wrapperRef.current;
+    if (!wrapper || typeof ResizeObserver === "undefined") {
+      return;
+    }
+
+    const publish = () => {
+      const height = wrapper.getBoundingClientRect().height;
+      if (height > 0) {
+        document.documentElement.style.setProperty("--tp-toolbar-height", `${Math.round(height)}px`);
+      }
+    };
+
+    publish();
+    const observer = new ResizeObserver(publish);
+    observer.observe(wrapper);
+    return () => {
+      observer.disconnect();
+      document.documentElement.style.removeProperty("--tp-toolbar-height");
+    };
+  }, []);
+
   useEffect(() => {
     if (!menuOpen) {
       return;

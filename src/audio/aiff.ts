@@ -142,17 +142,29 @@ export function parseAiffBuffer(
     const dataOffset = offset + 8;
     chunksVisited += 1;
 
-    if (chunkId === "FVER") {
+    // First occurrence wins for every chunk this parser consumes. inspectAiff
+    // (decode-budget.ts) latches the first COMM/SSND pair it sees and stops, so
+    // a later duplicate must not change the geometry used here: an AIFC laid out
+    // COMM#1, SSND, COMM#2, FVER would otherwise get its decode budget approved
+    // from COMM#1 while this parser allocates from COMM#2's frame count. The
+    // scan still continues past COMM+SSND for AIFC because FVER may legitimately
+    // trail them, which is why the latch matters rather than the break below.
+    //
+    // The size predicates mirror inspectAiff's, so both sides skip the same
+    // chunks. The inspector ignores a COMM below 18 bytes and an SSND below 8
+    // and keeps walking; latching one here regardless would reject a file the
+    // inspector reads happily from a later, well-formed chunk.
+    if (chunkId === "FVER" && !fverOffset) {
       fverOffset = dataOffset;
       fverSize = chunkSize;
     }
 
-    if (chunkId === "COMM") {
+    if (chunkId === "COMM" && !commOffset && chunkSize >= 18) {
       commOffset = dataOffset;
       commSize = chunkSize;
     }
 
-    if (chunkId === "SSND") {
+    if (chunkId === "SSND" && !ssndOffset && chunkSize >= 8) {
       ssndOffset = dataOffset;
       ssndSize = chunkSize;
     }

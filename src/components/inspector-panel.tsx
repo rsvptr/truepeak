@@ -326,10 +326,10 @@ export function InspectorPanel({
               // Spin a wrapper element, not the SVG itself: transforms on SVG
               // elements are not hardware accelerated in several browsers.
               <span className="inline-flex animate-spin">
-                <LoaderCircle className="h-5 w-5 text-[var(--accent)]" />
+                <LoaderCircle className="h-5 w-5 text-[var(--accent)]" aria-hidden="true" />
               </span>
             ) : (
-              <CircleAlert className="h-5 w-5 text-[var(--accent)]" />
+              <CircleAlert className="h-5 w-5 text-[var(--accent)]" aria-hidden="true" />
             )}
             <div className="text-[11px] uppercase tracking-[0.18em]">Status</div>
           </div>
@@ -412,10 +412,15 @@ export function InspectorPanel({
             </div>
           </section>
 
+          {/* The panel uses the pre-mixed --warning-line / --warning-soft tokens
+              rather than /30 and /12 opacity utilities: those compile to a
+              fallback that resolves to the solid --warning on engines without
+              color-mix, which would put warning-coloured text on a
+              warning-coloured panel. */}
           {selectedNotes.length ? (
-            <section className="rounded-[24px] border border-[color:var(--warning)]/30 bg-[color:var(--warning)]/12 p-5">
+            <section className="rounded-[24px] border border-[var(--warning-line)] bg-[var(--warning-soft)] p-5">
               <div className="flex items-center gap-2 text-[11px] uppercase tracking-[0.18em] text-[var(--warning)]">
-                <CircleAlert className="h-4 w-4" />
+                <CircleAlert className="h-4 w-4" aria-hidden="true" />
                 Notes and warnings
               </div>
               <div className="mt-4 space-y-2 text-sm leading-6 text-[var(--ink)]/85">

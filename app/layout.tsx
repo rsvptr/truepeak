@@ -1,8 +1,7 @@
 import type { Metadata, Viewport } from "next";
 import { cookies } from "next/headers";
 import { IBM_Plex_Mono, Space_Grotesk } from "next/font/google";
-import { Analytics } from "@vercel/analytics/react";
-import { SpeedInsights } from "@vercel/speed-insights/next";
+import { Telemetry } from "@/components/telemetry";
 import "./globals.css";
 
 const sans = Space_Grotesk({
@@ -112,12 +111,7 @@ export default async function RootLayout({ children }: Readonly<{ children: Reac
           }}
         />
         {children}
-        {enableVercelInsights ? (
-          <>
-            <Analytics />
-            <SpeedInsights />
-          </>
-        ) : null}
+        {enableVercelInsights ? <Telemetry /> : null}
       </body>
     </html>
   );

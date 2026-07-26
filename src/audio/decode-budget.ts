@@ -737,7 +737,21 @@ function inspectWave(view: DataView, totalBytes: number): AudioContainerPrefligh
     return null;
   }
 
-  const frameCount = Math.floor(dataBytes / blockAlign);
+  // The authorized footprint must never sit below what a decode actually
+  // allocates. decodePcmToPlanar (wav.ts) strides by channelCount *
+  // (bitsPerSample / 8) and never reads blockAlign at all, but blockAlign is an
+  // untrusted uint16 out of `fmt `, so sizing frames by it alone let a file
+  // declaring blockAlign 65535 against 8-bit mono PCM under-report by 65536x -
+  // the parser then committed the real, far larger Float32Arrays before
+  // validateNativeAsset could reject the mismatch. Take whichever stride yields
+  // the LARGER frame count. For a well-formed file the two are equal, so the
+  // trusted-footprint fast path is unchanged; only inconsistent containers get
+  // the more conservative plan. nativeDecodeSafe is not a substitute for this:
+  // it only feeds planLaneAdmission's scheduling decision and never gates
+  // whether parseWavBuffer runs, so the footprint itself has to be honest.
+  const parserStride = channelCount * (bitDepth / 8);
+  const stride = parserStride > 0 ? Math.min(blockAlign, parserStride) : blockAlign;
+  const frameCount = Math.floor(dataBytes / stride);
   if (!Number.isSafeInteger(frameCount) || frameCount <= 0) {
     return null;
   }

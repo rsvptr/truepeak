@@ -447,7 +447,7 @@ export function SessionInsightsPanel({
                     href={currentTarget.referenceUrl}
                     target="_blank"
                     rel="noreferrer"
-                    className="mt-4 inline-flex items-center gap-2 rounded-full border border-[var(--line)] bg-[var(--surface-0)] px-4 py-2 text-sm font-semibold text-[var(--ink)] transition-[border-color,color,background-color] duration-200 ease-out hover:border-[var(--accent)] hover:text-[var(--accent)]"
+                    className="mt-4 inline-flex items-center gap-2 rounded-full border border-[var(--line)] bg-[var(--surface-0)] px-4 py-2 text-sm font-semibold text-[var(--ink)] transition-[border-color,color,background-color] duration-200 ease-out hover:border-[var(--accent)] hover:text-[var(--accent-text)]"
                   >
                     View {currentTarget.sourceLabel}
                     <span className="sr-only"> (opens in a new tab)</span>
