@@ -6,27 +6,34 @@ import {
   inspectAudioContainer,
   resolveDecodeBudget,
   throwIfAborted,
+  validateDecodeProbeMetadata,
   validatePlanarChannels,
 } from "@/audio/decode-budget";
 import { toTransferAsset } from "@/audio/serialise";
-import type { DecodeBudget } from "@/audio/decode-budget";
+import type { DecodeBudget, DecodeProbeMetadata } from "@/audio/decode-budget";
 import type { DecodedAudioTransfer, SourceFormat } from "@/types/audio";
 
 const WAVE_EXTENSIONS = new Set(["wav", "rf64"]);
 const AIFF_EXTENSIONS = new Set(["aif", "aiff", "aifc"]);
+const CHANNEL_COPY_CHUNK_SAMPLES = 1024 * 1024;
 const numberFormatter = new Intl.NumberFormat("en-GB");
 
-interface FlacStreamInfo {
-  sampleRate: number;
-  channelCount: number;
-  bitDepth: number;
-  frameCount: number;
-  durationSeconds: number;
+interface BrowserSourceMetadata extends DecodeProbeMetadata {
+  bitDepth?: number;
+  label: string;
+  frameCountExact: boolean;
 }
+
+type FlacStreamInfo = BrowserSourceMetadata & { bitDepth: number };
 
 export interface BrowserDecodeOptions {
   signal?: AbortSignal;
   budget?: DecodeBudget;
+  sourceMetadata?: DecodeProbeMetadata & {
+    bitDepth?: number;
+    label?: string;
+    frameCountExact?: boolean;
+  };
 }
 
 function inferSourceFormat(fileName: string): SourceFormat {
@@ -66,15 +73,26 @@ export function shouldPreferBrowserDecoder(fileName: string, mimeType: string) {
   return true;
 }
 
-function getAudioContextConstructor() {
-  const candidate =
+type OfflineAudioContextConstructor = new (
+  numberOfChannels: number,
+  length: number,
+  sampleRate: number,
+) => OfflineAudioContext;
+
+function getDecodeContextConstructors() {
+  const realtime =
     window.AudioContext ??
     (window as Window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
-  if (!candidate) {
+  const offline =
+    window.OfflineAudioContext ??
+    (window as Window & {
+      webkitOfflineAudioContext?: OfflineAudioContextConstructor;
+    }).webkitOfflineAudioContext;
+  if (!realtime && !offline) {
     throw new Error("This browser does not expose a Web Audio decoder.");
   }
 
-  return candidate;
+  return { realtime, offline };
 }
 
 // Exported for the fuzz suite: this runs on the main thread against untrusted
@@ -82,12 +100,14 @@ function getAudioContextConstructor() {
 export function parseFlacStreamInfo(buffer: ArrayBuffer): FlacStreamInfo | null {
   const metadata = inspectAudioContainer(buffer);
   return metadata?.container === "flac"
-    ? {
+      ? {
         sampleRate: metadata.sampleRate,
         channelCount: metadata.channelCount,
         bitDepth: metadata.bitDepth,
         frameCount: metadata.frameCount,
         durationSeconds: metadata.durationSeconds,
+        label: "FLAC STREAMINFO",
+        frameCountExact: true,
       }
     : null;
 }
@@ -232,25 +252,74 @@ function createDecodeSignal(externalSignal: AbortSignal | undefined, maxDecodeMs
   };
 }
 
-function createAudioContext(
-  AudioContextConstructor: typeof AudioContext,
-  sourceMetadata: FlacStreamInfo | null,
+function createDecodeContext(
+  constructors: ReturnType<typeof getDecodeContextConstructors>,
+  sourceMetadata: BrowserSourceMetadata | null,
 ) {
   if (sourceMetadata?.sampleRate) {
-    try {
-      return {
-        context: new AudioContextConstructor({ sampleRate: sourceMetadata.sampleRate }),
-        requestedSourceRate: true,
-      };
-    } catch {
-      // Some browsers expose the options bag but reject specific rates. Fall back to default decode behaviour.
+    if (constructors.offline) {
+      try {
+        return {
+          context: new constructors.offline(
+            sourceMetadata.channelCount,
+            1,
+            sourceMetadata.sampleRate,
+          ) as BaseAudioContext,
+          requestedSourceRate: true,
+          offline: true,
+          cleanup: () => undefined,
+        };
+      } catch {
+        // Fall through to a source-rate realtime context on older engines.
+      }
+    }
+
+    if (constructors.realtime) {
+      try {
+        const context = new constructors.realtime({ sampleRate: sourceMetadata.sampleRate });
+        return {
+          context,
+          requestedSourceRate: true,
+          offline: false,
+          cleanup: () => void context.close().catch(() => undefined),
+        };
+      } catch {
+        // Some browsers expose the options bag but reject specific rates. Fall back to default decode behaviour.
+      }
     }
   }
 
-  return {
-    context: new AudioContextConstructor(),
-    requestedSourceRate: false,
-  };
+  if (constructors.realtime) {
+    try {
+      const context = new constructors.realtime();
+      return {
+        context,
+        requestedSourceRate: false,
+        offline: false,
+        cleanup: () => void context.close().catch(() => undefined),
+      };
+    } catch {
+      throw new Error("This browser could not create an audio decoding context.");
+    }
+  }
+
+  throw new Error("This browser could not create an audio decoding context.");
+}
+
+async function copyChannelWithYield(
+  source: Float32Array,
+  signal: AbortSignal,
+) {
+  const copy = new Float32Array(source.length);
+  for (let offset = 0; offset < source.length; offset += CHANNEL_COPY_CHUNK_SAMPLES) {
+    throwIfAborted(signal);
+    const end = Math.min(source.length, offset + CHANNEL_COPY_CHUNK_SAMPLES);
+    copy.set(source.subarray(offset, end), offset);
+    if (end < source.length) {
+      await new Promise<void>((resolve) => window.setTimeout(resolve, 0));
+    }
+  }
+  return copy;
 }
 
 export async function decodeAudioFileInBrowser(
@@ -259,10 +328,10 @@ export async function decodeAudioFileInBrowser(
   sourceBuffer?: ArrayBuffer,
   options: BrowserDecodeOptions = {},
 ): Promise<DecodedAudioTransfer> {
-  const AudioContextConstructor = getAudioContextConstructor();
+  const contextConstructors = getDecodeContextConstructors();
   const budget = resolveDecodeBudget(options.budget);
   const decodeSignal = createDecodeSignal(options.signal, budget.maxDecodeMs);
-  let context: AudioContext | null = null;
+  let cleanupContext: (() => void) | null = null;
 
   try {
     throwIfAborted(decodeSignal.signal);
@@ -272,14 +341,22 @@ export async function decodeAudioFileInBrowser(
     const input = sourceBuffer ?? await file.arrayBuffer();
     throwIfAborted(decodeSignal.signal);
     assertSourceWithinBudget(input.byteLength, budget);
-    const sourceMetadata = parseFlacStreamInfo(input);
+    const parsedFlacMetadata = parseFlacStreamInfo(input);
+    const suppliedMetadata = options.sourceMetadata;
+    const sourceMetadata: BrowserSourceMetadata | null = suppliedMetadata
+      ? {
+          ...suppliedMetadata,
+          label: suppliedMetadata.label ?? "Source probe",
+          frameCountExact: suppliedMetadata.frameCountExact ?? false,
+        }
+      : parsedFlacMetadata;
     if (sourceMetadata) {
-      assertDecodedFootprint(sourceMetadata, budget, "FLAC STREAMINFO");
+      validateDecodeProbeMetadata(sourceMetadata, budget, sourceMetadata.label);
     }
-    const contextState = createAudioContext(AudioContextConstructor, sourceMetadata);
-    context = contextState.context;
+    const contextState = createDecodeContext(contextConstructors, sourceMetadata);
+    cleanupContext = contextState.cleanup;
     const decoded = await waitForBrowserDecodeDrain(
-      context.decodeAudioData(input),
+      contextState.context.decodeAudioData(input),
       decodeSignal.signal,
     );
     throwIfAborted(decodeSignal.signal);
@@ -313,9 +390,12 @@ export async function decodeAudioFileInBrowser(
     );
 
     const channels: Float32Array[] = [];
-    for (const channelView of channelViews) {
+    for (const [index, channelView] of channelViews.entries()) {
       throwIfAborted(decodeSignal.signal);
-      channels.push(new Float32Array(channelView));
+      channels.push(await copyChannelWithYield(channelView, decodeSignal.signal));
+      if (index + 1 < channelViews.length) {
+        await new Promise<void>((resolve) => window.setTimeout(resolve, 0));
+      }
     }
     throwIfAborted(decodeSignal.signal);
     validatePlanarChannels(
@@ -339,11 +419,11 @@ export async function decodeAudioFileInBrowser(
     }
     if (sourceMetadata) {
       decodeNotes.push(
-        `FLAC STREAMINFO reports ${numberFormatter.format(sourceMetadata.sampleRate)} Hz, ${sourceMetadata.bitDepth}-bit, ${sourceMetadata.channelCount} channel${sourceMetadata.channelCount === 1 ? "" : "s"}.`,
+        `${sourceMetadata.label} reports ${numberFormatter.format(sourceMetadata.sampleRate)} Hz${sourceMetadata.bitDepth == null ? "" : `, ${sourceMetadata.bitDepth}-bit`}, ${sourceMetadata.channelCount} channel${sourceMetadata.channelCount === 1 ? "" : "s"}.`,
       );
       if (contextState.requestedSourceRate) {
         decodeNotes.push(
-          `Requested browser decoding at the source sample rate of ${numberFormatter.format(sourceMetadata.sampleRate)} Hz.`,
+          `Requested ${contextState.offline ? "offline " : ""}browser decoding at the source sample rate of ${numberFormatter.format(sourceMetadata.sampleRate)} Hz.`,
         );
       }
       if (decoded.sampleRate !== sourceMetadata.sampleRate) {
@@ -356,7 +436,7 @@ export async function decodeAudioFileInBrowser(
           `Browser decoder returned ${decoded.numberOfChannels} channel${decoded.numberOfChannels === 1 ? "" : "s"} after source metadata reported ${sourceMetadata.channelCount}.`,
         );
       }
-      if (decoded.length !== sourceMetadata.frameCount) {
+      if (sourceMetadata.frameCountExact && decoded.length !== sourceMetadata.frameCount) {
         warnings.push(
           `Browser decoder returned ${numberFormatter.format(decoded.length)} frames after source metadata reported ${numberFormatter.format(sourceMetadata.frameCount)}; analysis uses the decoded PCM frame count.`,
         );
@@ -387,9 +467,8 @@ export async function decodeAudioFileInBrowser(
     throw new Error("The browser decoder could not read this audio file.");
   } finally {
     decodeSignal.cleanup();
-    // Always close the context, including the abort/zombie-drain path: a decode
-    // that never settled still holds native decoder resources, and closing lets
-    // the browser drop that work once the drain grace has given up on it.
-    void context?.close().catch(() => undefined);
+    // Realtime fallback contexts are always closed, including the zombie-drain
+    // path. Offline contexts never open an output stream and expose no close().
+    cleanupContext?.();
   }
 }

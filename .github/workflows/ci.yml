@@ -8,10 +8,55 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   verify:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    strategy:
+      matrix:
+        node-version: [24, 26]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+
+      # Scripts are disabled on install and the ffmpeg asset copy is run
+      # explicitly, so the only install-time script that executes is this
+      # project's own. It verifies the pinned SHA-256 hashes, so a tampered
+      # @ffmpeg/core fails the build here.
+      - name: Install
+        run: npm ci --ignore-scripts
+
+      - name: Prepare ffmpeg assets (includes integrity check)
+        run: npm run prepare:ffmpeg
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Type check
+        run: npx tsc --noEmit
+      - name: Type-check scripts
+        run: npm run typecheck:scripts
+
+      # DSP reference signals, EBU compliance, session round-trip/rejection,
+      # adversarial robustness, export escaping, and the deterministic fuzz
+      # suite over every untrusted-input parser.
+      - name: Validation suites
+        run: npm test
+
+  build:
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
         with:
@@ -22,22 +67,36 @@ jobs:
           node-version: 24
           cache: npm
 
-      # npm ci runs the postinstall ffmpeg asset copy, which verifies the pinned
-      # SHA-256 hashes, so a tampered @ffmpeg/core fails the build here.
-      - name: Install (includes ffmpeg integrity check)
-        run: npm ci
+      - name: Install
+        run: npm ci --ignore-scripts
 
-      - name: Lint
-        run: npm run lint
-
-      # DSP reference signals, EBU compliance, session round-trip/rejection,
-      # adversarial robustness, export escaping, and the deterministic fuzz
-      # suite over every untrusted-input parser.
-      - name: Validation suites
-        run: npm test
+      - name: Prepare ffmpeg assets (includes integrity check)
+        run: npm run prepare:ffmpeg
 
       - name: Production build
         run: npm run build
+
+      - name: Assert worker build contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -z "$(find .next/static/media -type f \( -name '*.worker.*.ts' -o -name 'worker.*.js' \) -print -quit)"
+          grep -R -l -F 'importScripts(' .next/static/chunks >/dev/null
+          grep -R -l -F 'type:void 0' .next/static/chunks >/dev/null
+          grep -R -l -F 'classWorkerURL:' .next/static/chunks >/dev/null
+          grep -R -l -F 'The compatibility decoder core could not load' .next/static/chunks >/dev/null
+          test -f public/vendor/ffmpeg/core/0.12.9/ffmpeg-core.js
+          test -f public/vendor/ffmpeg/core/0.12.9/ffmpeg-core.wasm
+          test -f public/vendor/ffmpeg/ffmpeg/0.12.15/worker.js
+
+      - name: Generate compatibility fixture
+        run: node scripts/dsp/make-alaw-test-audio.mjs
+
+      - name: Install Chromium
+        run: npx playwright install --with-deps chromium
+
+      - name: Compatibility decoder smoke test
+        run: npx playwright test --project=chromium
 
       # Blocking gate on what actually reaches a browser. Dev-only tooling is
       # audited separately below, because the lint toolchain periodically

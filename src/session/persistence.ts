@@ -73,6 +73,8 @@ function isRecentSessionEntry(
     entry.provenanceKind === "unverified-import";
   const integratedValidityPresent =
     typeof entry.integratedValid === "boolean";
+  const lraValidityPresent =
+    typeof entry.loudnessRangeValid === "boolean";
   const lraStabilityPresent =
     typeof entry.loudnessRangeUnstable === "boolean";
   const validatedV2 = entry.recordTrust === "validated-v2";
@@ -110,6 +112,8 @@ function isRecentSessionEntry(
       : entry.integratedInvalidReason === undefined) &&
     isBoundedNumber(entry.truePeakDbtp, -1000, 100) &&
     isBoundedNumber(entry.loudnessRange, 0, 1000) &&
+    (entry.loudnessRangeValid === undefined || lraValidityPresent) &&
+    (entry.loudnessRangeValid !== false || entry.loudnessRange === 0) &&
     (schema === "legacy" || legacyUnknown
       ? entry.loudnessRangeUnstable === undefined || lraStabilityPresent
       : lraStabilityPresent) &&
@@ -154,20 +158,18 @@ function normalizeRecentSessionEntries(value: unknown) {
         Array.isArray((value as Partial<RecentSessionsEnvelope>).entries)
       ? (value as Partial<RecentSessionsEnvelope>).entries!
       : null;
-  if (
-    !entries ||
-    entries.length > (legacy ? MAX_LEGACY_RECENT_ROWS : MAX_RECENT)
-  ) {
+  if (!entries || (legacy && entries.length > MAX_LEGACY_RECENT_ROWS)) {
     return null;
   }
 
+  // A row failing validation (schema drift from an older/newer build) or the
+  // envelope holding more than MAX_RECENT rows must not wipe the whole
+  // history: keep the valid rows and cap to the newest 20, the same way the
+  // legacy branch below tolerates partial validity.
   const normalized = entries.filter((entry) =>
     isRecentSessionEntry(entry, legacy ? "legacy" : "v2"),
   );
   const fullyValid = normalized.length === entries.length;
-  if (!legacy && !fullyValid) {
-    return null;
-  }
 
   return {
     entries: sortRecentSessions(
@@ -207,6 +209,9 @@ function completedJobsToEntries(jobs: AnalysisJob[]) {
           : {}),
         truePeakDbtp: result.metrics.truePeakDbtp,
         loudnessRange: result.metrics.loudnessRange,
+        ...(typeof result.metrics.loudnessRangeValid === "boolean"
+          ? { loudnessRangeValid: result.metrics.loudnessRangeValid }
+          : {}),
         ...(typeof result.metrics.loudnessRangeUnstable === "boolean"
           ? { loudnessRangeUnstable: result.metrics.loudnessRangeUnstable }
           : {}),

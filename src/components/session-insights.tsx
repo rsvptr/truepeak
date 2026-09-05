@@ -11,8 +11,6 @@ import {
   Sparkles,
   Waves,
 } from "lucide-react";
-import { getComplianceSummary } from "@/audio/compliance";
-import { resolveAnalysisProvenance } from "@/audio/session-file";
 import {
   formatDuration,
   formatIntegratedLufs,
@@ -23,30 +21,18 @@ import {
   formatPresetPeakDbtp,
   formatRelativeDb,
 } from "@/lib/format";
+import { cn } from "@/lib/utils";
 import {
-  averageIntegratedLufs,
-  getAttentionJobs,
-  getComplianceCounts,
-  getCompletedAnalysisJobs,
-  getDecoderMix,
-  getHighestProjectedPeakJob,
-  getHottestPeakJob,
-  getLargestMoveJob,
-  getLongestJob,
-  getMeasureOnlyFocusJobs,
-  getQuietestJob,
-  getSessionChannelLayouts,
-  getSessionSampleRates,
-  getTargetedFocusJobs,
-  getWidestRangeJob,
+  type SessionStats,
 } from "@/lib/session-selectors";
-import type { AnalysisJob, AnalysisMode, TargetPreset } from "@/types/audio";
+import { describeResultBadges } from "@/lib/job-ui";
+import type { AnalysisMode, TargetPreset } from "@/types/audio";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 
 interface SessionInsightsPanelProps {
-  completedJobs: AnalysisJob[];
+  sessionStats: SessionStats;
   currentTarget: TargetPreset | null;
   analysisMode: AnalysisMode;
   historyEnabled: boolean;
@@ -54,10 +40,6 @@ interface SessionInsightsPanelProps {
   onOpenCompare: () => void;
   onOpenQueue?: () => void;
   onOpenJob: (jobId: string) => void;
-}
-
-function isUnverifiedImport(job: AnalysisJob) {
-  return resolveAnalysisProvenance(job).kind === "unverified-import";
 }
 
 function InsightMetric({
@@ -79,7 +61,9 @@ function InsightMetric({
     >
       <div className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">{label}</div>
       <div className="mt-2 break-words text-[clamp(1.05rem,1.6vw,1.5rem)] font-semibold leading-tight tabular-nums text-[var(--ink)]">{value}</div>
-      <div className="mt-1 break-words text-xs leading-5 text-[var(--muted)]">{hint}</div>
+      {/* The accent-soft background drops muted text below 4.5:1 in light
+          theme, so the accent tile needs the stronger token here (UX-10). */}
+      <div className={cn("mt-1 break-words text-xs leading-5", accent ? "text-[var(--ink)]" : "text-[var(--muted)]")}>{hint}</div>
     </div>
   );
 }
@@ -108,16 +92,8 @@ function RecommendationCard({
   );
 }
 
-function average(values: number[]) {
-  if (!values.length) {
-    return null;
-  }
-
-  return values.reduce((sum, value) => sum + value, 0) / values.length;
-}
-
 export function SessionInsightsPanel({
-  completedJobs,
+  sessionStats,
   currentTarget,
   analysisMode,
   historyEnabled,
@@ -126,62 +102,31 @@ export function SessionInsightsPanel({
   onOpenQueue,
   onOpenJob,
 }: SessionInsightsPanelProps) {
-  const readyJobs = useMemo(() => getCompletedAnalysisJobs(completedJobs), [completedJobs]);
-
-  const averageIntegrated = useMemo(
-    () => averageIntegratedLufs(readyJobs),
-    [readyJobs],
-  );
-  const averagePeak = useMemo(
-    () => average(readyJobs.map((job) => job.result.metrics.truePeakDbtp)),
-    [readyJobs],
-  );
-  // Only average files that actually have a planned move; coercing missing
-  // deltas to 0 would drag the mean toward zero and misreport the batch.
-  const averageMove = useMemo(
-    () =>
-      average(
-        readyJobs
-          .map((job) => job.result.metrics.targetDeltaDb)
-          .filter((value): value is number => value != null),
-      ),
-    [readyJobs],
-  );
-
-  const sampleRates = useMemo(() => getSessionSampleRates(readyJobs), [readyJobs]);
-  const layouts = useMemo(() => getSessionChannelLayouts(readyJobs), [readyJobs]);
-  const decoderMix = useMemo(() => getDecoderMix(readyJobs), [readyJobs]);
-
-  const quietestJob = useMemo(() => getQuietestJob(readyJobs), [readyJobs]);
-  const hottestPeakJob = useMemo(() => getHottestPeakJob(readyJobs), [readyJobs]);
-  const widestRangeJob = useMemo(() => getWidestRangeJob(readyJobs), [readyJobs]);
-  const longestJob = useMemo(() => getLongestJob(readyJobs), [readyJobs]);
+  const {
+    attentionJobs,
+    averageIntegrated,
+    averageMove,
+    averagePeak,
+    ceilingLimitedJobs,
+    channelLayouts: layouts,
+    complianceCounts,
+    decoderMix,
+    highestProjectedPeak,
+    hottestPeakJob,
+    invalidIntegratedCount,
+    largestMoveJob,
+    longestJob,
+    measureOnlyFocusJobs,
+    quietestJob,
+    readyJobs,
+    sampleRates,
+    targetedFocusJobs,
+    unverifiedCount,
+    widestRangeJob,
+  } = sessionStats;
   // Small batches often have one file win both categories at once; fold
   // them into a single tile instead of repeating the file name (UX-011).
   const widestIsLongest = widestRangeJob != null && longestJob != null && widestRangeJob.id === longestJob.id;
-  const largestMoveJob = useMemo(() => getLargestMoveJob(readyJobs), [readyJobs]);
-  const highestProjectedPeak = useMemo(() => getHighestProjectedPeakJob(readyJobs), [readyJobs]);
-
-  const complianceCounts = useMemo(() => getComplianceCounts(readyJobs), [readyJobs]);
-  const attentionJobs = useMemo(() => getAttentionJobs(readyJobs), [readyJobs]);
-  const ceilingLimitedJobs = useMemo(
-    () => readyJobs.filter((job) => getComplianceSummary(job.result)?.state === "ceiling-limited"),
-    [readyJobs],
-  );
-  const invalidIntegratedCount = useMemo(
-    () =>
-      readyJobs.filter(
-        (job) => job.result.metrics.integratedValid === false,
-      ).length,
-    [readyJobs],
-  );
-  const unverifiedCount = useMemo(
-    () => readyJobs.filter(isUnverifiedImport).length,
-    [readyJobs],
-  );
-
-  const targetedFocusJobs = useMemo(() => getTargetedFocusJobs(readyJobs).slice(0, 4), [readyJobs]);
-  const measureOnlyFocusJobs = useMemo(() => getMeasureOnlyFocusJobs(readyJobs).slice(0, 4), [readyJobs]);
 
   const recommendations = useMemo(() => {
     const items: Array<{ title: string; body: string; tone: "default" | "warn" | "good" }> = [];
@@ -514,16 +459,16 @@ export function SessionInsightsPanel({
             <div className="mt-5 space-y-3">
               {focusJobs.length ? (
                 focusJobs.map((job) => {
-                  const summary = getComplianceSummary(job.result);
+                  const badges = describeResultBadges(job, analysisMode, true);
                   return (
                     <div key={job.id} className="min-w-0 overflow-hidden rounded-[22px] border border-[var(--line)] bg-[var(--surface-1)] p-4 [content-visibility:auto] [contain-intrinsic-size:190px]">
                       <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
                         <div className="min-w-0">
                           <div className="break-words text-sm font-semibold text-[var(--ink)]">{job.fileName}</div>
                           <div className="mt-2 flex flex-wrap gap-2">
-                            {summary ? <Badge>{summary.label}</Badge> : job.result.metrics.integratedValid === false ? <Badge className="tone-warning">Integrated unavailable</Badge> : <Badge>Measure Only</Badge>}
-                            {isUnverifiedImport(job) ? <Badge className="tone-warning">Unverified import</Badge> : null}
-                            <Badge className="max-w-full break-words border-[var(--line)] bg-[var(--surface-0)] text-[var(--muted)]">{job.result.metadata.decoderLabel}</Badge>
+                            {badges.map((badge) => (
+                              <Badge key={badge.key} className={badge.className}>{badge.label}</Badge>
+                            ))}
                             <Badge className="border-[var(--line)] bg-[var(--surface-0)] text-[var(--muted)]">{formatDuration(job.result.metadata.durationSeconds)}</Badge>
                           </div>
                           <div className="mt-3 break-words text-sm leading-6 text-[var(--muted)]">

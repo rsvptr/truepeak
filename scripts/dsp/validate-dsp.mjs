@@ -2,8 +2,12 @@
 // Generates known WAV signals, runs the real parser + analyzer, and checks the
 // measured loudness / true-peak / LRA against values we can derive analytically.
 //
-// Run: node scripts/dsp/validate-dsp.mjs
+// Run: npm run test:dsp
+import assert from "node:assert/strict";
 import { register } from "node:module";
+import test from "node:test";
+import { encodeWav } from "./lib/fixtures.mjs";
+import { makeAudioMetadata, makeTimeline } from "./lib/job-fixtures.mjs";
 
 register("./alias-loader.mjs", import.meta.url);
 
@@ -13,6 +17,7 @@ const {
   INVALID_INTEGRATED_TOO_SHORT_WARNING,
   INVALID_INTEGRATED_BELOW_GATE_WARNING,
   LRA_UNSTABLE_WARNING,
+  TRUE_PEAK_FIR,
 } = await import("../../src/audio/analysis.ts");
 const { deriveChannelLayout, getLoudnessWeight, describeLayoutRisk } = await import(
   "../../src/audio/channel-layout.ts"
@@ -22,41 +27,23 @@ const { applyTargetToMetrics, clearTargetFromMetrics, TARGET_LIMIT_WARNING } = a
 );
 const { getComplianceSummary } = await import("../../src/audio/compliance.ts");
 
-// ---- tiny float32 WAV encoder (IEEE float, interleaved) ----
-function encodeWavFloat32(channels, sampleRate) {
-  const channelCount = channels.length;
-  const frameCount = channels[0].length;
-  const bytesPerSample = 4;
-  const blockAlign = channelCount * bytesPerSample;
-  const dataBytes = frameCount * blockAlign;
-  const buffer = new ArrayBuffer(44 + dataBytes);
-  const view = new DataView(buffer);
-  const writeAscii = (offset, text) => {
-    for (let i = 0; i < text.length; i += 1) view.setUint8(offset + i, text.charCodeAt(i));
-  };
-  writeAscii(0, "RIFF");
-  view.setUint32(4, 36 + dataBytes, true);
-  writeAscii(8, "WAVE");
-  writeAscii(12, "fmt ");
-  view.setUint32(16, 16, true);
-  view.setUint16(20, 3, true); // WAVE_FORMAT_IEEE_FLOAT
-  view.setUint16(22, channelCount, true);
-  view.setUint32(24, sampleRate, true);
-  view.setUint32(28, sampleRate * blockAlign, true);
-  view.setUint16(32, blockAlign, true);
-  view.setUint16(34, 32, true);
-  writeAscii(36, "data");
-  view.setUint32(40, dataBytes, true);
-  let offset = 44;
-  for (let frame = 0; frame < frameCount; frame += 1) {
-    for (let ch = 0; ch < channelCount; ch += 1) {
-      view.setFloat32(offset, channels[ch][frame], true);
-      offset += 4;
-    }
-  }
-  return buffer;
-}
+/** @typedef {import("../../src/types/audio.ts").ChannelLabel} ChannelLabel */
+/** @typedef {import("../../src/types/audio.ts").ChannelLayout} ChannelLayout */
+/** @typedef {import("../../src/types/audio.ts").DecodedAudioAsset} DecodedAudioAsset */
+/** @typedef {import("../../src/types/audio.ts").AnalysisResult} AnalysisResult */
+/** @typedef {import("../../src/types/audio.ts").LoudnessMetrics} LoudnessMetrics */
+/** @typedef {import("../../src/types/audio.ts").TargetPreset} TargetPreset */
 
+/**
+ * @param {object} options
+ * @param {number} options.freq
+ * @param {number} options.amp
+ * @param {number} options.seconds
+ * @param {number} [options.sampleRate]
+ * @param {number} [options.channels]
+ * @param {number} [options.phase]
+ * @returns {Float32Array[]}
+ */
 function sine({ freq, amp, seconds, sampleRate = 48000, channels = 2, phase = 0 }) {
   const frameCount = Math.round(seconds * sampleRate);
   const data = Array.from({ length: channels }, () => new Float32Array(frameCount));
@@ -67,37 +54,62 @@ function sine({ freq, amp, seconds, sampleRate = 48000, channels = 2, phase = 0 
   return data;
 }
 
+/**
+ * @param {Float32Array[]} channels
+ * @param {number} [sampleRate]
+ */
 function analyzeChannels(channels, sampleRate = 48000) {
-  const wav = encodeWavFloat32(channels, sampleRate);
+  const wav = encodeWav({ channels, sampleRate });
   const asset = parseWavBuffer(wav, "test.wav", "audio/wav");
   return analyzeDecodedAsset(asset, null).metrics;
 }
 
 // ---- assertions ----
-let passed = 0;
-let failed = 0;
+/**
+ * @param {string} name
+ * @param {number} actual
+ * @param {number} expected
+ * @param {number} tol
+ */
 function check(name, actual, expected, tol) {
   const ok = Number.isFinite(actual) && Math.abs(actual - expected) <= tol;
-  console.log(
-    `  ${ok ? "PASS" : "FAIL"}  ${name}: got ${actual.toFixed(3)}, expected ${expected.toFixed(3)} ±${tol}`,
-  );
-  ok ? (passed += 1) : (failed += 1);
+  test(name, () => {
+    assert.ok(ok, `got ${actual}, expected ${expected.toFixed(3)} +-${tol}`);
+  });
 }
+/**
+ * @param {string} name
+ * @param {number} actual
+ * @param {">" | "<" | ">=" | "<="} op
+ * @param {number} bound
+ */
 function checkCmp(name, actual, op, bound) {
   const ops = { ">": actual > bound, "<": actual < bound, ">=": actual >= bound, "<=": actual <= bound };
   const ok = Number.isFinite(actual) && ops[op];
-  console.log(`  ${ok ? "PASS" : "FAIL"}  ${name}: got ${actual.toFixed(3)}, expected ${op} ${bound}`);
-  ok ? (passed += 1) : (failed += 1);
+  test(name, () => {
+    assert.ok(ok, `got ${actual}, expected ${op} ${bound}`);
+  });
 }
 
 // Boolean assertion (validity flags, nulls, warning membership, layout labels).
+/**
+ * @param {string} name
+ * @param {boolean} cond
+ * @param {string} [detail]
+ */
 function assertOk(name, cond, detail = "") {
-  console.log(`  ${cond ? "PASS" : "FAIL"}  ${name}${detail ? ` — ${detail}` : ""}`);
-  cond ? (passed += 1) : (failed += 1);
+  test(name, () => {
+    assert.ok(cond, detail);
+  });
 }
 
 // Build a decoded asset straight from channel data (bypasses the WAV encoder so
 // tests can set exact frame counts, silence, sample rates, and channel layouts).
+/**
+ * @param {Float32Array[]} channels
+ * @param {{ sampleRate?: number, layout?: ChannelLayout }} [options]
+ * @returns {DecodedAudioAsset}
+ */
 function makeAsset(channels, { sampleRate = 48000, layout } = {}) {
   const frameCount = channels[0]?.length ?? 0;
   return {
@@ -119,7 +131,9 @@ function makeAsset(channels, { sampleRate = 48000, layout } = {}) {
   };
 }
 
+/** @param {number} amp */
 const dbfs = (amp) => 20 * Math.log10(amp);
+/** @param {number} db */
 const ampForDbfs = (db) => 10 ** (db / 20);
 
 console.log("\n[1] Stereo 1 kHz sine @ -6 dBFS (amp 0.5), 48k, 4s");
@@ -128,14 +142,35 @@ console.log(`     integrated=${m1.integratedLufs.toFixed(2)} LUFS  TP=${m1.trueP
 check("sample peak", m1.samplePeakDbfs, dbfs(0.5), 0.05);
 checkCmp("true peak >= sample peak", m1.truePeakDbtp, ">=", m1.samplePeakDbfs - 0.02);
 checkCmp("true peak within 0.3 dB of sample peak (low freq)", m1.truePeakDbtp, "<", m1.samplePeakDbfs + 0.3);
-// LRA ~0 for a steady tone. EBU Tech 3342 (2023) §5 mandates >=1.5 s of
-// trailing-silence padding for the file-based LRA procedure; on a very short clip
-// that padding leaves a small artefact (the clip is also flagged
-// loudnessRangeUnstable, and the spec itself notes short programmes can read
-// "misleadingly high" LRA). Assert steadiness on a 20 s tone, where the reference
-// procedure settles to ~0.
-const steadyToneLra = analyzeChannels(sine({ freq: 1000, amp: 0.5, seconds: 20 })).loudnessRange;
-checkCmp("LRA ~0 for steady tone (20 s, EBU Tech 3342 reference procedure)", steadyToneLra, "<", 1.0);
+for (const seconds of [2, 3, 5, 10, 20]) {
+  const steadyToneMetrics = analyzeChannels(sine({ freq: 1000, amp: 0.5, seconds }));
+  checkCmp(
+    `LRA uses complete windows for a steady ${seconds} s tone`,
+    steadyToneMetrics.loudnessRange,
+    "<",
+    0.1,
+  );
+  assertOk(
+    `LRA validity reflects complete-window count at ${seconds} s`,
+    steadyToneMetrics.loudnessRangeValid === (seconds >= 5),
+  );
+}
+
+console.log("\n[1b] LOGIC-05 per-rate accuracy: -23 dBFS 1 kHz stereo tone at each supported rate (48 kHz covered by validate-ebu.mjs 3341-1)");
+const referenceRateTruePeakDbtp = analyzeChannels(sine({ freq: 1000, amp: ampForDbfs(-23), seconds: 4 })).truePeakDbtp;
+for (const sampleRate of [44100, 88200, 96000, 192000]) {
+  const rateMetrics = analyzeChannels(
+    sine({ freq: 1000, amp: ampForDbfs(-23), seconds: 4, sampleRate }),
+    sampleRate,
+  );
+  check(`integrated -23 dBFS tone reads -23.0 LUFS at ${sampleRate} Hz`, rateMetrics.integratedLufs, -23.0, 0.1);
+  check(
+    `true peak at ${sampleRate} Hz matches the 48 kHz reading`,
+    rateMetrics.truePeakDbtp,
+    referenceRateTruePeakDbtp,
+    0.1,
+  );
+}
 
 console.log("\n[2] Same tone at -12 dBFS (amp 0.25) — expect ~6 dB/LU drop vs [1]");
 const m2 = analyzeChannels(sine({ freq: 1000, amp: 0.25, seconds: 4 }));
@@ -150,20 +185,23 @@ check("sample peak ~ -3.01 dBFS", m3.samplePeakDbfs, dbfs(Math.SQRT1_2), 0.1);
 checkCmp("true peak recovers the inter-sample crest (> -1 dBTP)", m3.truePeakDbtp, ">", -1.0);
 checkCmp("true peak well above sample peak (> +1.5 dB)", m3.truePeakDbtp - m3.samplePeakDbfs, ">", 1.5);
 
-console.log("\n[4] LRA: 10s @ -20 dBFS then 10s @ -14 dBFS (6 dB step), 1 kHz stereo");
+console.log("\n[4] LRA: 5s @ -20 dBFS then 5s @ -14 dBFS (6 dB step), 1 kHz stereo");
+/**
+ * @param {Float32Array} a
+ * @param {Float32Array} b
+ */
 const concat = (a, b) => {
   const out = new Float32Array(a.length + b.length);
   out.set(a, 0);
   out.set(b, a.length);
   return out;
 };
-const quiet = sine({ freq: 1000, amp: 0.1, seconds: 10 });
-const loud = sine({ freq: 1000, amp: 0.1 * 10 ** (6 / 20), seconds: 10 });
+const quiet = sine({ freq: 1000, amp: 0.1, seconds: 5 });
+const loud = sine({ freq: 1000, amp: 0.1 * 10 ** (6 / 20), seconds: 5 });
 const stepped = quiet.map((ch, i) => concat(ch, loud[i]));
 const m4 = analyzeChannels(stepped);
 console.log(`     LRA=${m4.loudnessRange.toFixed(2)} LU  integrated=${m4.integratedLufs.toFixed(2)} LUFS`);
-checkCmp("LRA reflects the ~6 LU spread (> 3)", m4.loudnessRange, ">", 3.0);
-checkCmp("LRA not wildly large (< 9)", m4.loudnessRange, "<", 9.0);
+check("LRA tracks a 5 s + 5 s, 6 dB step", m4.loudnessRange, 6, 0.5);
 
 console.log("\n[5] Digital silence, stereo, 2s — floors");
 const m5 = analyzeChannels([new Float32Array(96000), new Float32Array(96000)]);
@@ -241,6 +279,7 @@ assertOk("60 s tone (>=60 s): no LRA-unstable warning", !valid60s.warnings.inclu
 // block exists, at every sample rate.
 {
   const boundarySr = 11025;
+  /** @param {number} frames */
   const boundaryTone = (frames) => {
     const c = new Float32Array(frames);
     const amp = ampForDbfs(-10); // well above the -70 LUFS absolute gate
@@ -266,6 +305,10 @@ assertOk("60 s tone (>=60 s): no LRA-unstable warning", !valid60s.warnings.inclu
 }
 
 console.log("\n[8] Targeting & compliance (H-02 validity gating, M-12 tolerance-before-ceiling)");
+/**
+ * @param {Partial<LoudnessMetrics>} [overrides]
+ * @returns {LoudnessMetrics}
+ */
 function baseMetricsFixture(overrides = {}) {
   return {
     integratedLufs: -14.05,
@@ -279,11 +322,15 @@ function baseMetricsFixture(overrides = {}) {
     targetDeltaDb: null,
     projectedTruePeakDbtp: null,
     normalizationLimited: false,
-    timeline: { stepDurationSeconds: 0.1, timeSeconds: [], momentaryLufs: [], shortTermLufs: [], truePeakDbtp: [] },
+    timeline: makeTimeline(),
     warnings: [],
     ...overrides,
   };
 }
+/**
+ * @param {Partial<TargetPreset>} [overrides]
+ * @returns {TargetPreset}
+ */
 function targetPresetFixture(overrides = {}) {
   return {
     id: "test",
@@ -301,9 +348,14 @@ function targetPresetFixture(overrides = {}) {
     ...overrides,
   };
 }
+/**
+ * @param {LoudnessMetrics} metrics
+ * @param {TargetPreset | null} [target]
+ * @returns {AnalysisResult}
+ */
 function fakeResult(metrics, target) {
   return {
-    metadata: {},
+    metadata: makeAudioMetadata(),
     metrics,
     analysisMode: target ? "targeted" : "measure-only",
     target: target ?? null,
@@ -486,6 +538,7 @@ function fakeResult(metrics, target) {
 }
 
 console.log("\n[9] M-09 true-peak timeline invariant (headline == max plotted, within 1e-6)");
+/** @param {Float32Array | number[]} arr */
 function maxArr(arr) {
   let m = -Infinity;
   for (const v of arr) if (v > m) m = v;
@@ -510,7 +563,8 @@ function maxArr(arr) {
     m.timeline.truePeakDbtp.length === m.timeline.timeSeconds.length,
   );
 }
-// End-of-file transient (M-09 probe #2): full-scale burst in the last 20 samples; FIR tail folds into last bin.
+// End-of-file transient (M-09 probe #2): source samples in the last 20 frames
+// remain represented in the last complete timeline bin.
 {
   const n = 48000;
   const l = new Float32Array(n);
@@ -522,6 +576,27 @@ function maxArr(arr) {
     "end-transient: headline TP == max(timeline.truePeakDbtp)",
     Math.abs(m.truePeakDbtp - plotted) <= 1e-6,
     `headline ${m.truePeakDbtp.toFixed(6)} vs max ${plotted.toFixed(6)}`,
+  );
+}
+// LOGIC-06: a tone cut at its positive peak must stop at the last source sample.
+// Flushing the FIR with zeroes measured the artificial step and read about 1 dB hot.
+{
+  const sampleRate = 48000;
+  const amplitude = ampForDbfs(-6.02);
+  let frameCount = sampleRate;
+  while ((frameCount - 1) % 48 !== 12) frameCount += 1;
+  const channels = sine({
+    freq: 1000,
+    amp: amplitude,
+    seconds: frameCount / sampleRate,
+    sampleRate,
+  });
+  const m = analyzeDecodedAsset(makeAsset(channels, { sampleRate }), null).metrics;
+  check(
+    "hard-cut positive peak matches libebur128/ffmpeg source-boundary behavior",
+    m.truePeakDbtp,
+    -6.02,
+    0.1,
   );
 }
 // Mid-file transient: invariant must still hold when the hottest peak is not at the edges.
@@ -550,6 +625,7 @@ console.log("\n[10] M-11 determinism + caller PCM not mutated");
   for (let i = 0; i < n; i += 1) { if (l[i] !== lCopy[i] || r[i] !== rCopy[i]) { mutated = true; break; } }
   assertOk("caller PCM byte-identical after analysis", !mutated);
   const m2 = analyzeDecodedAsset(asset, null).metrics;
+  /** @type {(keyof LoudnessMetrics)[]} */
   const fields = ["integratedLufs", "ungatedLufs", "loudnessRange", "maxMomentaryLufs", "maxShortTermLufs", "samplePeakDbfs", "truePeakDbtp"];
   let identical = true;
   let diff = "";
@@ -559,11 +635,13 @@ console.log("\n[10] M-11 determinism + caller PCM not mutated");
 
 console.log("\n[11] H-03 channel weighting (ITU-R BS.1770-5) + WAVE speaker-mask layouts");
 const SQRT2 = Math.sqrt(2);
-const weightTable = {
-  L: 1, R: 1, C: 1, LFE: 0, Ls: SQRT2, Rs: SQRT2, Lb: 1, Rb: 1, Cs: 1, Lc: 1, Rc: 1,
-  Tfl: 1, Tfc: 1, Tfr: 1, Tc: 1, Tsl: 1, Tsr: 1, Tbl: 1, Tbc: 1, Tbr: 1, Unknown: 1,
-};
-for (const [label, exp] of Object.entries(weightTable)) {
+/** @type {[ChannelLabel, number][]} */
+const weightTable = [
+  ["L", 1], ["R", 1], ["C", 1], ["LFE", 0], ["Ls", SQRT2], ["Rs", SQRT2], ["Lb", 1], ["Rb", 1],
+  ["Cs", 1], ["Lc", 1], ["Rc", 1], ["Tfl", 1], ["Tfc", 1], ["Tfr", 1], ["Tc", 1], ["Tsl", 1],
+  ["Tsr", 1], ["Tbl", 1], ["Tbc", 1], ["Tbr", 1], ["Unknown", 1],
+];
+for (const [label, exp] of weightTable) {
   assertOk(`weight(${label}) === ${exp === SQRT2 ? "sqrt(2)" : exp}`, getLoudnessWeight(label) === exp, `got ${getLoudnessWeight(label)}`);
 }
 {
@@ -683,13 +761,16 @@ for (const [label, exp] of Object.entries(weightTable)) {
   // Real-analyzer mono equivalence: identical mono reads identical LUFS for C/Tfl/Tc/Lb/Cs (weight 1.0),
   // and +1.505 LU for Ls (surround weight sqrt 2). Guards the H-03 fix through the full pipeline.
   const monoCh = sine({ freq: 1000, amp: 0.5, seconds: 4, channels: 1 })[0];
+  /** @param {ChannelLabel} label */
   const readAs = (label) =>
     analyzeDecodedAsset(
       makeAsset([monoCh.slice()], { layout: { name: label, labels: [label], guessed: false, speakerMask: null } }),
       null,
     ).metrics.integratedLufs;
   const cLufs = readAs("C");
-  for (const label of ["Tfl", "Tc", "Lb", "Cs"]) {
+  /** @type {ChannelLabel[]} */
+  const unitWeightLabels = ["Tfl", "Tc", "Lb", "Cs"];
+  for (const label of unitWeightLabels) {
     const v = readAs(label);
     assertOk(`mono '${label}' reads identical to 'C' (weight 1.0)`, Math.abs(v - cLufs) < 1e-9, `delta ${(v - cLufs).toExponential(2)}`);
   }
@@ -697,5 +778,222 @@ for (const [label, exp] of Object.entries(weightTable)) {
   assertOk("mono 'Ls' reads +1.505 LU above 'C' (surround weight sqrt 2)", Math.abs(lsLufs - cLufs - 1.505) < 0.01, `delta ${(lsLufs - cLufs).toFixed(4)} LU`);
 }
 
-console.log(`\n==== DSP validation: ${passed} passed, ${failed} failed ====\n`);
-process.exit(failed ? 1 : 0);
+console.log("\n[13] True-peak candidate gating is bit-identical to the ungated loop");
+// The analyzer skips the oversampling FIR wherever the largest magnitude in a
+// sample's twelve-sample window, times the FIR's largest per-phase L1 gain,
+// cannot beat the peak already reported for the bin. The reference below is the
+// ungated loop the gate replaced, kept here so every reported value can be
+// compared against it rather than against a tolerance.
+
+/** @param {number} peak */
+const referencePeakToDb = (peak) => (peak <= 0 ? -144 : 20 * Math.log10(peak));
+
+/**
+ * @param {Float32Array[]} channels
+ * @param {number} stepSamples
+ */
+function referencePeaks(channels, stepSamples) {
+  const frameCount = channels[0]?.length ?? 0;
+  const history = channels.map(() => new Float32Array(24));
+  const historyIndex = new Array(channels.length).fill(0);
+  /** @type {number[]} */
+  const truePeakByStep = [];
+  let overallSamplePeak = 0;
+  let overallTruePeak = 0;
+  let stepPeak = 0;
+
+  for (let frame = 0; frame < frameCount; frame += 1) {
+    for (let channelIndex = 0; channelIndex < channels.length; channelIndex += 1) {
+      const sample = channels[channelIndex][frame];
+      const absSample = Math.abs(sample);
+      overallSamplePeak = Math.max(overallSamplePeak, absSample);
+
+      const ring = history[channelIndex];
+      const pointer = historyIndex[channelIndex];
+      ring[pointer] = sample;
+      ring[pointer + 12] = sample;
+
+      let localPeak = absSample;
+      for (let phase = 0; phase < TRUE_PEAK_FIR.length; phase += 1) {
+        let oversampled = 0;
+        for (let tap = 0; tap < 12; tap += 1) {
+          oversampled += ring[pointer + tap] * TRUE_PEAK_FIR[phase][tap];
+        }
+        localPeak = Math.max(localPeak, Math.abs(oversampled));
+      }
+
+      overallTruePeak = Math.max(overallTruePeak, localPeak);
+      stepPeak = Math.max(stepPeak, localPeak);
+      historyIndex[channelIndex] = pointer === 0 ? 11 : pointer - 1;
+    }
+
+    if ((frame + 1) % stepSamples === 0) {
+      truePeakByStep.push(referencePeakToDb(stepPeak));
+      stepPeak = 0;
+    }
+  }
+
+  if (truePeakByStep.length > 0 && stepPeak > 0) {
+    const lastIndex = truePeakByStep.length - 1;
+    truePeakByStep[lastIndex] = Math.max(truePeakByStep[lastIndex], referencePeakToDb(stepPeak));
+  }
+
+  return {
+    samplePeakDbfs: referencePeakToDb(overallSamplePeak),
+    truePeakDbtp: referencePeakToDb(overallTruePeak),
+    truePeakByStep,
+  };
+}
+
+/** @param {number} seed */
+function seededRandom(seed) {
+  let state = seed | 0;
+  return () => {
+    state = (state + 0x6d2b79f5) | 0;
+    let t = Math.imul(state ^ (state >>> 15), 1 | state);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+const GATING_SAMPLE_RATE = 8000;
+const GATING_FRAMES = 2000; // two complete 100 ms bins plus a partial third
+const GATING_STEP_SAMPLES = Math.round(GATING_SAMPLE_RATE * 0.1);
+
+/**
+ * @param {number} frames
+ * @param {(frame: number, channel: number) => number} fill
+ * @returns {Float32Array[]}
+ */
+function gatingSignal(frames, fill) {
+  const left = new Float32Array(frames);
+  const right = new Float32Array(frames);
+  for (let frame = 0; frame < frames; frame += 1) {
+    left[frame] = fill(frame, 0);
+    right[frame] = fill(frame, 1);
+  }
+  return [left, right];
+}
+
+/** @type {{ label: string, channels: Float32Array[] }[]} */
+const gatingCases = [
+  { label: "silence", channels: gatingSignal(GATING_FRAMES, () => 0) },
+  { label: "positive DC", channels: gatingSignal(GATING_FRAMES, () => 0.75) },
+  { label: "negative DC", channels: gatingSignal(GATING_FRAMES, () => -0.75) },
+  {
+    label: "full-scale square wave",
+    channels: gatingSignal(GATING_FRAMES, (frame) => (Math.floor(frame / 7) % 2 === 0 ? 1 : -1)),
+  },
+  {
+    label: "full-scale square wave, alternating samples",
+    channels: gatingSignal(GATING_FRAMES, (frame) => (frame % 2 === 0 ? 1 : -1)),
+  },
+  {
+    label: "late-arriving peak",
+    channels: gatingSignal(GATING_FRAMES, (frame) => {
+      const amplitude = frame < GATING_FRAMES - 200 ? 0.02 : 0.98;
+      return amplitude * Math.sin((2 * Math.PI * 997 * frame) / GATING_SAMPLE_RATE);
+    }),
+  },
+  {
+    label: "single late spike",
+    channels: gatingSignal(GATING_FRAMES, (frame) => (frame === GATING_FRAMES - 3 ? 0.999 : 0)),
+  },
+  {
+    label: "single late spike over a quiet floor",
+    channels: gatingSignal(GATING_FRAMES, (frame) => (
+      frame === GATING_FRAMES - 3
+        ? -0.999
+        : 0.001 * Math.sin((2 * Math.PI * 311 * frame) / GATING_SAMPLE_RATE)
+    )),
+  },
+];
+
+const gatingRandom = seededRandom(0x7ea11ed);
+for (let index = 0; index < 1500; index += 1) {
+  const amplitude = 0.05 + gatingRandom() * 0.95;
+  const bias = (gatingRandom() - 0.5) * 0.2;
+  gatingCases.push({
+    label: `seeded noise #${index}`,
+    channels: gatingSignal(GATING_FRAMES, () => {
+      const value = bias + amplitude * (gatingRandom() * 2 - 1);
+      return Math.max(-1, Math.min(1, value));
+    }),
+  });
+}
+
+for (let index = 0; index < 1500; index += 1) {
+  // Music-like: a few partials, a slow envelope, and an occasional transient,
+  // so the running bin peak spends time both near and far from the window
+  // maximum the gate compares against.
+  const root = 60 + gatingRandom() * 900;
+  const envelopeHz = 0.5 + gatingRandom() * 6;
+  const drive = 0.2 + gatingRandom() * 0.8;
+  const transientAt = Math.floor(gatingRandom() * GATING_FRAMES);
+  gatingCases.push({
+    label: `music-like #${index}`,
+    channels: gatingSignal(GATING_FRAMES, (frame, channel) => {
+      const detune = channel === 0 ? 1 : 1.003;
+      const envelope =
+        0.35 + 0.65 * Math.abs(Math.sin((2 * Math.PI * envelopeHz * frame) / GATING_SAMPLE_RATE));
+      const partials =
+        Math.sin((2 * Math.PI * root * detune * frame) / GATING_SAMPLE_RATE) +
+        0.6 * Math.sin((2 * Math.PI * root * 2 * detune * frame) / GATING_SAMPLE_RATE) +
+        0.3 * Math.sin((2 * Math.PI * root * 3.01 * detune * frame) / GATING_SAMPLE_RATE);
+      const transient = frame === transientAt ? 0.9 : 0;
+      const value = drive * envelope * partials * 0.45 + transient;
+      return Math.max(-1, Math.min(1, value));
+    }),
+  });
+}
+
+{
+  let mismatches = 0;
+  let firstMismatch = "";
+  let comparedTimelinePoints = 0;
+  for (const gatingCase of gatingCases) {
+    const expected = referencePeaks(gatingCase.channels, GATING_STEP_SAMPLES);
+    const metrics = analyzeDecodedAsset(
+      makeAsset(gatingCase.channels, { sampleRate: GATING_SAMPLE_RATE }),
+      null,
+    ).metrics;
+
+    /** @param {string} detail */
+    const report = (detail) => {
+      mismatches += 1;
+      if (!firstMismatch) firstMismatch = `${gatingCase.label}: ${detail}`;
+    };
+
+    if (metrics.truePeakDbtp !== expected.truePeakDbtp) {
+      report(`true peak ${metrics.truePeakDbtp} vs ${expected.truePeakDbtp}`);
+    }
+    if (metrics.samplePeakDbfs !== expected.samplePeakDbfs) {
+      report(`sample peak ${metrics.samplePeakDbfs} vs ${expected.samplePeakDbfs}`);
+    }
+    if (metrics.timeline.truePeakDbtp.length !== expected.truePeakByStep.length) {
+      report(
+        `timeline length ${metrics.timeline.truePeakDbtp.length} vs ${expected.truePeakByStep.length}`,
+      );
+      continue;
+    }
+    for (let index = 0; index < expected.truePeakByStep.length; index += 1) {
+      comparedTimelinePoints += 1;
+      // buildTimeline stores the series in a Float32Array, so the reference
+      // value is rounded the same way before the comparison.
+      if (metrics.timeline.truePeakDbtp[index] !== Math.fround(expected.truePeakByStep[index])) {
+        report(
+          `timeline[${index}] ${metrics.timeline.truePeakDbtp[index]} vs ${Math.fround(expected.truePeakByStep[index])}`,
+        );
+      }
+    }
+  }
+
+  console.log(
+    `     ${gatingCases.length} signals, ${comparedTimelinePoints} timeline points, ${mismatches} mismatches`,
+  );
+  assertOk(
+    `gated true peak is bit-identical to the ungated loop over ${gatingCases.length} signals`,
+    mismatches === 0,
+    firstMismatch,
+  );
+}

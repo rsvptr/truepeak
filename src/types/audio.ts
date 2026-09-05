@@ -105,10 +105,11 @@ export interface TargetPreset {
 
 export interface AnalysisTimeline {
   stepDurationSeconds: number;
-  timeSeconds: number[];
-  momentaryLufs: Array<number | null>;
-  shortTermLufs: Array<number | null>;
-  truePeakDbtp: number[];
+  /** Compact in-memory series. Missing loudness windows use NaN sentinels. */
+  timeSeconds: Float32Array;
+  momentaryLufs: Float32Array;
+  shortTermLufs: Float32Array;
+  truePeakDbtp: Float32Array;
 }
 
 export type IntegratedInvalidReason = "too-short" | "below-gate";
@@ -117,6 +118,12 @@ export interface LoudnessMetrics {
   integratedLufs: number;
   ungatedLufs: number;
   loudnessRange: number;
+  /**
+   * False when fewer than two complete 3 second short-term windows exist.
+   * `loudnessRange` remains 0 for wire compatibility and MUST NOT be presented
+   * as a measurement. Absent on older records: treat absent as valid.
+   */
+  loudnessRangeValid?: boolean;
   /**
    * False when no complete 400 ms gated block exists ("too-short") or nothing
    * survives the -70 LUFS absolute gate ("below-gate"). When false,
@@ -212,6 +219,8 @@ export interface RecentSessionEntry {
   integratedInvalidReason?: IntegratedInvalidReason;
   truePeakDbtp: number;
   loudnessRange: number;
+  /** Absent on older history rows: treat absent as valid. */
+  loudnessRangeValid?: boolean;
   loudnessRangeUnstable?: boolean;
   sampleRate: number;
   channelLayoutName: string;

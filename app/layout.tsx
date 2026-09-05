@@ -1,5 +1,4 @@
 import type { Metadata, Viewport } from "next";
-import { cookies } from "next/headers";
 import { IBM_Plex_Mono, Space_Grotesk } from "next/font/google";
 import { Telemetry } from "@/components/telemetry";
 import "./globals.css";
@@ -42,14 +41,6 @@ export const metadata: Metadata = {
   category: "music",
   keywords: ["TruePeak", "LUFS", "loudness", "true peak", "R128", "audio analysis", "mastering"],
   manifest: "/manifest.webmanifest",
-  icons: {
-    icon: [
-      { url: "/favicon.png", type: "image/png", sizes: "192x192" },
-      { url: "/logo.png", type: "image/png", sizes: "512x512" },
-    ],
-    apple: [{ url: "/favicon.png", type: "image/png", sizes: "192x192" }],
-    shortcut: ["/favicon.png"],
-  },
   openGraph: {
     title: "TruePeak",
     description: APP_DESCRIPTION,
@@ -64,27 +55,18 @@ export const metadata: Metadata = {
   },
 };
 
-export async function generateViewport(): Promise<Viewport> {
+export function generateViewport(): Viewport {
   // Match the browser UI (address bar, status bar) to the active theme, and
   // extend the layout into notch/home-indicator areas so the safe-area
   // padding in globals.css can take over.
-  const themeCookie = (await cookies()).get("truepeak-theme")?.value;
-  if (themeCookie === "light" || themeCookie === "dark") {
-    return {
-      width: "device-width",
-      initialScale: 1,
-      viewportFit: "cover",
-      themeColor: themeCookie === "light" ? "#f6faf8" : "#071412",
-    };
-  }
-
-  // No stored choice yet: emit both media-qualified colors so first-time
-  // visitors get browser chrome that matches the OS preference the pre-paint
-  // script will apply. The client keeps this meta in sync after any toggle.
+  // Media-qualified colors keep the static shell aligned with the OS before
+  // the pre-paint script resolves a saved choice. The client mutates these
+  // React-owned tags in place after a theme toggle.
   return {
     width: "device-width",
     initialScale: 1,
     viewportFit: "cover",
+    interactiveWidget: "resizes-content",
     themeColor: [
       { media: "(prefers-color-scheme: light)", color: "#f6faf8" },
       { media: "(prefers-color-scheme: dark)", color: "#071412" },
@@ -92,16 +74,12 @@ export async function generateViewport(): Promise<Viewport> {
   };
 }
 
-export default async function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {
-  // Read the theme from the cookie so the server renders the correct data-theme on the
-  // first byte, with no flash of the default theme for users who chose light mode.
-  const themeCookie = (await cookies()).get("truepeak-theme")?.value;
-  const theme = themeCookie === "light" || themeCookie === "dark" ? themeCookie : "dark";
+export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {
   return (
-    <html lang="en" data-theme={theme} suppressHydrationWarning>
+    <html lang="en" data-theme="dark" suppressHydrationWarning>
       <body className={`${sans.variable} ${mono.variable}`}>
-        {/* Pre-paint theme correction: the server defaults to dark when no
-            cookie is set, so first-time visitors whose OS prefers light would
+        {/* Pre-paint theme correction: the static shell ships with data-theme="dark" and no
+            server ever reads the cookie, so first-time visitors whose OS prefers light would
             otherwise see a dark flash before React applies their preference.
             Runs before anything renders; cookie still wins when present. */}
         <script

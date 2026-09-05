@@ -20,6 +20,25 @@ const themePreferenceListeners = new Set<() => void>();
 const parallelPreferenceListeners = new Set<() => void>();
 const analysisSettingsListeners = new Set<() => void>();
 
+// Stable server snapshots describe the static shell. They also match a fresh
+// browser's committed client values, so hydration does not schedule preference
+// corrections when no saved choice exists.
+export function readHistoryPreferenceServerSnapshot() {
+  return false;
+}
+
+export function readUiModePreferenceServerSnapshot(): WorkspaceUiMode {
+  return "simple";
+}
+
+export function readParallelPreferenceServerSnapshot(): ParallelLanesPreference {
+  return "auto";
+}
+
+export function readAnalysisSettingsPreferenceServerSnapshot(): WorkspaceAnalysisSettings | null {
+  return null;
+}
+
 export interface WorkspaceAnalysisSettings {
   analysisMode: AnalysisMode;
   selectedPresetId: string;
@@ -347,10 +366,18 @@ export function readThemePreference(): WorkspaceTheme {
     return "dark";
   }
 
-  // The theme lives in a cookie so the server can read it and render the correct
-  // data-theme on the first byte (no flash). Fall back to the OS preference if unset.
+  // The theme lives in a cookie that the pre-paint script in app/layout.tsx reads
+  // before first paint (no flash); no route reads it on the server. Fall back to the OS preference if unset.
   themeCache ??= readThemeCookie() ?? systemTheme();
   return themeCache;
+}
+
+// ThemeSynchronizer renders no DOM, so its hydration snapshot can safely use
+// the theme the pre-paint script already committed on the client. This avoids
+// an effect briefly replacing a saved/OS light theme with the static dark
+// fallback while keeping the generated HTML deterministic.
+export function readThemePreferenceHydrationSnapshot(): WorkspaceTheme {
+  return typeof window === "undefined" ? "dark" : readThemePreference();
 }
 
 export function subscribeThemePreference(listener: () => void) {

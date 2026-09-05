@@ -40,10 +40,10 @@ export const TARGET_PRESETS: TargetPreset[] = [
     sourceLabel: "Spotify Premium loud mode",
     referenceUrl: "https://support.spotify.com/us/artists/article/loudness-normalization/",
     referenceNote:
-      "Spotify documents a Loud setting at -11 LUFS and notes that playback may use a limiter rather than follow the same peak handling as Normal mode.",
+      'Spotify Loud playback targets -11 LUFS. "If your track is louder than -14 LUFS, keep the max true peak below -2 dBTP to avoid extra distortion."',
     highlights: ["Noisy environments", "Limiter at playback", "Reference mode"],
     loudnessTargetLufs: -11,
-    truePeakCeilingDbtp: -1,
+    truePeakCeilingDbtp: -2,
     toleranceLufs: 1,
     policy: "loudness-first",
     description: "Playback reference for Spotify Loud. Better for comparison than for mastering decisions.",

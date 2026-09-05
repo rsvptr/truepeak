@@ -1,13 +1,14 @@
 "use client";
 
 import {
+  memo,
+  useCallback,
   useEffect,
   useId,
   useLayoutEffect,
   useRef,
   useState,
   type KeyboardEvent as ReactKeyboardEvent,
-  type ReactNode,
 } from "react";
 import {
   ArrowLeft,
@@ -19,49 +20,24 @@ import {
   Plus,
   Save,
   Square,
+  SunMoon,
   Trash2,
 } from "lucide-react";
 import { formatDuration } from "@/lib/format";
+import type { BatchProgress } from "@/lib/session-selectors";
 import { cn } from "@/lib/utils";
 import { useBackgroundInert } from "@/hooks/use-modal-focus";
+import { useMediaQuery } from "@/hooks/use-media-query";
+import { useOverlayHistoryEntry } from "@/hooks/use-overlay-history";
 import { TruePeakLogo } from "@/components/truepeak-logo";
+import { WorkspaceThemeToggle } from "@/components/workspace-theme-toggle";
+import { useWorkspaceCommands, useWorkspaceSession } from "@/components/workspace-contexts";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { Progress } from "@/components/ui/progress";
 
-export interface BatchProgressSummary {
-  finished: number;
-  total: number;
-  percent: number;
-  etaSeconds: number | null;
-}
-
-interface StudioToolbarProps {
-  currentModeLabel: string;
-  uiMode: "simple" | "advanced";
-  decodeLabel: string;
-  historyEnabled: boolean;
-  completedCount: number;
-  activeCount: number;
-  finishedCount: number;
-  jobsCount: number;
-  parallelLimit?: number;
-  batchProgress?: BatchProgressSummary | null;
-  themeControl?: ReactNode;
-  onGoHome: () => void;
-  onOpenPicker: () => void;
-  onExportCsv: () => void;
-  onExportJson: () => void;
-  onExportMarkdown: () => void;
-  onExportSession: () => void;
-  onOpenSession: () => void;
-  onToggleHistory: () => void;
-  onOpenHistory: () => void;
-  onClearFinished: () => void;
-  onCancelActive: () => void;
-  onClearSession: () => void;
-}
+export type BatchProgressSummary = BatchProgress;
 
 // Minimum vertical room (px) the More menu needs before we flip it to open
 // upward instead of downward on short viewports.
@@ -69,39 +45,54 @@ const MENU_MIN_COMFORTABLE_HEIGHT = 200;
 const MENU_VIEWPORT_MARGIN = 16;
 const MENU_TRIGGER_GAP = 10;
 
-export function StudioToolbar({
-  currentModeLabel,
-  uiMode,
-  decodeLabel,
-  historyEnabled,
-  completedCount,
-  activeCount,
-  finishedCount,
-  jobsCount,
-  parallelLimit,
-  batchProgress,
-  themeControl,
-  onGoHome,
-  onOpenPicker,
-  onExportCsv,
-  onExportJson,
-  onExportMarkdown,
-  onExportSession,
-  onOpenSession,
-  onToggleHistory,
-  onOpenHistory,
-  onClearFinished,
-  onCancelActive,
-  onClearSession,
-}: StudioToolbarProps) {
+export const StudioToolbar = memo(function StudioToolbar() {
+  const {
+    cancelActiveJobs: onCancelActive,
+    currentModeLabel,
+    decodeLabel,
+    exportCsv: onExportCsv,
+    exportJson: onExportJson,
+    exportMarkdown: onExportMarkdown,
+    exportSession: onExportSession,
+    goHome: onGoHome,
+    historyEnabled,
+    openHistory: onOpenHistory,
+    openPicker: onOpenPicker,
+    openSessionPicker: onOpenSession,
+    requestClearFinished: onClearFinished,
+    requestClearSession: onClearSession,
+    route: { uiMode },
+    toggleHistory: onToggleHistory,
+    toggleTheme,
+  } = useWorkspaceCommands();
+  const {
+    batchProgress,
+    completedJobs,
+    jobs,
+    parallelLimit,
+    queueCounts,
+  } = useWorkspaceSession();
+  const activeCount = queueCounts.active;
+  const completedCount = completedJobs.length;
+  const finishedCount = queueCounts.complete + queueCounts.issues;
+  const jobsCount = jobs.length;
   const [menuOpen, setMenuOpen] = useState(false);
-  const [isCompactMenu, setIsCompactMenu] = useState(false);
+  const dismissMenu = useCallback(() => setMenuOpen(false), []);
+  const { closeHistoryEntry, openHistoryEntry } = useOverlayHistoryEntry(
+    "more-sheet",
+    dismissMenu,
+  );
+  // Below this width, the More menu renders as a bottom sheet instead of an
+  // anchored dropdown so it never has to fight for horizontal room.
+  // Hydration-safe (MOB-15): reads matchMedia during render, so the menu
+  // never briefly believes it is the anchored dropdown on a phone.
+  const isCompactMenu = useMediaQuery("(max-width: 640px)");
   const [menuPlacement, setMenuPlacement] = useState<"below" | "above">("below");
   const [menuMaxHeight, setMenuMaxHeight] = useState<number | null>(null);
   const menuId = useId();
   const menuRef = useRef<HTMLDivElement | null>(null);
   const triggerRef = useRef<HTMLButtonElement | null>(null);
-  const wrapperRef = useRef<HTMLDivElement | null>(null);
+  const wrapperRef = useRef<HTMLElement | null>(null);
   // Wraps the compact (bottom-sheet) variant's backdrop + panel. That
   // variant looks fully modal (full-screen dim, fixed sheet), so it should
   // actually block the background behind it -- see useBackgroundInert below.
@@ -129,12 +120,19 @@ export function StudioToolbar({
     items[safeIndex]?.focus();
   };
 
-  const closeMenu = (returnFocus = false) => {
-    setMenuOpen(false);
-    if (returnFocus) {
-      window.setTimeout(() => triggerRef.current?.focus(), 0);
-    }
-  };
+  const openMenu = useCallback(() => {
+    setMenuOpen(true);
+    openHistoryEntry();
+  }, [openHistoryEntry]);
+
+  const closeMenu = useCallback((returnFocus = false, afterClose?: () => void) => {
+    closeHistoryEntry(() => {
+      if (returnFocus) {
+        window.setTimeout(() => triggerRef.current?.focus(), 0);
+      }
+      afterClose?.();
+    });
+  }, [closeHistoryEntry]);
 
   // Menu action wrapper: unavailable actions no-op (the item is perceivable
   // but announced disabled) and available ones close the menu after running.
@@ -144,22 +142,8 @@ export function StudioToolbar({
       return;
     }
 
-    action();
-    closeMenu(true);
+    closeMenu(true, action);
   };
-
-  // Below this width, the More menu renders as a bottom sheet instead of an
-  // anchored dropdown so it never has to fight for horizontal room.
-  useEffect(() => {
-    if (typeof window === "undefined" || !window.matchMedia) {
-      return;
-    }
-    const query = window.matchMedia("(max-width: 640px)");
-    setIsCompactMenu(query.matches);
-    const handleChange = (event: MediaQueryListEvent) => setIsCompactMenu(event.matches);
-    query.addEventListener("change", handleChange);
-    return () => query.removeEventListener("change", handleChange);
-  }, []);
 
   // Collision-aware placement for the anchored (non-compact) dropdown: flip
   // above the trigger when there isn't comfortable room below, and always
@@ -249,7 +233,7 @@ export function StudioToolbar({
       window.removeEventListener("mousedown", handlePointerDown);
       window.removeEventListener("keydown", handleKeyDown);
     };
-  }, [menuOpen]);
+  }, [closeMenu, menuOpen]);
 
   const handleMenuKeyDown = (event: ReactKeyboardEvent<HTMLDivElement>) => {
     const items = Array.from(menuRef.current?.querySelectorAll<HTMLButtonElement>('[data-menu-item="true"]') ?? [])
@@ -381,6 +365,18 @@ export function StudioToolbar({
         type="button"
         size="sm"
         variant="secondary"
+        className="sm:hidden"
+        onClick={() => runMenuAction(true, toggleTheme)}
+      >
+        <SunMoon className="h-4 w-4" />
+        Toggle Theme
+      </Button>
+      <Button
+        data-menu-item="true"
+        role="menuitem"
+        type="button"
+        size="sm"
+        variant="secondary"
         onClick={() => runMenuAction(finishedCount > 0, onClearFinished)}
         aria-disabled={!finishedCount}
       >
@@ -415,14 +411,17 @@ export function StudioToolbar({
   );
 
   return (
-    <div ref={wrapperRef} className="sticky top-2 z-30 sm:top-4">
-      <Card className="border-[var(--line)]/65 bg-[color:var(--surface-0)]/94 px-3 py-3 shadow-[0_14px_34px_rgba(0,0,0,0.14)] sm:px-5 sm:py-4">
-        <div className="flex flex-col gap-3 sm:gap-4 xl:flex-row xl:items-center xl:justify-between">
-          <div className="min-w-0">
-            <div className="flex flex-wrap items-center gap-2">
-              <Button type="button" size="sm" variant="ghost" onClick={onGoHome}>
+    <header
+      ref={wrapperRef}
+      className="sticky top-[max(0.5rem,env(safe-area-inset-top))] z-30 sm:top-[max(1rem,env(safe-area-inset-top))]"
+    >
+      <Card className="relative border-[var(--line)]/65 bg-[color:var(--surface-0)]/94 px-2 py-2 shadow-[0_14px_34px_rgba(0,0,0,0.14)] sm:px-5 sm:py-4">
+        <div className="flex flex-row items-center justify-between gap-2 sm:flex-col sm:items-stretch sm:gap-4 xl:flex-row xl:items-center xl:justify-between">
+          <div className="flex min-w-0 flex-1 items-center gap-2 sm:block sm:flex-none">
+            <div className="flex shrink-0 items-center gap-2 sm:flex-wrap">
+              <Button type="button" size="sm" variant="ghost" onClick={onGoHome} aria-label="Home">
                 <ArrowLeft className="h-4 w-4" />
-                Home
+                <span className="sr-only sm:not-sr-only">Home</span>
               </Button>
               <span className="hidden h-6 w-px rounded-full bg-[var(--line)] sm:block" aria-hidden="true" />
               {/* Branding is redundant chrome once a session is open; drop it
@@ -438,7 +437,7 @@ export function StudioToolbar({
                 {decodeLabel} decode
               </Badge>
             </div>
-            <div className="mt-2 text-xs leading-5 text-[var(--muted)] sm:mt-3 sm:text-sm sm:leading-6">
+            <div className="min-w-0 flex-1 truncate text-xs leading-5 text-[var(--muted)] sm:mt-3 sm:text-sm sm:leading-6">
               <span className="sm:hidden">
                 {completedCount}/{jobsCount} ready{activeCount > 0 ? ` · ${activeCount} active` : ""}
               </span>
@@ -448,7 +447,7 @@ export function StudioToolbar({
               </span>
             </div>
             {batchProgress ? (
-              <div className="mt-2 flex items-center gap-3">
+              <div className="mt-2 hidden items-center gap-3 sm:flex">
                 <div className="min-w-0 max-w-[420px] flex-1">
                   <Progress value={batchProgress.percent} label="Batch progress" />
                 </div>
@@ -460,11 +459,13 @@ export function StudioToolbar({
             ) : null}
           </div>
 
-          <div className="flex flex-wrap items-center gap-2">
-            {themeControl}
-            <Button type="button" size="sm" variant="secondary" onClick={onOpenPicker}>
+          <div className="flex shrink-0 items-center gap-1 sm:flex-wrap sm:gap-2">
+            <div className="hidden sm:block">
+              <WorkspaceThemeToggle onToggle={toggleTheme} />
+            </div>
+            <Button type="button" size="sm" variant="secondary" onClick={onOpenPicker} aria-label="Add files">
               <Plus className="h-4 w-4" />
-              Add Files
+              <span className="sr-only sm:not-sr-only">Add Files</span>
             </Button>
             <Button type="button" size="sm" variant="secondary" onClick={onExportCsv} disabled={!completedCount} className="hidden md:inline-flex">
               <Download className="h-4 w-4" />
@@ -488,16 +489,17 @@ export function StudioToolbar({
                 aria-haspopup="menu"
                 aria-expanded={menuOpen}
                 aria-controls={menuId}
-                onClick={() => setMenuOpen((current) => !current)}
+                onClick={() => menuOpen ? closeMenu() : openMenu()}
                 onKeyDown={(event) => {
                   if (event.key === "ArrowDown") {
                     event.preventDefault();
-                    setMenuOpen(true);
+                    openMenu();
                   }
                 }}
+                aria-label="More session actions"
               >
                 <MoreHorizontal className="h-4 w-4" />
-                More
+                <span className="sr-only sm:not-sr-only">More</span>
               </Button>
               {menuOpen ? (
                 isCompactMenu ? (
@@ -507,7 +509,7 @@ export function StudioToolbar({
                   // or become a fixed-position containing block itself.
                   <div ref={compactMenuContainerRef} className="contents">
                     <div
-                      className="fixed inset-0 z-40 bg-black/45"
+                      className="fixed inset-0 z-40 touch-none overscroll-contain bg-black/45"
                       aria-hidden="true"
                       onClick={() => closeMenu()}
                     />
@@ -543,7 +545,22 @@ export function StudioToolbar({
             </div>
           </div>
         </div>
+        {batchProgress ? (
+          <div
+            className="absolute inset-x-3 bottom-0 h-0.5 overflow-hidden rounded-full bg-[var(--line)] sm:hidden"
+            role="progressbar"
+            aria-label="Batch progress"
+            aria-valuemin={0}
+            aria-valuemax={100}
+            aria-valuenow={Math.round(batchProgress.percent)}
+          >
+            <span
+              className="block h-full rounded-full bg-[var(--accent)] transition-[width] duration-200"
+              style={{ width: `${Math.max(0, Math.min(100, batchProgress.percent))}%` }}
+            />
+          </div>
+        ) : null}
       </Card>
-    </div>
+    </header>
   );
-}
+});

@@ -38,7 +38,7 @@ export function RecentSessionsPanel({
             Saved summaries from earlier runs
           </h2>
           <p className="mt-2 max-w-2xl text-sm leading-6 text-[var(--muted)]">
-            These cards hold the final readings from each run. They are local snapshots, not live session restores.
+            These view-only cards hold final readings from earlier runs. Add the source file again to analyze it or inspect its timeline.
           </p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
@@ -95,7 +95,9 @@ export function RecentSessionsPanel({
                 {session.integratedValid === false ? (
                   <Badge className="tone-warning">Integrated unavailable</Badge>
                 ) : null}
-                {session.loudnessRangeUnstable === true ? (
+                {session.loudnessRangeValid === false ? (
+                  <Badge className="tone-warning">LRA unavailable</Badge>
+                ) : session.loudnessRangeUnstable === true ? (
                   <Badge className="tone-warning">LRA unstable</Badge>
                 ) : null}
               </div>
@@ -165,7 +167,7 @@ export function HistoryPreferenceCard({
             Save finished readings only when you want to
           </h2>
           <p className="mt-2 max-w-2xl text-sm leading-6 text-[var(--muted)]">
-            History controls the compact recent-summary list. Full completed results use a separate local recovery session until you choose Clear Session.
+            History controls the view-only recent-summary list. Full completed results use a separate local recovery session until you choose Clear Session.
           </p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
@@ -195,7 +197,7 @@ export function HistoryPreferenceCard({
 
       <div className="mt-4 rounded-[20px] border border-[var(--line)] bg-[var(--surface-1)] px-4 py-3 text-sm leading-6 text-[var(--muted)]">
         {historyEnabled
-          ? "New completed runs are also saved as compact local summaries. Clear Saved History removes those summaries; Clear Session removes the full recovery results."
+          ? "New completed runs are also saved as compact view-only summaries. Clear Saved History removes those summaries; Clear Session removes the full recovery results."
           : recentCount > 0
             ? "Recent-summary history is off, so no new summaries are added. Existing saved summaries remain until you use Clear Saved History. Full completed results may also remain in recovery storage until you use Clear Session."
             : "Recent-summary history is off. Full completed results may still be stored locally for crash/reload recovery until you use Clear Session."}

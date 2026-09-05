@@ -1,7 +1,17 @@
 "use client";
 
-import { Analytics } from "@vercel/analytics/react";
-import { SpeedInsights } from "@vercel/speed-insights/next";
+import dynamic from "next/dynamic";
+
+// Loaded through next/dynamic with ssr:false so these SDKs live in their own
+// chunk instead of the shared layout entry chunk, which every visitor
+// downloads regardless of whether telemetry is enabled.
+const Analytics = dynamic(() => import("@vercel/analytics/react").then((m) => m.Analytics), {
+  ssr: false,
+});
+const SpeedInsights = dynamic(
+  () => import("@vercel/speed-insights/next").then((m) => m.SpeedInsights),
+  { ssr: false },
+);
 
 // Workspace state lives in the query string, and three of those params carry
 // user content: `search` is the queue search box, which matches against local

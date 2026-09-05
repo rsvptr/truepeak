@@ -8,6 +8,11 @@ import path from "node:path";
 const outDir = path.join(os.tmpdir(), "truepeak-test-audio");
 await mkdir(outDir, { recursive: true });
 
+/**
+ * @param {Float32Array[]} channels
+ * @param {number} sampleRate
+ * @param {{ float?: boolean, bits?: number }} [options]
+ */
 function encodeWav(channels, sampleRate, { float = false, bits = 16 } = {}) {
   const channelCount = channels.length;
   const frameCount = channels[0].length;
@@ -16,6 +21,10 @@ function encodeWav(channels, sampleRate, { float = false, bits = 16 } = {}) {
   const dataBytes = frameCount * blockAlign;
   const buffer = new ArrayBuffer(44 + dataBytes);
   const view = new DataView(buffer);
+  /**
+   * @param {number} off
+   * @param {string} text
+   */
   const ascii = (off, text) => { for (let i = 0; i < text.length; i += 1) view.setUint8(off + i, text.charCodeAt(i)); };
   ascii(0, "RIFF");
   view.setUint32(4, 36 + dataBytes, true);
@@ -31,6 +40,7 @@ function encodeWav(channels, sampleRate, { float = false, bits = 16 } = {}) {
   ascii(36, "data");
   view.setUint32(40, dataBytes, true);
   let off = 44;
+  /** @param {number} v */
   const clamp = (v) => Math.max(-1, Math.min(1, v));
   for (let n = 0; n < frameCount; n += 1) {
     for (let ch = 0; ch < channelCount; ch += 1) {
@@ -47,6 +57,11 @@ function encodeWav(channels, sampleRate, { float = false, bits = 16 } = {}) {
 }
 
 const SR = 48000;
+/**
+ * @param {(t: number, n: number) => [number, number]} fn
+ * @param {number} seconds
+ * @returns {Float32Array[]}
+ */
 const stereo = (fn, seconds) => {
   const N = Math.round(seconds * SR);
   const l = new Float32Array(N);
@@ -54,6 +69,10 @@ const stereo = (fn, seconds) => {
   for (let n = 0; n < N; n += 1) { const [a, b] = fn(n / SR, n); l[n] = a; r[n] = b; }
   return [l, r];
 };
+/**
+ * @param {number} f
+ * @param {number} t
+ */
 const tone = (f, t) => Math.sin(2 * Math.PI * f * t);
 
 // 1) Loud, steady, hot peaks — should read above a -14 LUFS streaming target.
@@ -69,6 +88,7 @@ const dynamic = stereo((t) => {
   return [base, base * 0.94 + env * 0.2 * tone(330, t)];
 }, 12);
 
+/** @type {[string, Buffer][]} */
 const files = [
   ["loud-master_48k_f32.wav", encodeWav(loud, SR, { float: true })],
   ["quiet-pad_48k_16bit.wav", encodeWav(quiet, SR, { bits: 16 })],

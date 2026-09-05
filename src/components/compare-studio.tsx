@@ -3,7 +3,6 @@
 import { memo, useMemo, useState } from "react";
 import { ArrowRightLeft, AudioLines, BarChart3, CircleAlert, Target, Waves } from "lucide-react";
 import { getComplianceSummary, type ComplianceState } from "@/audio/compliance";
-import { resolveAnalysisProvenance } from "@/audio/session-file";
 import {
   describeIntegratedInvalidReason,
   formatDb,
@@ -16,26 +15,18 @@ import {
   formatPresetPeakDbtp,
   formatRelativeDb,
   formatRelativeLu,
+  isSilencePeak,
 } from "@/lib/format";
 import {
-  getAttentionJobs,
-  getClosestToTargetJob,
-  getComplianceCounts,
-  getCompletedAnalysisJobs,
-  getDecoderMix,
-  getHottestPeakJob,
   hasValidIntegratedMeasurement,
-  getLargestMoveJob,
-  getLoudestJob,
-  getLongestJob,
-  getQuietestJob,
-  getWidestRangeJob,
   compareOptionalMetric,
   type CompletedAnalysisJob,
+  type SessionStats,
 } from "@/lib/session-selectors";
+import { describeResultBadges } from "@/lib/job-ui";
 import { complianceToneClass, deltaToneClass } from "@/lib/status-tone";
 import { cn } from "@/lib/utils";
-import type { AnalysisJob, AnalysisMode, TargetPreset } from "@/types/audio";
+import type { AnalysisMode, TargetPreset } from "@/types/audio";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
@@ -46,7 +37,7 @@ export type SortDirection = "asc" | "desc";
 export type CompareFilter = "all" | "on-target" | "attention";
 
 interface CompareStudioProps {
-  completedJobs: AnalysisJob[];
+  sessionStats: SessionStats;
   currentTarget: TargetPreset | null;
   analysisMode: AnalysisMode;
   selectedJobId: string | null;
@@ -133,10 +124,6 @@ function insightSpread(values: number[]) {
   return Math.max(...values) - Math.min(...values);
 }
 
-function isUnverifiedImport(job: AnalysisJob) {
-  return resolveAnalysisProvenance(job).kind === "unverified-import";
-}
-
 function formatSortDirection(direction: SortDirection) {
   return direction === "asc" ? "Ascending" : "Descending";
 }
@@ -215,8 +202,15 @@ function compareJobs(
       compare = left.result.metrics.truePeakDbtp - right.result.metrics.truePeakDbtp;
       break;
     case "lra":
-      compare = left.result.metrics.loudnessRange - right.result.metrics.loudnessRange;
-      break;
+      return compareOptionalMetric(
+        left.result.metrics.loudnessRangeValid === false
+          ? null
+          : left.result.metrics.loudnessRange,
+        right.result.metrics.loudnessRangeValid === false
+          ? null
+          : right.result.metrics.loudnessRange,
+        compareDirection,
+      );
     case "gain":
       return compareOptionalMetric(
         left.result.metrics.targetDeltaDb,
@@ -269,19 +263,9 @@ function buildTableRowModel(
   job: CompletedAnalysisJob,
   referenceJob: CompletedAnalysisJob | null,
   selectedJobId: string | null,
+  analysisMode: AnalysisMode,
 ): TableRowModel {
-  const compliance = getComplianceSummary(job.result);
-  const badges: TableRowBadge[] = [];
-  if (compliance) {
-    badges.push({ key: "compliance", label: compliance.label, className: complianceToneClass(compliance.state) });
-  } else if (job.result.metrics.integratedValid === false) {
-    badges.push({ key: "integrated-unavailable", label: "Integrated unavailable", className: "tone-warning" });
-  } else {
-    badges.push({ key: "measure-only", label: "Measure Only" });
-  }
-  if (isUnverifiedImport(job)) {
-    badges.push({ key: "unverified", label: "Unverified import", className: "tone-warning" });
-  }
+  const badges: TableRowBadge[] = describeResultBadges(job, analysisMode);
   if (job.result.metrics.normalizationLimited) {
     badges.push({ key: "ceiling-limited", label: "Ceiling-limited", className: "tone-warning" });
   }
@@ -347,7 +331,7 @@ const CompareBoardCard = memo(function CompareBoardCard({
   isSelected: boolean;
   onOpenJob: (jobId: string) => void;
 }) {
-  const compliance = getComplianceSummary(job.result);
+  const badges = describeResultBadges(job, "targeted", true);
   return (
     <div
       className={cn(
@@ -361,10 +345,16 @@ const CompareBoardCard = memo(function CompareBoardCard({
         <div className="min-w-0">
           <div className="break-words text-sm font-semibold text-[var(--ink)]">{job.fileName}</div>
           <div className="mt-2 flex flex-wrap gap-2">
-            {compliance ? <Badge className={complianceToneClass(compliance.state)}>{compliance.label}</Badge> : null}
-            {job.result.metrics.integratedValid === false ? <Badge className="tone-warning">Integrated unavailable</Badge> : null}
-            {isUnverifiedImport(job) ? <Badge className="tone-warning">Unverified import</Badge> : null}
-            <Badge className="max-w-full break-words border-[var(--line)] bg-[var(--surface-1)] text-[var(--muted)]">{job.result.metadata.decoderLabel}</Badge>
+            {badges.map((badge) => (
+              <Badge
+                key={badge.key}
+                className={badge.key === "decoder"
+                  ? "max-w-full break-words border-[var(--line)] bg-[var(--surface-1)] text-[var(--muted)]"
+                  : badge.className}
+              >
+                {badge.label}
+              </Badge>
+            ))}
           </div>
         </div>
         <Button type="button" size="sm" variant="ghost" onClick={() => onOpenJob(job.id)} aria-label={`Inspect ${job.fileName}`} className="shrink-0">Inspect</Button>
@@ -451,7 +441,7 @@ const CompareRankedCard = memo(function CompareRankedCard({
   analysisMode,
   onOpenJob,
 }: CompareRankedCardProps) {
-  const compliance = getComplianceSummary(job.result);
+  const badges = describeResultBadges(job, analysisMode);
   const distanceToTarget =
     currentTarget && job.result.metrics.integratedValid !== false
       ? Math.abs(job.result.metrics.integratedLufs - currentTarget.loudnessTargetLufs)
@@ -467,8 +457,7 @@ const CompareRankedCard = memo(function CompareRankedCard({
         <div className="min-w-0">
           <div className="flex flex-wrap items-center gap-2">
             <Badge>#{rank}</Badge>
-            {compliance ? <Badge className={complianceToneClass(compliance.state)}>{compliance.label}</Badge> : job.result.metrics.integratedValid === false ? <Badge className="tone-warning">Integrated unavailable</Badge> : <Badge>Measure Only</Badge>}
-            {isUnverifiedImport(job) ? <Badge className="tone-warning">Unverified import</Badge> : null}
+            {badges.map((badge) => <Badge key={badge.key} className={badge.className}>{badge.label}</Badge>)}
             {job.result.metrics.normalizationLimited ? <Badge className="tone-warning">Ceiling-limited</Badge> : null}
           </div>
           <h3 className="mt-3 break-words text-xl font-semibold text-[var(--ink)]">{job.fileName}</h3>
@@ -515,13 +504,17 @@ const CompareReferenceCard = memo(function CompareReferenceCard({
   analysisMode,
   onOpenJob,
 }: CompareReferenceCardProps) {
-  const compliance = getComplianceSummary(job.result);
+  const badges = describeResultBadges(job, analysisMode);
   const integratedDelta = job.result.metrics.integratedValid !== false && referenceJob.result.metrics.integratedValid !== false ? job.result.metrics.integratedLufs - referenceJob.result.metrics.integratedLufs : null;
   const truePeakDelta = job.result.metrics.truePeakDbtp - referenceJob.result.metrics.truePeakDbtp;
+  const lraDeltaInvalid =
+    job.result.metrics.loudnessRangeValid === false ||
+    referenceJob.result.metrics.loudnessRangeValid === false;
   const lraDeltaUnstable =
-    job.result.metrics.loudnessRangeUnstable === true ||
-    referenceJob.result.metrics.loudnessRangeUnstable === true;
-  const lraDelta = lraDeltaUnstable
+    !lraDeltaInvalid &&
+    (job.result.metrics.loudnessRangeUnstable === true ||
+      referenceJob.result.metrics.loudnessRangeUnstable === true);
+  const lraDelta = lraDeltaInvalid || lraDeltaUnstable
     ? null
     : job.result.metrics.loudnessRange - referenceJob.result.metrics.loudnessRange;
   const gainDelta = job.result.metrics.targetDeltaDb == null || referenceJob.result.metrics.targetDeltaDb == null ? null : job.result.metrics.targetDeltaDb - referenceJob.result.metrics.targetDeltaDb;
@@ -540,8 +533,7 @@ const CompareReferenceCard = memo(function CompareReferenceCard({
         <div className="min-w-0">
           <div className="flex flex-wrap items-center gap-2">
             {isReference ? <Badge>Reference</Badge> : null}
-            {compliance ? <Badge className={complianceToneClass(compliance.state)}>{compliance.label}</Badge> : job.result.metrics.integratedValid === false ? <Badge className="tone-warning">Integrated unavailable</Badge> : <Badge>Measure Only</Badge>}
-            {isUnverifiedImport(job) ? <Badge className="tone-warning">Unverified import</Badge> : null}
+            {badges.map((badge) => <Badge key={badge.key} className={badge.className}>{badge.label}</Badge>)}
           </div>
           <h3 className="mt-3 break-words text-xl font-semibold text-[var(--ink)]">{job.fileName}</h3>
           <p className="mt-2 break-words text-sm leading-6 text-[var(--muted)]">Compare this file against {referenceJob.fileName} before making batch-wide decisions.</p>
@@ -551,7 +543,7 @@ const CompareReferenceCard = memo(function CompareReferenceCard({
       <div className={cn("mt-5 grid gap-3", analysisMode === "targeted" ? "sm:grid-cols-2" : "sm:grid-cols-3")}>
         <div className="rounded-[20px] border border-[var(--line)] bg-[var(--surface-0)] px-4 py-3"><div className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">Integrated delta</div><div className={cn("mt-2 text-lg font-semibold tabular-nums", deltaToneClass(integratedDelta))}>{formatRelativeLu(integratedDelta)}</div></div>
         <div className="rounded-[20px] border border-[var(--line)] bg-[var(--surface-0)] px-4 py-3"><div className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">True peak delta</div><div className={cn("mt-2 text-lg font-semibold tabular-nums", deltaToneClass(truePeakDelta))}>{formatRelativeDb(truePeakDelta)}</div></div>
-        <div className="rounded-[20px] border border-[var(--line)] bg-[var(--surface-0)] px-4 py-3"><div className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">LRA delta</div><div className={cn("mt-2 text-lg font-semibold tabular-nums", deltaToneClass(lraDelta))}>{lraDeltaUnstable ? "Unstable" : formatRelativeLu(lraDelta)}</div></div>
+        <div className="rounded-[20px] border border-[var(--line)] bg-[var(--surface-0)] px-4 py-3"><div className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">LRA delta</div><div className={cn("mt-2 text-lg font-semibold tabular-nums", deltaToneClass(lraDelta))}>{lraDeltaInvalid ? "No valid measurement" : lraDeltaUnstable ? "Unstable" : formatRelativeLu(lraDelta)}</div></div>
         {analysisMode === "targeted" ? <div className="rounded-[20px] border border-[var(--line)] bg-[var(--surface-0)] px-4 py-3"><div className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">Gain delta</div><div className={cn("mt-2 text-lg font-semibold tabular-nums", deltaToneClass(gainDelta))}>{formatRelativeDb(gainDelta)}</div></div> : null}
       </div>
     </Card>
@@ -581,7 +573,7 @@ const CompareTableMobileRow = memo(function CompareTableMobileRow({
   analysisMode,
   onOpenJob,
 }: CompareTableRowProps) {
-  const row = buildTableRowModel(job, referenceJob, selectedJobId);
+  const row = buildTableRowModel(job, referenceJob, selectedJobId, analysisMode);
 
   return (
     <article
@@ -642,7 +634,7 @@ const CompareTableDesktopRow = memo(function CompareTableDesktopRow({
   analysisMode,
   onOpenJob,
 }: CompareTableRowProps) {
-  const row = buildTableRowModel(job, referenceJob, selectedJobId);
+  const row = buildTableRowModel(job, referenceJob, selectedJobId, analysisMode);
   const showReferenceColumn = referenceJob != null;
 
   return (
@@ -664,7 +656,7 @@ const CompareTableDesktopRow = memo(function CompareTableDesktopRow({
 });
 
 export function CompareStudio({
-  completedJobs,
+  sessionStats,
   currentTarget,
   analysisMode,
   selectedJobId,
@@ -682,32 +674,27 @@ export function CompareStudio({
 }: CompareStudioProps) {
   const availableViews = analysisMode === "targeted" ? TARGETED_VIEWS : MEASURE_ONLY_VIEWS;
   const availableSorts = analysisMode === "targeted" ? TARGETED_SORTS : MEASURE_ONLY_SORTS;
-  const compareView = availableViews.some((view) => view.id === compareViewProp) ? compareViewProp : "cards";
-  const compareSort = availableSorts.some((sort) => sort.id === compareSortProp) ? compareSortProp : "integrated";
-  const compareDirection = compareDirectionProp === "asc" || compareDirectionProp === "desc" ? compareDirectionProp : compareSort === "name" ? "asc" : "desc";
-  const compareFilter = analysisMode === "targeted" ? compareFilterProp : "all";
-
-  const readyJobs = useMemo(() => getCompletedAnalysisJobs(completedJobs), [completedJobs]);
+  const compareView = compareViewProp;
+  const compareSort = compareSortProp;
+  const compareDirection = compareDirectionProp;
+  const compareFilter = compareFilterProp;
+  const {
+    attentionJobs,
+    closestToTargetJob,
+    complianceCounts,
+    decoderMix,
+    hottestPeakJob,
+    largestMoveJob,
+    longestJob,
+    loudestJob,
+    quietestJob,
+    readyJobs,
+    unverifiedCount,
+    widestRangeJob,
+  } = sessionStats;
   const selectedCompletedJob = useMemo(
     () => readyJobs.find((job) => job.id === selectedJobId) ?? null,
     [readyJobs, selectedJobId],
-  );
-  const closestToTargetJob = useMemo(
-    () => getClosestToTargetJob(readyJobs, analysisMode === "targeted" && currentTarget ? currentTarget.loudnessTargetLufs : null),
-    [analysisMode, currentTarget, readyJobs],
-  );
-  const quietestJob = useMemo(() => getQuietestJob(readyJobs), [readyJobs]);
-  const loudestJob = useMemo(() => getLoudestJob(readyJobs), [readyJobs]);
-  const hottestPeakJob = useMemo(() => getHottestPeakJob(readyJobs), [readyJobs]);
-  const widestRangeJob = useMemo(() => getWidestRangeJob(readyJobs), [readyJobs]);
-  const longestJob = useMemo(() => getLongestJob(readyJobs), [readyJobs]);
-  const largestMoveJob = useMemo(() => getLargestMoveJob(readyJobs), [readyJobs]);
-
-  const complianceCounts = useMemo(() => getComplianceCounts(readyJobs), [readyJobs]);
-  const attentionJobs = useMemo(() => getAttentionJobs(readyJobs), [readyJobs]);
-  const unverifiedCount = useMemo(
-    () => readyJobs.filter(isUnverifiedImport).length,
-    [readyJobs],
   );
 
   const filterCounts = useMemo<Record<CompareFilter, number>>(
@@ -787,7 +774,6 @@ export function CompareStudio({
     () => insightSpread(readyJobs.map((job) => job.result.metrics.truePeakDbtp)),
     [readyJobs],
   );
-  const decoderMix = useMemo(() => getDecoderMix(readyJobs), [readyJobs]);
   const decoderSummary = decoderMix.length
     ? decoderMix.map(([label, count]) => `${label} x${count}`).join(" | ")
     : "Waiting for completed jobs";
@@ -811,12 +797,13 @@ export function CompareStudio({
   }, [analysisMode, currentTarget, readyJobs]);
 
   const truePeakRange = useMemo(() => {
-    if (!readyJobs.length) {
+    const values = readyJobs
+      .map((job) => job.result.metrics.truePeakDbtp)
+      .filter((value) => !isSilencePeak(value));
+    const marker = analysisMode === "targeted" && currentTarget ? currentTarget.truePeakCeilingDbtp : null;
+    if (!values.length && marker == null) {
       return null;
     }
-
-    const values = readyJobs.map((job) => job.result.metrics.truePeakDbtp);
-    const marker = analysisMode === "targeted" && currentTarget ? currentTarget.truePeakCeilingDbtp : null;
     const rangeValues = marker == null ? values : [...values, marker];
     return {
       min: Math.min(...rangeValues),
@@ -1078,16 +1065,21 @@ export function CompareStudio({
           </div>
           <div className="mt-5 space-y-3">
             {topLaneJobs.map((job) => {
-              const compliance = getComplianceSummary(job.result);
+              const badges = describeResultBadges(job, analysisMode, true);
               return (
                   <div key={job.id} className="min-w-0 overflow-hidden rounded-[22px] border border-[var(--line)] bg-[var(--surface-1)] p-4 [content-visibility:auto] [contain-intrinsic-size:180px]">
                   <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
                     <div className="min-w-0">
                       <div className="break-words text-sm font-semibold text-[var(--ink)]">{job.fileName}</div>
                       <div className="mt-2 flex flex-wrap items-center gap-2">
-                        {compliance ? <Badge className={complianceToneClass(compliance.state)}>{compliance.label}</Badge> : job.result.metrics.integratedValid === false ? <Badge className="tone-warning">Integrated unavailable</Badge> : <Badge>Measure Only</Badge>}
-                        {isUnverifiedImport(job) ? <Badge className="tone-warning">Unverified import</Badge> : null}
-                        <Badge className="max-w-full break-words">{job.result.metadata.decoderLabel}</Badge>
+                        {badges.map((badge) => (
+                          <Badge
+                            key={badge.key}
+                            className={badge.key === "decoder" ? "max-w-full break-words" : badge.className}
+                          >
+                            {badge.label}
+                          </Badge>
+                        ))}
                         <Badge className="border-[var(--line)] bg-[var(--surface-0)] text-[var(--muted)]">{formatDuration(job.result.metadata.durationSeconds)}</Badge>
                       </div>
                     </div>
@@ -1139,7 +1131,7 @@ export function CompareStudio({
               {(analysisMode === "targeted" ? COMPARE_FILTERS : [{ id: "all", label: "All" }]).map((filter) => (
                 <Button key={filter.id} type="button" size="sm" variant={compareFilter === filter.id ? "primary" : "secondary"} aria-pressed={compareFilter === filter.id} onClick={() => onCompareFilterChange(filter.id as CompareFilter)}>
                   {filter.label}
-                  {analysisMode === "targeted" ? <span className="text-[11px] opacity-70">{numberFormatter.format(filterCounts[filter.id as CompareFilter])}</span> : null}
+                  {analysisMode === "targeted" ? <span className="text-[11px]">{numberFormatter.format(filterCounts[filter.id as CompareFilter])}</span> : null}
                 </Button>
               ))}
             </div>
@@ -1156,7 +1148,7 @@ export function CompareStudio({
                 </div>
                 <div className="mt-3 flex flex-col gap-3 xl:flex-row xl:items-center">
                   <label htmlFor="compare-reference" className="sr-only">Choose a reference file</label>
-                  <select id="compare-reference" name="compare-reference" aria-label="Choose reference file" value={referenceJob?.id ?? "none"} onChange={(event) => onReferenceIdChange(event.target.value === "none" ? null : event.target.value)} className="w-full rounded-full border border-[var(--control-line)] bg-[var(--surface-0)] px-4 py-3 text-sm text-[var(--ink)] outline-none transition-[border-color,background-color] duration-200 ease-out focus:border-[var(--accent)] xl:max-w-md">
+                  <select id="compare-reference" name="compare-reference" aria-label="Choose reference file" value={referenceJob?.id ?? "none"} onChange={(event) => onReferenceIdChange(event.target.value === "none" ? null : event.target.value)} className="w-full rounded-full border border-[var(--control-line)] bg-[var(--surface-0)] px-4 py-3 text-sm text-[var(--ink)] outline-none transition-[border-color,background-color] duration-200 ease-out focus:border-[var(--accent)] focus-visible:ring-2 focus-visible:ring-[var(--accent)] xl:max-w-md">
                     <option value="none">No reference</option>
                     {readyJobs.map((job) => (
                       <option key={job.id} value={job.id}>{job.fileName}</option>
@@ -1196,7 +1188,7 @@ export function CompareStudio({
               onClick={() => toggleCompareSort(option.id)}
             >
               {option.label}
-              {compareSort === option.id ? <span className="text-[11px] opacity-70">{formatSortDirection(compareDirection)}</span> : null}
+              {compareSort === option.id ? <span className="text-[11px]">{formatSortDirection(compareDirection)}</span> : null}
             </Button>
           ))}
         </div>

@@ -1,13 +1,13 @@
 "use client";
 
-import { memo } from "react";
+import { memo, useState } from "react";
 import { RefreshCcw, Square, Trash2 } from "lucide-react";
 import { getComplianceSummary, type ComplianceSummary } from "@/audio/compliance";
 import { formatDuration, formatIntegratedLufs, formatLoudnessRange, formatPeakDbtp, formatRelativeDb } from "@/lib/format";
-import { getJobErrorDisplay, type JobErrorDisplay } from "@/lib/job-ui";
-import { isActiveJob, isIssueJob } from "@/lib/session-selectors";
-import { complianceToneClass, statusToneClass } from "@/lib/status-tone";
+import { describeJobBadges, getJobErrorDisplay, getViewOnlyHint, type JobBadgeDescriptor, type JobErrorDisplay } from "@/lib/job-ui";
+import { isActiveJob, isIssueJob, isPausedAnalysisJob } from "@/lib/session-selectors";
 import { cn } from "@/lib/utils";
+import { useMediaQuery } from "@/hooks/use-media-query";
 import type { AnalysisJob, AnalysisMode } from "@/types/audio";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -33,17 +33,14 @@ interface SimpleResultsTableProps {
   onRetryJob: (jobId: string) => void;
 }
 
-interface JobBadgeDescriptor {
-  key: string;
-  label: string;
-  className?: string;
-}
+const QUEUE_WINDOW_SIZE = 60;
 
 interface JobRowModel {
   compliance: ComplianceSummary | null;
   errorDisplay: JobErrorDisplay | null;
   isActive: boolean;
   isIssue: boolean;
+  viewOnlyHint: string | null;
   badges: JobBadgeDescriptor[];
   integratedDisplay: string;
   truePeakDisplay: string;
@@ -62,32 +59,7 @@ function buildJobRowModel(job: AnalysisJob, analysisMode: AnalysisMode): JobRowM
   const errorDisplay = getJobErrorDisplay(job.error);
   const isActive = isActiveJob(job);
   const isIssue = isIssueJob(job);
-
-  const badges: JobBadgeDescriptor[] = [
-    { key: "status", label: job.status, className: statusToneClass(job.status) },
-  ];
-  if (job.imported) {
-    badges.push({ key: "imported", label: "Unverified import", className: "tone-warning" });
-  }
-  if (job.restored) {
-    badges.push({
-      key: "restored",
-      label: "Restored",
-      className: "border-[var(--line)] bg-[var(--surface-0)] text-[var(--muted)]",
-    });
-  }
-  if (job.result?.metrics.integratedValid === false) {
-    badges.push({ key: "integrated-unavailable", label: "Integrated unavailable", className: "tone-warning" });
-  }
-  if (compliance) {
-    badges.push({ key: "compliance", label: compliance.label, className: complianceToneClass(compliance.state) });
-  }
-  if (job.result?.target) {
-    badges.push({ key: "target", label: job.result.target.label });
-  }
-  if (analysisMode === "measure-only" && job.result) {
-    badges.push({ key: "measure-only", label: "Measure Only" });
-  }
+  const isPaused = isPausedAnalysisJob(job);
 
   // Reserve "Waiting" for work that is actually still queued/active. A
   // terminal failure or cancellation has no measurement coming - saying
@@ -96,14 +68,17 @@ function buildJobRowModel(job: AnalysisJob, analysisMode: AnalysisMode): JobRowM
     ? formatIntegratedLufs(job.result.metrics)
     : isIssue
       ? job.status === "failed" ? "Failed" : "Unavailable"
-      : "Waiting";
+      : isPaused
+        ? "Paused"
+        : "Waiting";
 
   return {
     compliance,
     errorDisplay,
     isActive,
     isIssue,
-    badges,
+    viewOnlyHint: getViewOnlyHint(job),
+    badges: describeJobBadges(job, analysisMode).filter((badge) => badge.key !== "decoder"),
     integratedDisplay,
     truePeakDisplay: job.result ? formatPeakDbtp(job.result.metrics.truePeakDbtp) : "n/a",
     gainDisplay: job.result ? formatRelativeDb(job.result.metrics.targetDeltaDb) : "n/a",
@@ -165,6 +140,9 @@ const SimpleQueueCard = memo(function SimpleQueueCard({
           </Badge>
         ))}
       </div>
+      {model.viewOnlyHint ? (
+        <p className="mt-3 text-xs leading-5 text-[var(--muted)]">{model.viewOnlyHint}</p>
+      ) : null}
       <div className="mt-4 grid grid-cols-2 gap-3">
         <div>
           <div className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">Integrated</div>
@@ -197,6 +175,14 @@ const SimpleQueueCard = memo(function SimpleQueueCard({
       {model.errorDisplay ? (
         <div className="mt-3 text-xs leading-5 text-[var(--danger)]">
           {model.errorDisplay.summary}
+          {model.errorDisplay.detail ? (
+            <details className="mt-2 rounded-[16px] border border-[var(--danger-line)] bg-[var(--danger-soft)] px-3 py-2 text-[11px] leading-5 text-[var(--ink)]">
+              <summary className="cursor-pointer font-semibold uppercase tracking-[0.14em] text-[var(--danger)]">
+                Why it failed
+              </summary>
+              <p className="mt-2 normal-case tracking-normal text-[var(--ink)]/75">{model.errorDisplay.detail}</p>
+            </details>
+          ) : null}
         </div>
       ) : null}
       <div className="mt-4 flex flex-wrap gap-2 border-t border-[var(--line)]/70 pt-4">
@@ -271,6 +257,9 @@ const SimpleQueueRow = memo(function SimpleQueueRow({
                 </Badge>
               ))}
             </div>
+            {model.viewOnlyHint ? (
+              <p className="mt-2 max-w-[38rem] text-xs leading-5 text-[var(--muted)]">{model.viewOnlyHint}</p>
+            ) : null}
             {model.isActive ? (
               <div className="mt-3 space-y-2">
                 <div className="flex items-center justify-between gap-3 text-xs text-[var(--muted)]">
@@ -284,7 +273,7 @@ const SimpleQueueRow = memo(function SimpleQueueRow({
               <div className="mt-3 text-xs leading-5 text-[var(--danger)]">
                 {model.errorDisplay.summary}
                 {model.errorDisplay.detail ? (
-                  <details className="mt-2 rounded-[16px] border border-[var(--danger-line)] bg-[var(--danger-soft)] px-3 py-2 text-[11px] leading-5 text-[var(--ink)]/85">
+                  <details className="mt-2 rounded-[16px] border border-[var(--danger-line)] bg-[var(--danger-soft)] px-3 py-2 text-[11px] leading-5 text-[var(--ink)]">
                     <summary className="cursor-pointer font-semibold uppercase tracking-[0.14em] text-[var(--danger)]">
                       Why it failed
                     </summary>
@@ -340,10 +329,19 @@ export const SimpleResultsTable = memo(function SimpleResultsTable({
   onRemoveJob,
   onRetryJob,
 }: SimpleResultsTableProps) {
+  const isDesktopQueue = useMediaQuery("(min-width: 768px)");
+  const [requestedPage, setRequestedPage] = useState(0);
+  const pageCount = Math.max(1, Math.ceil(jobs.length / QUEUE_WINDOW_SIZE));
+  const pageIndex = Math.min(requestedPage, pageCount - 1);
+  const windowStart = pageIndex * QUEUE_WINDOW_SIZE;
+  const visibleJobs = jobs.slice(windowStart, windowStart + QUEUE_WINDOW_SIZE);
+  const windowEnd = windowStart + visibleJobs.length;
+
   return (
     <div className="overflow-hidden rounded-[28px] border border-[var(--line)]/80 bg-[var(--surface-1)] shadow-[0_18px_44px_rgba(0,0,0,0.12)]">
-      <div className="grid gap-3 p-3 md:hidden">
-        {jobs.map((job) => (
+      {!isDesktopQueue ? (
+      <div className="grid gap-3 p-3">
+        {visibleJobs.map((job) => (
           <SimpleQueueCard
             key={job.id}
             job={job}
@@ -356,10 +354,11 @@ export const SimpleResultsTable = memo(function SimpleResultsTable({
           />
         ))}
       </div>
-      <div className="hidden overflow-x-auto md:block">
+      ) : (
+      <div className="overflow-x-auto">
         <table className="w-full min-w-[640px] table-fixed text-sm lg:min-w-[760px] xl:min-w-[860px]">
           <caption className="sr-only">
-            Analysis results for {jobs.length} file{jobs.length === 1 ? "" : "s"} in this session,{" "}
+            Analysis results {jobs.length > QUEUE_WINDOW_SIZE ? `${windowStart + 1} to ${windowEnd} of ` : "for "}{jobs.length} file{jobs.length === 1 ? "" : "s"} in this session,{" "}
             {analysisMode === "targeted" ? "showing target compliance and gain" : "in measure-only mode"}.
           </caption>
           <colgroup>
@@ -393,7 +392,7 @@ export const SimpleResultsTable = memo(function SimpleResultsTable({
             </tr>
           </thead>
           <tbody>
-            {jobs.map((job) => (
+            {visibleJobs.map((job) => (
               <SimpleQueueRow
                 key={job.id}
                 job={job}
@@ -408,6 +407,50 @@ export const SimpleResultsTable = memo(function SimpleResultsTable({
           </tbody>
         </table>
       </div>
+      )}
+      {pageCount > 1 ? (
+        <div className="flex flex-wrap items-center justify-between gap-3 border-t border-[var(--line)]/70 px-4 py-3 text-sm text-[var(--muted)]">
+          <span>
+            Showing {windowStart + 1}-{windowEnd} of {jobs.length} files
+          </span>
+          <div className="flex items-center gap-2" role="group" aria-label="Queue pages">
+            {/* aria-disabled, not disabled: a native disabled button drops
+                keyboard focus to <body> the moment paging reaches a boundary,
+                so the buttons stay focusable and no-op instead. */}
+            <Button
+              type="button"
+              size="sm"
+              variant="ghost"
+              aria-disabled={pageIndex === 0}
+              onClick={() => {
+                if (pageIndex === 0) {
+                  return;
+                }
+                setRequestedPage(pageIndex - 1);
+              }}
+            >
+              Previous
+            </Button>
+            <span aria-live="polite">
+              Page {pageIndex + 1} of {pageCount}
+            </span>
+            <Button
+              type="button"
+              size="sm"
+              variant="ghost"
+              aria-disabled={pageIndex >= pageCount - 1}
+              onClick={() => {
+                if (pageIndex >= pageCount - 1) {
+                  return;
+                }
+                setRequestedPage(pageIndex + 1);
+              }}
+            >
+              Next
+            </Button>
+          </div>
+        </div>
+      ) : null}
     </div>
   );
 });

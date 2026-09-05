@@ -1,11 +1,11 @@
 "use client";
 
-import { useEffect, useRef, type KeyboardEvent, type Ref } from "react";
+import { memo, useEffect, useRef, type KeyboardEvent, type Ref } from "react";
 import dynamic from "next/dynamic";
 import { BarChart3, CircleAlert, LoaderCircle, RefreshCcw, Square } from "lucide-react";
 import { getComplianceSummary } from "@/audio/compliance";
-import { describeIntegratedInvalidReason, formatDb, formatDuration, formatIntegratedLufs, formatLoudnessRange, formatLufs, formatPeakDbtp, formatRelativeDb, formatRelativeLu, formatTimestamp } from "@/lib/format";
-import { getJobErrorDisplay } from "@/lib/job-ui";
+import { describeIntegratedInvalidReason, formatDb, formatDuration, formatIntegratedLufs, formatLoudnessRange, formatLufs, formatPeakDbtp, formatPresetLufs, formatPresetPeakDbtp, formatRelativeDb, formatRelativeLu, formatTimestamp } from "@/lib/format";
+import { describeJobBadges, getJobErrorDisplay, getViewOnlyHint } from "@/lib/job-ui";
 import { complianceToneClass, statusToneClass } from "@/lib/status-tone";
 import { isActiveJob, isIssueJob } from "@/lib/session-selectors";
 import { cn } from "@/lib/utils";
@@ -14,6 +14,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { Progress } from "@/components/ui/progress";
+import { useWorkspaceCommands, useWorkspaceSession } from "@/components/workspace-contexts";
 
 // uPlot and the chart wiring only matter once someone opens the Timeline tab
 // of a completed result, so keep them out of the initial bundle. The
@@ -86,20 +87,43 @@ function InspectorMetric({
 }
 
 interface InspectorPanelProps {
-  job: AnalysisJob;
-  analysisMode: AnalysisMode;
-  detailTab: InspectorDetailTab;
   headingId?: string;
   headingRef?: Ref<HTMLHeadingElement>;
   headingTabIndex?: number;
-  completedCount: number;
-  onDetailTabChange: (tab: InspectorDetailTab) => void;
-  onOpenCompare?: () => void;
-  onRetryJob: (jobId: string) => void;
-  onCancelJob: (jobId: string) => void;
 }
 
-export function InspectorPanel({
+export const InspectorPanel = memo(function InspectorPanel({
+  headingId,
+  headingRef,
+  headingTabIndex,
+}: InspectorPanelProps) {
+  const commands = useWorkspaceCommands();
+  const { completedJobs, selectedJob } = useWorkspaceSession();
+
+  if (!selectedJob) {
+    return null;
+  }
+
+  return (
+    <InspectorPanelContent
+      job={selectedJob}
+      analysisMode={commands.route.analysisMode}
+      detailTab={commands.route.detailTab}
+      headingId={headingId}
+      headingRef={headingRef}
+      headingTabIndex={headingTabIndex}
+      completedCount={completedJobs.length}
+      onDetailTabChange={commands.setDetailTab}
+      onOpenCompare={
+        commands.route.uiMode === "advanced" ? commands.openCompare : undefined
+      }
+      onRetryJob={commands.retryJob}
+      onCancelJob={commands.cancelJob}
+    />
+  );
+});
+
+function InspectorPanelContent({
   job,
   analysisMode,
   detailTab,
@@ -111,7 +135,19 @@ export function InspectorPanel({
   onOpenCompare,
   onRetryJob,
   onCancelJob,
-}: InspectorPanelProps) {
+}: {
+  job: AnalysisJob;
+  analysisMode: AnalysisMode;
+  detailTab: InspectorDetailTab;
+  headingId?: string;
+  headingRef?: Ref<HTMLHeadingElement>;
+  headingTabIndex?: number;
+  completedCount: number;
+  onDetailTabChange: (tab: InspectorDetailTab) => void;
+  onOpenCompare?: () => void;
+  onRetryJob: (jobId: string) => void;
+  onCancelJob: (jobId: string) => void;
+}) {
   const result = job.result ?? null;
   const selectedTarget = result?.target ?? null;
   const processingSeconds =
@@ -129,6 +165,33 @@ export function InspectorPanel({
     ? Array.from(new Set([...result.metadata.decodeNotes, ...result.metadata.warnings, ...result.metrics.warnings]))
     : [];
   const errorDisplay = getJobErrorDisplay(job.error);
+  const viewOnlyHint = getViewOnlyHint(job);
+  const inspectorBadgeOrder = new Map([
+    ["status", 0],
+    ["imported", 1],
+    ["restored", 2],
+    ["compliance", 3],
+    ["integrated-unavailable", 4],
+    ["target", 5],
+    ["decoder", 6],
+    ["measure-only", 7],
+  ]);
+  const badges = describeJobBadges(job, analysisMode)
+    .map((badge) => {
+      if (badge.key === "status") {
+        return { ...badge, label: job.status, className: statusToneClass(job.status) };
+      }
+      if (badge.key === "measure-only") {
+        return {
+          ...badge,
+          className: "border-[var(--line)] bg-[var(--surface-0)] text-[var(--muted)]",
+        };
+      }
+      return badge;
+    })
+    .sort((left, right) => (
+      (inspectorBadgeOrder.get(left.key) ?? 99) - (inspectorBadgeOrder.get(right.key) ?? 99)
+    ));
   const tabRefs = useRef<Array<HTMLButtonElement | null>>([]);
 
   // Timeline/Technical have nothing to show until a result exists (only the
@@ -217,27 +280,15 @@ export function InspectorPanel({
               {job.fileName}
             </h2>
             <div className="mt-3 flex flex-wrap gap-2">
-              <Badge className={statusToneClass(job.status)}>{job.status}</Badge>
-              {job.imported ? (
-                <Badge className="tone-warning">Unverified import</Badge>
-              ) : null}
-              {job.restored ? (
-                <Badge className="border-[var(--line)] bg-[var(--surface-0)] text-[var(--muted)]">
-                  Restored
-                </Badge>
-              ) : null}
-              {selectedCompliance ? <Badge className={complianceToneClass(selectedCompliance.state)}>{selectedCompliance.label}</Badge> : null}
-              {result?.metrics.integratedValid === false ? <Badge className="tone-warning">Integrated unavailable</Badge> : null}
-              {selectedTarget ? <Badge>{selectedTarget.label}</Badge> : null}
-              {result?.metadata.decoderLabel ? (
-                <Badge className="max-w-full break-words border-[var(--line)] bg-[var(--surface-0)] text-[var(--muted)]">
-                  {result.metadata.decoderLabel}
-                </Badge>
-              ) : null}
-              {!selectedCompliance && result && analysisMode === "measure-only" ? (
-                <Badge className="border-[var(--line)] bg-[var(--surface-0)] text-[var(--muted)]">Measure Only</Badge>
-              ) : null}
+              {badges.map((badge) => (
+                <Badge key={badge.key} className={badge.className}>{badge.label}</Badge>
+              ))}
             </div>
+            {viewOnlyHint ? (
+              <p className="mt-3 max-w-2xl text-sm leading-6 text-[var(--muted)]">
+                {viewOnlyHint}
+              </p>
+            ) : null}
           </div>
 
           <div className="flex flex-wrap items-center gap-2">
@@ -266,7 +317,7 @@ export function InspectorPanel({
           <div className={cn("grid gap-3", analysisMode === "targeted" ? "md:grid-cols-2 2xl:grid-cols-3" : "md:grid-cols-2 xl:grid-cols-3")}>
             <InspectorMetric label="Integrated" value={formatIntegratedLufs(result.metrics)} hint={result.metrics.integratedValid === false ? describeIntegratedInvalidReason(result.metrics.integratedInvalidReason) : selectedTarget?.label ?? "Measured loudness"} accent />
             <InspectorMetric label="True peak" value={formatPeakDbtp(result.metrics.truePeakDbtp)} hint="Measured true peak" />
-            <InspectorMetric label="LRA" value={formatLoudnessRange(result.metrics)} hint={result.metrics.loudnessRangeUnstable === true ? "Programme is under 60 seconds; LRA is not statistically stable" : "Loudness range"} />
+            <InspectorMetric label="LRA" value={formatLoudnessRange(result.metrics)} hint={result.metrics.loudnessRangeValid === false ? "Fewer than two complete 3 second windows" : result.metrics.loudnessRangeUnstable === true ? "Programme is under 60 seconds; LRA is not statistically stable" : "Loudness range"} />
             {analysisMode === "targeted" ? (
               <>
                 <InspectorMetric label="Gain move" value={formatRelativeDb(result.metrics.targetDeltaDb)} hint={result.metrics.normalizationLimited ? "Limited by ceiling" : "Planned normalization move"} />
@@ -355,7 +406,7 @@ export function InspectorPanel({
       {result && detailTab === "overview" ? (
         <div id="inspector-panel-overview" role="tabpanel" aria-labelledby="inspector-tab-overview" className="mt-5 space-y-4">
           <section className="rounded-[24px] border border-[var(--line)]/80 bg-[var(--surface-1)] p-5">
-            <div className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">Loudness</div>
+            <h3 className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">Loudness</h3>
             <div className="mt-4 grid gap-3 md:grid-cols-2">
               <InspectorMetric label="Integrated" value={formatIntegratedLufs(result.metrics)} hint={result.metrics.integratedValid === false ? describeIntegratedInvalidReason(result.metrics.integratedInvalidReason) : "Primary LUFS reading"} accent />
               <InspectorMetric label="Ungated" value={formatLufs(result.metrics.ungatedLufs)} hint="Before gating" />
@@ -365,18 +416,18 @@ export function InspectorPanel({
           </section>
 
           <section className="rounded-[24px] border border-[var(--line)]/80 bg-[var(--surface-1)] p-5">
-            <div className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">Peaks and dynamics</div>
+            <h3 className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">Peaks and dynamics</h3>
             <div className="mt-4 grid gap-3 md:grid-cols-2">
               <InspectorMetric label="True peak" value={formatPeakDbtp(result.metrics.truePeakDbtp)} hint="Measured true peak" accent />
               <InspectorMetric label="Sample peak" value={formatDb(result.metrics.samplePeakDbfs, "dBFS")} hint="Highest sample peak" />
-              <InspectorMetric label="LRA" value={formatLoudnessRange(result.metrics)} hint={result.metrics.loudnessRangeUnstable === true ? "Programme is under 60 seconds; LRA is not statistically stable" : "Loudness range"} />
+              <InspectorMetric label="LRA" value={formatLoudnessRange(result.metrics)} hint={result.metrics.loudnessRangeValid === false ? "Fewer than two complete 3 second windows" : result.metrics.loudnessRangeUnstable === true ? "Programme is under 60 seconds; LRA is not statistically stable" : "Loudness range"} />
               <InspectorMetric label="Timeline points" value={String(result.metrics.timeline.timeSeconds.length)} hint="Momentary, short-term, and peak samples" />
             </div>
           </section>
 
           {analysisMode === "targeted" && selectedTarget ? (
             <section className="rounded-[24px] border border-[var(--line)]/80 bg-[var(--surface-1)] p-5">
-              <div className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">Normalization and delivery</div>
+              <h3 className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">Normalization and delivery</h3>
               <div className="mt-4 grid gap-3 md:grid-cols-2">
                 <InspectorMetric label="Requested move" value={formatRelativeDb(result.metrics.unclampedTargetDeltaDb)} hint="Needed before ceiling protection" />
                 <InspectorMetric label="Applied move" value={formatRelativeDb(result.metrics.targetDeltaDb)} hint={result.metrics.normalizationLimited ? "Capped to protect projected true peak" : "Move toward target"} accent={result.metrics.normalizationLimited} />
@@ -384,8 +435,8 @@ export function InspectorPanel({
                 <InspectorMetric label="Policy" value={selectedTarget.policy === "protect-true-peak" ? "Protect ceiling" : "Hit target"} hint="Current normalization strategy" />
               </div>
               <div className="mt-4 flex flex-wrap gap-2">
-                <Badge className="border-[var(--line)] bg-[var(--surface-0)] text-[var(--muted)]">Target {formatLufs(selectedTarget.loudnessTargetLufs)}</Badge>
-                <Badge className="border-[var(--line)] bg-[var(--surface-0)] text-[var(--muted)]">Ceiling {formatPeakDbtp(selectedTarget.truePeakCeilingDbtp)}</Badge>
+                <Badge className="border-[var(--line)] bg-[var(--surface-0)] text-[var(--muted)]">Target {formatPresetLufs(selectedTarget.loudnessTargetLufs)}</Badge>
+                <Badge className="border-[var(--line)] bg-[var(--surface-0)] text-[var(--muted)]">Ceiling {formatPresetPeakDbtp(selectedTarget.truePeakCeilingDbtp)}</Badge>
                 {selectedCompliance ? (
                   <Badge className={complianceToneClass(selectedCompliance.state)}>
                     Delta {formatRelativeLu(selectedCompliance.deltaFromTargetLufs)}
@@ -403,11 +454,15 @@ export function InspectorPanel({
           )}
 
           <section className="rounded-[24px] border border-[var(--line)]/80 bg-[var(--surface-1)] p-5">
-            <div className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">Technical details</div>
+            <h3 className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">Technical details</h3>
             <div className="mt-4 grid gap-3 md:grid-cols-2">
               <InspectorMetric label="Decoder" value={result.metadata.decoderLabel} hint={result.metadata.decoderSummary} accent />
               <InspectorMetric label="Source" value={formatSourceFormatLabel(result.metadata.sourceFormat)} hint={result.metadata.mimeType || "Audio source"} />
-              <InspectorMetric label="Sample rate" value={`${result.metadata.sampleRate.toLocaleString("en-GB")} Hz`} hint="Parsed sample rate" />
+              <InspectorMetric
+                label={result.metadata.decoderMode === "browser-audio" ? "Decoded sample rate" : "Sample rate"}
+                value={`${result.metadata.sampleRate.toLocaleString("en-GB")} Hz`}
+                hint={result.metadata.decoderMode === "browser-audio" ? "PCM rate used for analysis" : "Parsed sample rate"}
+              />
               <InspectorMetric label="Channels" value={String(result.metadata.channelCount)} hint={result.metadata.channelLayout.name} />
             </div>
           </section>
@@ -456,7 +511,12 @@ export function InspectorPanel({
           <section className="rounded-[24px] border border-[var(--line)]/80 bg-[var(--surface-1)] p-5">
             <div className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">Technical metadata</div>
             <div className="mt-4 grid gap-3 md:grid-cols-2">
-              <InspectorMetric label="Sample rate" value={`${result.metadata.sampleRate.toLocaleString("en-GB")} Hz`} hint="Source sample rate" accent />
+              <InspectorMetric
+                label={result.metadata.decoderMode === "browser-audio" ? "Decoded sample rate" : "Sample rate"}
+                value={`${result.metadata.sampleRate.toLocaleString("en-GB")} Hz`}
+                hint={result.metadata.decoderMode === "browser-audio" ? "PCM rate used for analysis" : "Source sample rate"}
+                accent
+              />
               <InspectorMetric label="Bit depth" value={`${result.metadata.bitDepth}-bit`} hint="Parsed container depth" />
               <InspectorMetric label="Channels" value={String(result.metadata.channelCount)} hint={result.metadata.channelLayout.name} />
               <InspectorMetric label="Layout confidence" value={result.metadata.channelLayout.guessed ? "Guessed" : "Explicit"} hint={result.metadata.channelLayout.labels.join(" / ")} />

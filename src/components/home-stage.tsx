@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, type ReactNode } from "react";
+import { memo, useState, type ReactNode } from "react";
 import {
   ChevronDown,
   ChevronUp,
@@ -9,10 +9,12 @@ import {
   SlidersHorizontal,
   Upload,
 } from "lucide-react";
-import { formatLufs, formatPeakDbtp } from "@/lib/format";
+import { useMediaQuery } from "@/hooks/use-media-query";
+import { useWorkspaceCommands, useWorkspaceSession } from "@/components/workspace-contexts";
+import { formatPresetLufs, formatPresetPeakDbtp } from "@/lib/format";
 import { cn } from "@/lib/utils";
 import type { ParallelLanesPreference } from "@/lib/workspace-preferences";
-import type { AnalysisMode, DecodePreference, TargetPreset } from "@/types/audio";
+import type { DecodePreference } from "@/types/audio";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
@@ -24,22 +26,8 @@ interface DecodeOption {
 }
 
 interface HomeStageProps {
-  uiMode: "simple" | "advanced";
-  analysisMode: AnalysisMode;
-  decodePreference: DecodePreference;
-  parallelPreference: ParallelLanesPreference;
-  resolvedParallelLimit: number;
-  currentTarget: TargetPreset | null;
-  currentModeLabel: string;
   supportedFormats: string[];
   decodeOptions: DecodeOption[];
-  isDragging: boolean;
-  onOpenPicker: () => void;
-  onSetUiMode: (mode: "simple" | "advanced") => void;
-  onSetAnalysisMode: (mode: AnalysisMode) => void;
-  onSetDecodePreference: (preference: DecodePreference) => void;
-  onSetParallelPreference: (preference: ParallelLanesPreference) => void;
-  onOpenPresetLibrary: () => void;
 }
 
 const PARALLEL_OPTIONS: Array<{ id: ParallelLanesPreference; label: string }> = [
@@ -109,44 +97,38 @@ function StripSection({
   );
 }
 
-export function HomeStage({
-  uiMode,
-  analysisMode,
-  decodePreference,
-  parallelPreference,
-  resolvedParallelLimit,
-  currentTarget,
-  currentModeLabel,
+export const HomeStage = memo(function HomeStage({
   supportedFormats,
   decodeOptions,
-  isDragging,
-  onOpenPicker,
-  onSetUiMode,
-  onSetAnalysisMode,
-  onSetDecodePreference,
-  onSetParallelPreference,
-  onOpenPresetLibrary,
 }: HomeStageProps) {
+  const {
+    compatibilityDecoderAllowed,
+    connectionSavingStatus,
+    currentModeLabel,
+    currentTarget,
+    decodePreference,
+    isDragging,
+    openPicker: onOpenPicker,
+    openPresetLibrary: onOpenPresetLibrary,
+    parallelPreference,
+    route: { analysisMode, uiMode },
+    setAnalysisMode: onSetAnalysisMode,
+    setCompatibilityDecoderAllowed: onSetCompatibilityDecoderAllowed,
+    setDecodePreference: onSetDecodePreference,
+    setParallelPreference: onSetParallelPreference,
+    setUiMode: onSetUiMode,
+  } = useWorkspaceCommands();
+  const { parallelLimit: resolvedParallelLimit } = useWorkspaceSession();
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const advancedPanelId = "home-stage-advanced-options";
   const decodeOption =
     decodeOptions.find((option) => option.id === decodePreference) ?? decodeOptions[0];
 
   // Drag-and-drop and folder intake are effectively mouse/trackpad-only, so
-  // the intake copy should not promise them on touch-primary devices. Default
-  // to the fine-pointer (desktop) copy on first paint and correct after
-  // hydration once the real pointer type is known.
-  const [isCoarsePointer, setIsCoarsePointer] = useState(false);
-  useEffect(() => {
-    if (typeof window === "undefined" || !window.matchMedia) {
-      return;
-    }
-    const query = window.matchMedia("(pointer: coarse)");
-    setIsCoarsePointer(query.matches);
-    const handleChange = (event: MediaQueryListEvent) => setIsCoarsePointer(event.matches);
-    query.addEventListener("change", handleChange);
-    return () => query.removeEventListener("change", handleChange);
-  }, []);
+  // the intake copy should not promise them on touch-primary devices.
+  // Hydration-safe: reads matchMedia during render via useSyncExternalStore,
+  // so the desktop copy never paints for a frame on a phone (MOB-15).
+  const isCoarsePointer = useMediaQuery("(pointer: coarse)");
 
   return (
     <Card className="tp-enter overflow-hidden border-[color:var(--accent)]/10 bg-[var(--surface-0)] p-0 shadow-[0_28px_72px_rgba(0,0,0,0.16)]">
@@ -180,7 +162,7 @@ export function HomeStage({
               <p>
                 Audio files and analysis stay in this browser. The review view opens as soon as you choose files, and the queue starts working through them.
               </p>
-              <p className="text-xs leading-5 text-[var(--muted)]/85">
+              <p className="text-xs leading-5 text-[var(--muted)]">
                 This app does not send usage analytics unless the deployment operator has explicitly enabled them; audio and results are never included, even then.
               </p>
             </div>
@@ -224,7 +206,7 @@ export function HomeStage({
               </div>
             </section>
 
-            <div className="flex min-h-[168px] h-full flex-col justify-between gap-4 xl:pl-2">
+            <div className="order-first flex min-h-[168px] h-full flex-col justify-between gap-4 xl:order-none xl:pl-2">
               <div>
                 <div className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">
                   Browse files
@@ -295,7 +277,7 @@ export function HomeStage({
                   <div>
                     <div className="text-base font-semibold text-[var(--ink)]">{currentTarget.label}</div>
                     <div className="mt-1 text-sm text-[var(--muted)]">
-                      {formatLufs(currentTarget.loudnessTargetLufs)} / {formatPeakDbtp(currentTarget.truePeakCeilingDbtp)}
+                      {formatPresetLufs(currentTarget.loudnessTargetLufs)} / {formatPresetPeakDbtp(currentTarget.truePeakCeilingDbtp)}
                     </div>
                   </div>
                   <Button type="button" size="sm" variant="secondary" className="w-full justify-center" onClick={onOpenPresetLibrary}>
@@ -355,7 +337,7 @@ export function HomeStage({
                       aria-label="Choose decode path"
                       value={decodePreference}
                       onChange={(event) => onSetDecodePreference(event.target.value as DecodePreference)}
-                      className="h-11 w-full rounded-[18px] border border-[var(--control-line)] bg-[var(--surface-1)] px-3 text-[var(--ink)] outline-none transition-[border-color,background-color] duration-200 ease-out focus:border-[var(--accent)]"
+                      className="h-11 w-full rounded-[18px] border border-[var(--control-line)] bg-[var(--surface-1)] px-3 text-[var(--ink)] outline-none transition-[border-color,background-color] duration-200 ease-out focus:border-[var(--accent)] focus-visible:ring-2 focus-visible:ring-[var(--accent)]"
                     >
                       {decodeOptions.map((option) => (
                         <option key={option.id} value={option.id}>
@@ -367,6 +349,22 @@ export function HomeStage({
                   <div className="text-sm leading-6 text-[var(--muted)]">
                     Pick a decode route when you want to favor speed, browser codecs, or wider format support.
                   </div>
+                  {connectionSavingStatus !== "normal" ? (
+                    <div className="rounded-[16px] border border-[color:var(--warning)]/35 bg-[color:var(--warning-soft)] px-3 py-3 text-sm leading-6 text-[var(--ink)]">
+                      <p>
+                        {connectionSavingStatus === "save-data" ? "Data Saver is on." : "This connection appears slow."} TruePeak will skip the approximately 31 MB compatibility decoder unless you allow the download.
+                      </p>
+                      <label className="mt-3 flex min-h-11 cursor-pointer items-center gap-3 font-semibold">
+                        <input
+                          type="checkbox"
+                          checked={compatibilityDecoderAllowed}
+                          onChange={(event) => onSetCompatibilityDecoderAllowed(event.target.checked)}
+                          className="h-5 w-5 accent-[var(--accent)]"
+                        />
+                        Allow compatibility decoder
+                      </label>
+                    </div>
+                  ) : null}
                 </div>
               </StripSection>
 
@@ -380,7 +378,7 @@ export function HomeStage({
                       aria-label="Choose how many files analyze at once"
                       value={parallelPreference}
                       onChange={(event) => onSetParallelPreference(event.target.value as ParallelLanesPreference)}
-                      className="h-11 w-full rounded-[18px] border border-[var(--control-line)] bg-[var(--surface-1)] px-3 text-[var(--ink)] outline-none transition-[border-color,background-color] duration-200 ease-out focus:border-[var(--accent)]"
+                      className="h-11 w-full rounded-[18px] border border-[var(--control-line)] bg-[var(--surface-1)] px-3 text-[var(--ink)] outline-none transition-[border-color,background-color] duration-200 ease-out focus:border-[var(--accent)] focus-visible:ring-2 focus-visible:ring-[var(--accent)]"
                     >
                       {PARALLEL_OPTIONS.map((option) => (
                         <option key={option.id} value={option.id}>
@@ -409,4 +407,4 @@ export function HomeStage({
       </div>
     </Card>
   );
-}
+});

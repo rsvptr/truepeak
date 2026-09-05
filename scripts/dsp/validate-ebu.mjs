@@ -22,13 +22,18 @@
 // documented behaviors below against regression. Counts are reported per CASE
 // (one published test signal), not per assertion.
 //
-// Run: node scripts/dsp/validate-ebu.mjs   (or: npm run test:ebu)
+// Run: npm run test:ebu
+import assert from "node:assert/strict";
 import { register } from "node:module";
+import test from "node:test";
 
 register("./alias-loader.mjs", import.meta.url);
 
 const { analyzeDecodedAsset } = await import("../../src/audio/analysis.ts");
 const { deriveChannelLayout } = await import("../../src/audio/channel-layout.ts");
+
+/** @typedef {import("../../src/types/audio.ts").ChannelLayout} ChannelLayout */
+/** @typedef {import("../../src/types/audio.ts").DecodedAudioAsset} DecodedAudioAsset */
 
 const SR = 48000;
 
@@ -36,9 +41,16 @@ const SR = 48000;
 // LUFS (the -0.691 LUFS offset and the K-weighting gain at 1 kHz cancel, and two
 // equal channels sum to +0 vs a single sine's RMS). So amplitude 10^(dBFS/20)
 // yields a stereo tone measuring that many LUFS / M / S.
+/** @param {number} db */
 const ampForDb = (db) => 10 ** (db / 20);
 
 // One mono channel: 1 kHz tone at `db` dBFS for `seconds`.
+/**
+ * @param {number} db
+ * @param {number} seconds
+ * @param {number} [freq]
+ * @param {number} [phase]
+ */
 function monoTone(db, seconds, freq = 1000, phase = 0) {
   const n = Math.round(seconds * SR);
   const out = new Float32Array(n);
@@ -48,14 +60,26 @@ function monoTone(db, seconds, freq = 1000, phase = 0) {
 }
 
 // Stereo tone (both channels identical) at `db` dBFS for `seconds`.
+/**
+ * @param {number} db
+ * @param {number} seconds
+ * @param {number} [freq]
+ * @param {number} [phase]
+ * @returns {Float32Array[]}
+ */
 function toneSegment(db, seconds, freq = 1000, phase = 0) {
   const ch = monoTone(db, seconds, freq, phase);
   return [ch, ch.slice()];
 }
 
 // Concatenate per-channel segment arrays into one multi-segment asset.
+/**
+ * @param {Float32Array[][]} segments
+ * @returns {Float32Array[]}
+ */
 function concatSegments(segments) {
   const channelCount = segments[0].length;
+  /** @type {Float32Array[]} */
   const channels = [];
   for (let c = 0; c < channelCount; c += 1) {
     const total = segments.reduce((sum, seg) => sum + seg[c].length, 0);
@@ -72,6 +96,13 @@ function concatSegments(segments) {
 
 // Stereo tone at `db` occupying [leadMs, leadMs+durMs), then `trailMs` of silence.
 // Models the file-based EBU meter-dynamics segments (cases 10, 11, 13, 14).
+/**
+ * @param {number} db
+ * @param {number} leadMs
+ * @param {number} durMs
+ * @param {number} trailMs
+ * @returns {Float32Array[]}
+ */
 function pulseSegment(db, leadMs, durMs, trailMs) {
   const total = Math.round(((leadMs + durMs + trailMs) / 1000) * SR);
   const amp = ampForDb(db);
@@ -95,6 +126,14 @@ function pulseSegment(db, leadMs, durMs, trailMs) {
 // of the steady-state inter-sample peak. A short fade (>= 5 ms; 20 ms used here for
 // margin) removes the onset/offset discontinuity so the reading reflects the
 // steady inter-sample peak the standard intends.
+/**
+ * @param {number} amp
+ * @param {number} freq
+ * @param {number} phaseDeg
+ * @param {number} [seconds]
+ * @param {number} [fadeMs]
+ * @returns {Float32Array[]}
+ */
 function fadedSine(amp, freq, phaseDeg, seconds = 0.5, fadeMs = 20) {
   const n = Math.round(seconds * SR);
   const f = Math.max(1, Math.round((fadeMs / 1000) * SR));
@@ -112,8 +151,13 @@ function fadedSine(amp, freq, phaseDeg, seconds = 0.5, fadeMs = 20) {
   return [l, r];
 }
 
+/**
+ * @param {Float32Array[]} channels
+ * @param {ChannelLayout} [layout]
+ */
 function analyze(channels, layout) {
   const frameCount = channels[0].length;
+  /** @type {DecodedAudioAsset} */
   const asset = {
     fileName: "ebu.wav",
     mimeType: "audio/wav",
@@ -137,44 +181,93 @@ function analyze(channels, layout) {
 // ---- per-case harness (counts CASES, not assertions, per M-25) ----
 let assertPass = 0;
 let assertFail = 0;
+let activeCaseId = "";
+/** @type {{ id: string, ok: boolean }[]} */
 const caseResults = [];
 
+/**
+ * @param {string} id
+ * @param {string} title
+ * @param {() => void} body
+ */
 function runCase(id, title, body) {
   const failBefore = assertFail;
   console.log(`\n[${id}] ${title}`);
+  activeCaseId = id;
   body();
   caseResults.push({ id, ok: assertFail === failBefore });
 }
 
-function expect(name, actual, expected, tol) {
-  const ok = Number.isFinite(actual) && Math.abs(actual - expected) <= tol;
-  console.log(`    ${ok ? "PASS" : "FAIL"}  ${name}: ${Number.isFinite(actual) ? actual.toFixed(3) : actual} (expected ${expected.toFixed(2)} +-${tol})`);
+// Every assertion becomes one named test under the runner. The counters stay so
+// the coverage report below can keep its per-case denominators.
+/**
+ * @param {string} name
+ * @param {boolean} ok
+ * @param {string} [detail]
+ */
+function record(name, ok, detail) {
   ok ? (assertPass += 1) : (assertFail += 1);
+  const caseId = activeCaseId;
+  test(`[${caseId}] ${name}`, () => {
+    assert.ok(ok, detail);
+  });
+}
+
+/**
+ * @param {string} name
+ * @param {number | null} actual
+ * @param {number} expected
+ * @param {number} tol
+ */
+function expect(name, actual, expected, tol) {
+  const value = Number(actual);
+  const ok = Number.isFinite(actual) && Math.abs(value - expected) <= tol;
+  record(
+    name,
+    ok,
+    `${Number.isFinite(actual) ? value.toFixed(3) : actual} (expected ${expected.toFixed(2)} +-${tol})`,
+  );
 }
 
 // Asymmetric band [expected+low, expected+high] for the EBU true-peak tolerance
 // (published as "+0.2 / -0.4 dBTP": may over-read by 0.2, under-read by 0.4).
+/**
+ * @param {string} name
+ * @param {number | null} actual
+ * @param {number} expected
+ * @param {number} low
+ * @param {number} high
+ */
 function expectBand(name, actual, expected, low, high) {
   const lo = expected + low;
   const hi = expected + high;
-  const ok = Number.isFinite(actual) && actual >= lo && actual <= hi;
-  console.log(`    ${ok ? "PASS" : "FAIL"}  ${name}: ${Number.isFinite(actual) ? actual.toFixed(3) : actual} (expected in [${lo.toFixed(2)}, ${hi.toFixed(2)}])`);
-  ok ? (assertPass += 1) : (assertFail += 1);
+  const value = Number(actual);
+  const ok = Number.isFinite(actual) && value >= lo && value <= hi;
+  record(
+    name,
+    ok,
+    `${Number.isFinite(actual) ? value.toFixed(3) : actual} (expected in [${lo.toFixed(2)}, ${hi.toFixed(2)}])`,
+  );
 }
 
 // Roll a family of sub-signals (e.g. 20 alignments) into ONE case: passes iff every
 // sub-signal is within tol of its expected value. Reports the worst error.
+/**
+ * @param {(number | null)[]} values
+ * @param {string} name
+ * @param {(index: number) => number} expectedFn
+ * @param {number} tol
+ */
 function expectFamily(name, values, expectedFn, tol) {
   let worst = 0;
   let allOk = true;
   values.forEach((v, i) => {
     const e = expectedFn(i);
-    const d = Math.abs(v - e);
+    const d = Math.abs(Number(v) - e);
     worst = Math.max(worst, d);
     if (!(Number.isFinite(v) && d <= tol)) allOk = false;
   });
-  console.log(`    ${allOk ? "PASS" : "FAIL"}  ${name}: ${values.length} sub-signals, worst error ${worst.toFixed(4)} LU (tol +-${tol})`);
-  allOk ? (assertPass += 1) : (assertFail += 1);
+  record(name, allOk, `${values.length} sub-signals, worst error ${worst.toFixed(4)} LU (tol +-${tol})`);
 }
 
 console.log("================ EBU Tech 3341 — Loudness (I / M / S) ================");
@@ -229,6 +322,7 @@ runCase("3341-9", "Short-term averaging: (1.34s -20 / 1.66s -30) x5 -> Max S = -
 });
 
 runCase("3341-10", "Short-term alignment: 20 files (i*0.15s sil; 3s -23; 1s sil) -> Max S = -23.0 each", () => {
+  /** @type {(number | null)[]} */
   const values = [];
   for (let i = 0; i < 20; i += 1) values.push(analyze(pulseSegment(-23, i * 150, 3000, 1000)).maxShortTermLufs);
   expectFamily("Max S over 20 alignments", values, () => -23.0, 0.1);
@@ -238,6 +332,7 @@ runCase("3341-11", "Short-term staircase: 20 files (i*0.15s sil; 3s @(-38+i); tr
   // Case 11 is defined for 'live' meters as one file yielding 20 successive Max S
   // values; a file-based meter reproduces it by measuring each segment as its own
   // file (audit M-25 / task note: "the meter is file-based so analyze each segment").
+  /** @type {(number | null)[]} */
   const values = [];
   for (let i = 0; i < 20; i += 1) values.push(analyze(pulseSegment(-38 + i, i * 150, 3000, 3000 - i * 150)).maxShortTermLufs);
   expectFamily("Max S over 20 levels", values, (i) => -38 + i, 0.1);
@@ -255,12 +350,14 @@ runCase("3341-13", "Momentary alignment (H-01): 20 files (i*20ms sil; 400ms -23;
   // The exact audit H-01 failure: on a fixed 100 ms grid, 16 of these 20 read
   // wrong. The high-resolution rolling momentary window must read -23.0 +-0.1 for
   // every alignment.
+  /** @type {(number | null)[]} */
   const values = [];
   for (let i = 0; i < 20; i += 1) values.push(analyze(pulseSegment(-23, i * 20, 400, 1000)).maxMomentaryLufs);
   expectFamily("Max M over 20 alignments", values, () => -23.0, 0.1);
 });
 
 runCase("3341-14", "Momentary staircase: 20 files (i*20ms sil; 400ms @(-38+i); trail) -> Max M = -38..-19 (file-based equivalent)", () => {
+  /** @type {(number | null)[]} */
   const values = [];
   for (let i = 0; i < 20; i += 1) values.push(analyze(pulseSegment(-38 + i, i * 20, 400, 400 - i * 20)).maxMomentaryLufs);
   expectFamily("Max M over 20 levels", values, (i) => -38 + i, 0.1);
@@ -280,8 +377,11 @@ runCase("3341-16", "True peak: fs/4 sine, amp 0.50, phase 45 deg -> -6.0 dBTP (s
   expectBand("true peak", m.truePeakDbtp, -6.0, -0.4, 0.2);
   // The inter-sample peak must exceed the (lower) sample peak.
   const catches = m.truePeakDbtp > m.samplePeakDbfs + 1.0;
-  console.log(`    ${catches ? "PASS" : "FAIL"}  true peak exceeds sample peak by >1 dB: TP=${m.truePeakDbtp.toFixed(3)} SP=${m.samplePeakDbfs.toFixed(3)}`);
-  catches ? (assertPass += 1) : (assertFail += 1);
+  record(
+    "true peak exceeds sample peak by >1 dB",
+    catches,
+    `TP=${m.truePeakDbtp.toFixed(3)} SP=${m.samplePeakDbfs.toFixed(3)}`,
+  );
 });
 
 runCase("3341-17", "True peak: fs/6 sine, amp 0.50, phase 60 deg -> -6.0 dBTP", () => {
@@ -346,4 +446,3 @@ if (failedCases.length) {
   console.log(`Failed cases: ${failedCases.map((c) => c.id).join(", ")}`);
 }
 console.log("=====================================================================\n");
-process.exit(failedCases.length ? 1 : 0);

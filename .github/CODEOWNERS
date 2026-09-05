@@ -1,0 +1,4 @@
+# These paths execute during npm install (ffmpeg asset hashes) or pin the
+# exact dependency tree, so changes need an explicit review.
+scripts/prepare-ffmpeg-assets.mjs @rsvptr
+package-lock.json @rsvptr

@@ -1,6 +1,6 @@
 "use client";
 
-import type { Ref } from "react";
+import type { FormEvent, Ref } from "react";
 import { AlertTriangle, BookOpen, ExternalLink, Info, RotateCcw } from "lucide-react";
 import {
   CUSTOM_PRESET_ID,
@@ -22,7 +22,6 @@ import {
   PLAYBACK_REFERENCE_NOTE,
   formatTargetDbtp,
   formatTargetLufs,
-  formatToleranceLu,
   isPlaybackReference,
   provenanceLabel,
   provenanceToneClass,
@@ -33,6 +32,17 @@ import type { TargetPreset } from "@/types/audio";
 const CUSTOM_DESCRIPTION =
   "Use this when you already know the loudness target and true peak limit you need: a client, label, or distributor spec the preset library does not cover.";
 
+/**
+ * Id of the detail pane's `<form>`. The drawer footer's Apply button lives
+ * outside this component (in PresetLibraryDrawer) and submits the form via
+ * the HTML `form` attribute rather than nesting, so Enter in a field and a
+ * click on Apply both go through the same submit handler (UX-09).
+ */
+export const PRESET_TARGET_FORM_ID = "preset-target-form";
+
+/** The three numeric draft fields that carry per-keystroke validation. */
+export type TargetFieldKey = Exclude<keyof TargetDraftErrors, "preset">;
+
 interface NumberFieldProps {
   id: string;
   name: string;
@@ -41,10 +51,14 @@ interface NumberFieldProps {
   ariaLabel: string;
   value: string;
   onChange: (value: string) => void;
+  onBlur: () => void;
   min: number;
   max: number;
   error?: string;
   surface: "surface-0" | "surface-1";
+  /** Signed fields (negative values allowed) must not use the decimal keypad
+      on iOS: it has no minus key (MOB-01). */
+  signed?: boolean;
 }
 
 function NumberField({
@@ -55,10 +69,12 @@ function NumberField({
   ariaLabel,
   value,
   onChange,
+  onBlur,
   min,
   max,
   error,
   surface,
+  signed,
 }: NumberFieldProps) {
   const errorId = `${id}-error`;
   return (
@@ -69,12 +85,25 @@ function NumberField({
           id={id}
           name={name}
           autoComplete="off"
-          inputMode="decimal"
+          inputMode={signed ? undefined : "decimal"}
           aria-label={ariaLabel}
           aria-describedby={error ? errorId : undefined}
           aria-invalid={error ? true : undefined}
           value={value}
           onChange={(event) => onChange(event.target.value)}
+          onBlur={onBlur}
+          onKeyDown={(event) => {
+            // Enter should submit the detail form (UX-09). The footer's Apply
+            // button submits this form via the HTML `form` attribute rather
+            // than DOM nesting (see PRESET_TARGET_FORM_ID), and browsers do
+            // not reliably treat an externally-associated button as the
+            // form's default button for implicit Enter submission, so submit
+            // explicitly instead of relying on that.
+            if (event.key === "Enter") {
+              event.preventDefault();
+              event.currentTarget.form?.requestSubmit();
+            }
+          }}
           type="number"
           step="0.1"
           min={min}
@@ -134,11 +163,20 @@ interface PresetDetailPaneProps {
   policy: TargetPreset["policy"];
   fieldErrors?: TargetDraftErrors;
   draftIsModified: boolean;
+  /** Fields the user has blurred at least once (UX-02): gates error display. */
+  touchedFields: Partial<Record<TargetFieldKey, boolean>>;
+  /** True after an Apply attempt; reveals every field's error regardless of touch. */
+  showAllErrors: boolean;
   onToleranceChange: (value: string) => void;
   onCustomTargetLufsChange: (value: string) => void;
   onCustomTruePeakChange: (value: string) => void;
   onPolicyChange: (policy: TargetPreset["policy"]) => void;
+  onFieldBlur: (field: TargetFieldKey) => void;
   onResetToPublished: () => void;
+  /** Submit handler for the detail form (UX-09): Enter in a field or the
+      footer's Apply button (associated via PRESET_TARGET_FORM_ID) both land
+      here. */
+  onSubmit: (event: FormEvent<HTMLFormElement>) => void;
   /** Focus target for the narrow master/detail step change. */
   headingRef?: Ref<HTMLHeadingElement>;
   className?: string;
@@ -160,16 +198,23 @@ export function PresetDetailPane({
   policy,
   fieldErrors,
   draftIsModified,
+  touchedFields,
+  showAllErrors,
   onToleranceChange,
   onCustomTargetLufsChange,
   onCustomTruePeakChange,
   onPolicyChange,
+  onFieldBlur,
   onResetToPublished,
+  onSubmit,
   headingRef,
   className,
 }: PresetDetailPaneProps) {
   const isCustom = selectedPresetId === CUSTOM_PRESET_ID;
   const preset = isCustom ? null : TARGET_PRESETS.find((item) => item.id === selectedPresetId);
+  // Only a touched field or an Apply attempt shows its error text/aria-invalid
+  // (UX-02); resolveDraftTarget still runs live for the Apply button's gate.
+  const showError = (field: TargetFieldKey) => showAllErrors || Boolean(touchedFields[field]);
 
   const evidence: TargetPreset["evidence"] = preset?.evidence ?? "custom";
   const playback = preset ? isPlaybackReference(preset) : false;
@@ -187,7 +232,12 @@ export function PresetDetailPane({
   };
 
   return (
-    <div className={cn("@container min-w-0 space-y-5 overflow-y-auto overscroll-contain", className)}>
+    <form
+      id={PRESET_TARGET_FORM_ID}
+      onSubmit={onSubmit}
+      noValidate
+      className={cn("@container min-w-0 space-y-5 overflow-y-auto overscroll-contain", className)}
+    >
       {/* Header: name + provenance + task marker + modified/reset */}
       <div className="space-y-3">
         <div className="flex flex-wrap items-start justify-between gap-3">
@@ -256,10 +306,12 @@ export function PresetDetailPane({
               ariaLabel="Custom loudness target in LUFS"
               value={customTargetLufs}
               onChange={onCustomTargetLufsChange}
+              onBlur={() => onFieldBlur("customTargetLufs")}
               min={LOUDNESS_TARGET_RANGE.min}
               max={LOUDNESS_TARGET_RANGE.max}
-              error={fieldErrors?.customTargetLufs}
+              error={showError("customTargetLufs") ? fieldErrors?.customTargetLufs : undefined}
               surface="surface-0"
+              signed
             />
             <NumberField
               id="custom-true-peak"
@@ -269,10 +321,12 @@ export function PresetDetailPane({
               ariaLabel="Custom true peak limit in dBTP"
               value={customTruePeak}
               onChange={onCustomTruePeakChange}
+              onBlur={() => onFieldBlur("customTruePeak")}
               min={TRUE_PEAK_LIMIT_RANGE.min}
               max={TRUE_PEAK_LIMIT_RANGE.max}
-              error={fieldErrors?.customTruePeak}
+              error={showError("customTruePeak") ? fieldErrors?.customTruePeak : undefined}
               surface="surface-0"
+              signed
             />
           </div>
         ) : preset ? (
@@ -290,9 +344,10 @@ export function PresetDetailPane({
           ariaLabel="Target tolerance window in LU"
           value={toleranceLufs}
           onChange={onToleranceChange}
+          onBlur={() => onFieldBlur("toleranceLufs")}
           min={TOLERANCE_RANGE.min}
           max={TOLERANCE_RANGE.max}
-          error={fieldErrors?.toleranceLufs}
+          error={showError("toleranceLufs") ? fieldErrors?.toleranceLufs : undefined}
           surface="surface-0"
         />
 
@@ -360,6 +415,6 @@ export function PresetDetailPane({
           ) : null}
         </section>
       ) : null}
-    </div>
+    </form>
   );
 }

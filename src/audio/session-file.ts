@@ -142,7 +142,23 @@ interface PortableSessionJob {
   progressPercent: 1;
   progressLabel: "Complete";
   provenance: AnalysisProvenance;
-  result: AnalysisResult;
+  result: PortableAnalysisResult;
+}
+
+interface PortableAnalysisTimeline {
+  stepDurationSeconds: number;
+  timeSeconds: number[];
+  momentaryLufs: Array<number | null>;
+  shortTermLufs: Array<number | null>;
+  truePeakDbtp: number[];
+}
+
+interface PortableLoudnessMetrics extends Omit<LoudnessMetrics, "timeline"> {
+  timeline: PortableAnalysisTimeline;
+}
+
+interface PortableAnalysisResult extends Omit<AnalysisResult, "metrics"> {
+  metrics: PortableLoudnessMetrics;
 }
 
 interface SessionFileV2 {
@@ -213,31 +229,6 @@ function normalizeIsoDate(value: unknown): string | null {
   }
 }
 
-// Exact TextEncoder-compatible byte count without allocating another copy of a
-// potentially 64 MiB string.
-function utf8ByteLength(value: string): number {
-  let bytes = 0;
-  for (let index = 0; index < value.length; index += 1) {
-    const code = value.charCodeAt(index);
-    if (code <= 0x7f) {
-      bytes += 1;
-    } else if (code <= 0x7ff) {
-      bytes += 2;
-    } else if (code >= 0xd800 && code <= 0xdbff) {
-      const next = value.charCodeAt(index + 1);
-      if (next >= 0xdc00 && next <= 0xdfff) {
-        bytes += 4;
-        index += 1;
-      } else {
-        bytes += 3;
-      }
-    } else {
-      bytes += 3;
-    }
-  }
-  return bytes;
-}
-
 function normalizeDigest(value: unknown): string | undefined {
   if (
     typeof value !== "string" ||
@@ -288,35 +279,41 @@ export function resolveAnalysisProvenance(job: AnalysisJob): AnalysisProvenance 
   };
 }
 
-function readFiniteNumberArray(value: unknown, maxPoints: number): number[] | null {
-  if (!Array.isArray(value) || value.length > maxPoints) {
+function readFiniteFloat32Array(value: unknown, maxPoints: number): Float32Array | null {
+  if ((!Array.isArray(value) && !(value instanceof Float32Array)) || value.length > maxPoints) {
     return null;
   }
 
-  for (const entry of value) {
+  const result = value instanceof Float32Array ? value : new Float32Array(value.length);
+  for (let index = 0; index < value.length; index += 1) {
+    const entry = value[index];
     if (!isFiniteNumber(entry)) {
       return null;
     }
+    result[index] = entry;
   }
 
-  return value as number[];
+  return result;
 }
 
-function readNullableNumberArray(
+function readNullableFloat32Array(
   value: unknown,
   maxPoints: number,
-): Array<number | null> | null {
-  if (!Array.isArray(value) || value.length > maxPoints) {
+): Float32Array | null {
+  if ((!Array.isArray(value) && !(value instanceof Float32Array)) || value.length > maxPoints) {
     return null;
   }
 
-  for (const entry of value) {
-    if (entry !== null && !isFiniteNumber(entry)) {
+  const result = value instanceof Float32Array ? value : new Float32Array(value.length);
+  for (let index = 0; index < value.length; index += 1) {
+    const entry = value[index];
+    if (entry !== null && !isFiniteNumber(entry) && !Number.isNaN(entry)) {
       return null;
     }
+    result[index] = entry === null ? Number.NaN : entry;
   }
 
-  return value as Array<number | null>;
+  return result;
 }
 
 function normalizeTimeline(
@@ -333,10 +330,10 @@ function normalizeTimeline(
     return null;
   }
 
-  const timeSeconds = readFiniteNumberArray(timeline.timeSeconds, maxPoints);
-  const momentaryLufs = readNullableNumberArray(timeline.momentaryLufs, maxPoints);
-  const shortTermLufs = readNullableNumberArray(timeline.shortTermLufs, maxPoints);
-  const truePeakDbtp = readFiniteNumberArray(timeline.truePeakDbtp, maxPoints);
+  const timeSeconds = readFiniteFloat32Array(timeline.timeSeconds, maxPoints);
+  const momentaryLufs = readNullableFloat32Array(timeline.momentaryLufs, maxPoints);
+  const shortTermLufs = readNullableFloat32Array(timeline.shortTermLufs, maxPoints);
+  const truePeakDbtp = readFiniteFloat32Array(timeline.truePeakDbtp, maxPoints);
   if (!timeSeconds || !momentaryLufs || !shortTermLufs || !truePeakDbtp) {
     return null;
   }
@@ -536,6 +533,14 @@ function normalizeResult(raw: unknown): AnalysisResult | null {
     return null;
   }
 
+  const loudnessRangeValid = metrics.loudnessRangeValid;
+  if (loudnessRangeValid !== undefined && typeof loudnessRangeValid !== "boolean") {
+    return null;
+  }
+  if (loudnessRangeValid === false && metrics.loudnessRange !== 0) {
+    return null;
+  }
+
   if (
     metrics.loudnessRangeUnstable !== undefined &&
     typeof metrics.loudnessRangeUnstable !== "boolean"
@@ -599,6 +604,7 @@ function normalizeResult(raw: unknown): AnalysisResult | null {
     ...(integratedValid === false
       ? { integratedInvalidReason: integratedInvalidReason as IntegratedInvalidReason }
       : {}),
+    ...(typeof loudnessRangeValid === "boolean" ? { loudnessRangeValid } : {}),
     ...(typeof metrics.loudnessRangeUnstable === "boolean"
       ? { loudnessRangeUnstable: metrics.loudnessRangeUnstable }
       : {}),
@@ -664,7 +670,7 @@ export function normalizeSessionJob(entry: unknown): AnalysisJob | null {
   };
 }
 
-function allocateTimelinePoints(lengths: number[]): number[] {
+export function allocateTimelinePoints(lengths: number[]): number[] {
   const total = lengths.reduce((sum, length) => sum + length, 0);
   if (total <= MAX_SESSION_TIMELINE_POINTS) {
     return [...lengths];
@@ -697,14 +703,14 @@ function allocateTimelinePoints(lengths: number[]): number[] {
   return allocations;
 }
 
-function downsampleTimeline(timeline: AnalysisTimeline, pointCount: number): AnalysisTimeline {
+export function downsampleTimeline(
+  timeline: AnalysisTimeline,
+  pointCount: number,
+): PortableAnalysisTimeline {
   const originalCount = timeline.timeSeconds.length;
-  if (pointCount >= originalCount) {
-    return timeline;
-  }
-  if (pointCount <= 0) {
+  if (pointCount <= 0 || originalCount === 0) {
     return {
-      ...timeline,
+      stepDurationSeconds: timeline.stepDurationSeconds,
       timeSeconds: [],
       momentaryLufs: [],
       shortTermLufs: [],
@@ -712,22 +718,31 @@ function downsampleTimeline(timeline: AnalysisTimeline, pointCount: number): Ana
     };
   }
 
-  const indexes = pointCount === 1
+  const retainedCount = Math.min(pointCount, originalCount);
+  const indexes = retainedCount === originalCount
+    ? Array.from({ length: originalCount }, (_, index) => index)
+    : retainedCount === 1
     ? [0]
-    : Array.from({ length: pointCount }, (_, index) =>
-        Math.round((index * (originalCount - 1)) / (pointCount - 1)),
+    : Array.from({ length: retainedCount }, (_, index) =>
+        Math.round((index * (originalCount - 1)) / (retainedCount - 1)),
       );
   const firstTime = timeline.timeSeconds[indexes[0]];
   const finalTime = timeline.timeSeconds[indexes[indexes.length - 1]];
-  const portableStep = pointCount > 1
-    ? (finalTime - firstTime) / (pointCount - 1)
+  const portableStep = retainedCount === originalCount
+    ? timeline.stepDurationSeconds
+    : retainedCount > 1
+    ? (finalTime - firstTime) / (retainedCount - 1)
     : timeline.stepDurationSeconds;
 
   return {
     stepDurationSeconds: portableStep,
     timeSeconds: indexes.map((index) => timeline.timeSeconds[index]),
-    momentaryLufs: indexes.map((index) => timeline.momentaryLufs[index]),
-    shortTermLufs: indexes.map((index) => timeline.shortTermLufs[index]),
+    momentaryLufs: indexes.map((index) =>
+      Number.isFinite(timeline.momentaryLufs[index]) ? timeline.momentaryLufs[index] : null,
+    ),
+    shortTermLufs: indexes.map((index) =>
+      Number.isFinite(timeline.shortTermLufs[index]) ? timeline.shortTermLufs[index] : null,
+    ),
     truePeakDbtp: indexes.map((index) => timeline.truePeakDbtp[index]),
   };
 }
@@ -799,7 +814,13 @@ export function buildSessionFile(jobs: AnalysisJob[]): string {
       progressPercent: 1,
       progressLabel: "Complete",
       provenance: resolveAnalysisProvenance(normalized),
-      result: normalized.result,
+      result: {
+        ...normalized.result,
+        metrics: {
+          ...normalized.result.metrics,
+          timeline,
+        },
+      },
     };
   });
 
@@ -812,7 +833,7 @@ export function buildSessionFile(jobs: AnalysisJob[]): string {
     jobs: portableJobs,
   };
   const serialized = JSON.stringify(payload, null, 2);
-  const byteLength = utf8ByteLength(serialized);
+  const byteLength = new Blob([serialized]).size;
   if (byteLength > MAX_SESSION_FILE_BYTES) {
     throw new SessionExportError(
       `The portable session would be ${byteLength} UTF-8 bytes, above the ${MAX_SESSION_FILE_BYTES}-byte import limit. No file was created.`,
@@ -847,7 +868,7 @@ export function parseSessionFile(
   text: string,
   options: SessionImportOptions = {},
 ): SessionImportResult {
-  if (utf8ByteLength(text) > MAX_SESSION_FILE_BYTES) {
+  if (new Blob([text]).size > MAX_SESSION_FILE_BYTES) {
     return { jobs: [], error: "That session file is too large to import safely." };
   }
 

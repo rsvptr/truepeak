@@ -1,9 +1,21 @@
 // Portable-session v2 round trips, legacy-v1 compatibility, provenance, and
 // rejection tests for the untrusted JSON boundary.
-// Run: node scripts/dsp/validate-session.mjs
+// Run: npm run test:session
+import assert from "node:assert/strict";
 import { register } from "node:module";
+import test from "node:test";
+import { isDeepStrictEqual } from "node:util";
+import { encodeWav } from "./lib/fixtures.mjs";
 
 register("./alias-loader.mjs", import.meta.url);
+
+/** @typedef {import("../../src/types/audio.ts").AnalysisJob} AnalysisJob */
+/** @typedef {import("../../src/types/audio.ts").RecentSessionEntry} RecentSessionEntry */
+/** @typedef {import("../../src/types/audio.ts").AnalysisResult} AnalysisResult */
+/** @typedef {import("../../src/types/audio.ts").LoudnessMetrics} LoudnessMetrics */
+/** @typedef {import("../../src/audio/session-file.ts").SessionImportResult} SessionImportResult */
+/** A completed fixture job: `result` is always present, unlike the app type. */
+/** @typedef {AnalysisJob & { result: AnalysisResult }} CompletedFixtureJob */
 
 const { parseWavBuffer } = await import("../../src/audio/wav.ts");
 const { analyzeDecodedAsset } = await import("../../src/audio/analysis.ts");
@@ -21,41 +33,7 @@ const {
 const { DEFAULT_TARGET_PRESET } = await import("../../src/audio/presets.ts");
 const { fileIdentityKey } = await import("../../src/lib/file-identity.ts");
 const { mergeImportedJobs } = await import("../../src/audio/session-reconciliation.ts");
-
-function encodeWavFloat32(channels, sampleRate) {
-  const channelCount = channels.length;
-  const frameCount = channels[0].length;
-  const blockAlign = channelCount * 4;
-  const dataBytes = frameCount * blockAlign;
-  const buffer = new ArrayBuffer(44 + dataBytes);
-  const view = new DataView(buffer);
-  const ascii = (offset, value) => {
-    for (let index = 0; index < value.length; index += 1) {
-      view.setUint8(offset + index, value.charCodeAt(index));
-    }
-  };
-  ascii(0, "RIFF");
-  view.setUint32(4, 36 + dataBytes, true);
-  ascii(8, "WAVE");
-  ascii(12, "fmt ");
-  view.setUint32(16, 16, true);
-  view.setUint16(20, 3, true);
-  view.setUint16(22, channelCount, true);
-  view.setUint32(24, sampleRate, true);
-  view.setUint32(28, sampleRate * blockAlign, true);
-  view.setUint16(32, blockAlign, true);
-  view.setUint16(34, 32, true);
-  ascii(36, "data");
-  view.setUint32(40, dataBytes, true);
-  let offset = 44;
-  for (let frame = 0; frame < frameCount; frame += 1) {
-    for (let channel = 0; channel < channelCount; channel += 1) {
-      view.setFloat32(offset, channels[channel][frame], true);
-      offset += 4;
-    }
-  }
-  return buffer;
-}
+const { loadRecentSessions } = await import("@/session/persistence");
 
 const SAMPLE_RATE = 48_000;
 const FRAME_COUNT = SAMPLE_RATE * 3;
@@ -66,12 +44,13 @@ for (let index = 0; index < FRAME_COUNT; index += 1) {
   right[index] = left[index];
 }
 const asset = parseWavBuffer(
-  encodeWavFloat32([left, right], SAMPLE_RATE),
+  encodeWav({ channels: [left, right], sampleRate: SAMPLE_RATE }),
   "round-trip.wav",
   "audio/wav",
 );
 const result = analyzeDecodedAsset(asset, DEFAULT_TARGET_PRESET);
 
+/** @type {CompletedFixtureJob} */
 const job = {
   id: "job-1",
   fileName: "round-trip.wav",
@@ -84,22 +63,31 @@ const job = {
   result,
 };
 
-let passed = 0;
-let failed = 0;
+/**
+ * @param {string} name
+ * @param {unknown} condition
+ * @param {string | null | undefined} [detail]
+ */
 function check(name, condition, detail = "") {
-  if (condition) {
-    console.log(`  PASS  ${name}`);
-    passed += 1;
-  } else {
-    console.log(`  FAIL  ${name}${detail ? ` — ${detail}` : ""}`);
-    failed += 1;
-  }
+  test(name, () => {
+    assert.ok(condition, detail ?? undefined);
+  });
 }
 
+/**
+ * @template T
+ * @param {T} value
+ * @returns {T}
+ */
 function clone(value) {
   return structuredClone(value);
 }
 
+/**
+ * @template T
+ * @param {T} base
+ * @param {(value: T) => void} mutate
+ */
 function mutateEnvelope(base, mutate) {
   const next = clone(base);
   mutate(next);
@@ -114,6 +102,22 @@ const back = parseSessionFile(text, { sourceSessionDigest: digest });
 check("v2 emitted", payload.version === SESSION_VERSION && SESSION_VERSION === 2);
 check("UTF-8 output stays within the import byte limit", Buffer.byteLength(text, "utf8") <= MAX_SESSION_FILE_BYTES);
 check("jobCount matches serialized jobs", payload.jobCount === 1 && payload.jobs.length === 1);
+check(
+  "analysis timelines use four Float32Array series in memory",
+  Object.values(result.metrics.timeline)
+    .filter((value) => typeof value !== "number")
+    .every((value) => value instanceof Float32Array),
+);
+check(
+  "a five-minute 3,000-point timeline has a 48,000-byte typed-array payload",
+  result.metrics.timeline.timeSeconds.BYTES_PER_ELEMENT === 4 &&
+    3_000 * 4 * 4 === 48_000,
+);
+check(
+  "missing loudness windows use NaN sentinels in memory and JSON nulls at the boundary",
+  Number.isNaN(result.metrics.timeline.momentaryLufs[0]) &&
+    payload.jobs[0].result.metrics.timeline.momentaryLufs[0] === null,
+);
 check("no import error", !back.error, back.error);
 check("source version reported", back.sourceVersion === 2);
 check("one job restored", back.jobs.length === 1);
@@ -135,6 +139,13 @@ check(
   "timeline preserved",
   restored.result?.metrics.timeline.timeSeconds.length === result.metrics.timeline.timeSeconds.length &&
     restored.result?.metrics.timeline.truePeakDbtp.length === result.metrics.timeline.truePeakDbtp.length,
+);
+// LOGIC-05: the field-by-field checks above only sample a few metrics. A real
+// analyzeDecodedAsset result (this 3 s stereo tone) must round-trip losslessly
+// in full, including every timeline array, not just the fields asserted above.
+check(
+  "result.metrics (including the nested timeline) round-trips deep-equal from a real analyzeDecodedAsset run",
+  isDeepStrictEqual(restored.result?.metrics, result.metrics),
 );
 
 const secondImport = parseSessionFile(text);
@@ -168,12 +179,14 @@ invalidJob.result.analysisMode = "measure-only";
 invalidJob.result.target = null;
 invalidJob.result.metadata.durationSeconds = 0.3;
 invalidJob.result.metadata.frameCount = 14_400;
-invalidJob.result.metrics = {
+/** @type {LoudnessMetrics} */
+const invalidMetrics = {
   ...invalidJob.result.metrics,
   integratedLufs: -70,
   integratedValid: false,
   integratedInvalidReason: "too-short",
   loudnessRange: 0,
+  loudnessRangeValid: false,
   loudnessRangeUnstable: true,
   unclampedTargetDeltaDb: null,
   targetDeltaDb: null,
@@ -181,16 +194,22 @@ invalidJob.result.metrics = {
   normalizationLimited: false,
   timeline: {
     stepDurationSeconds: 0.1,
-    timeSeconds: [0.1, 0.2, 0.3],
-    momentaryLufs: [null, null, null],
-    shortTermLufs: [null, null, null],
-    truePeakDbtp: [-120, -120, -120],
+    timeSeconds: Float32Array.from([0.1, 0.2, 0.3]),
+    momentaryLufs: new Float32Array(3).fill(Number.NaN),
+    shortTermLufs: new Float32Array(3).fill(Number.NaN),
+    truePeakDbtp: Float32Array.from([-120, -120, -120]),
   },
 };
+invalidJob.result.metrics = invalidMetrics;
 const invalidBack = parseSessionFile(buildSessionFile([invalidJob]));
 check("invalid integrated status round-trips", invalidBack.jobs[0]?.result?.metrics.integratedValid === false);
 check("invalid integrated reason round-trips", invalidBack.jobs[0]?.result?.metrics.integratedInvalidReason === "too-short");
 check("invalid targeting stays absent", invalidBack.jobs[0]?.result?.metrics.targetDeltaDb === null);
+check("invalid LRA status round-trips", invalidBack.jobs[0]?.result?.metrics.loudnessRangeValid === false);
+check(
+  "result with invalid LRA round-trips deeply",
+  isDeepStrictEqual(invalidBack.jobs[0]?.result, invalidJob.result),
+);
 
 const tcEnvelope = clone(payload);
 tcEnvelope.jobs[0].result.metadata.channelCount = 4;
@@ -208,11 +227,23 @@ legacyEnvelope.version = 1;
 delete legacyEnvelope.jobs[0].provenance;
 delete legacyEnvelope.jobs[0].result.metrics.integratedValid;
 delete legacyEnvelope.jobs[0].result.metrics.integratedInvalidReason;
+delete legacyEnvelope.jobs[0].result.metrics.loudnessRangeValid;
 delete legacyEnvelope.jobs[0].result.metrics.loudnessRangeUnstable;
 const legacy = parseSessionFile(JSON.stringify(legacyEnvelope));
 check("v1 session remains importable", !legacy.error && legacy.sourceVersion === 1);
 check("v1 missing validity stays legacy/absent", legacy.jobs[0]?.result?.metrics.integratedValid === undefined);
+check(
+  "v1 missing LRA validity is treated as valid",
+  legacy.jobs[0]?.result?.metrics.loudnessRangeValid !== false,
+);
 check("v1 import is still unverified", legacy.jobs[0]?.provenance?.kind === "unverified-import");
+const olderV2Envelope = clone(payload);
+delete olderV2Envelope.jobs[0].result.metrics.loudnessRangeValid;
+const olderV2 = parseSessionFile(JSON.stringify(olderV2Envelope));
+check(
+  "older v2 missing LRA validity is treated as valid",
+  !olderV2.error && olderV2.jobs[0]?.result?.metrics.loudnessRangeValid !== false,
+);
 const firstAmbiguousFile = { name: "same.wav", size: 10, lastModified: 1 };
 const secondAmbiguousFile = { name: "same.wav", size: 10, lastModified: 1 };
 check(
@@ -330,6 +361,13 @@ check(
   !!mutateEnvelope(payload, (value) => { value.jobs[0].result.metrics.loudnessRangeUnstable = false; }).error,
 );
 check(
+  "invalid LRA flag with a nonzero wire value rejected",
+  !!mutateEnvelope(payload, (value) => {
+    value.jobs[0].result.metrics.loudnessRangeValid = false;
+    value.jobs[0].result.metrics.loudnessRange = 1;
+  }).error,
+);
+check(
   "misaligned timeline arrays rejected",
   !!mutateEnvelope(payload, (value) => { value.jobs[0].result.metrics.timeline.truePeakDbtp.pop(); }).error,
 );
@@ -378,6 +416,7 @@ check("empty non-importable export fails explicitly", emptyExportThrew);
 
 const perJobPoints = Math.floor(MAX_SESSION_TIMELINE_POINTS / 2) + 1;
 const aggregateEnvelope = clone(payload);
+/** @param {string} id */
 const makeLargeEntry = (id) => {
   const entry = clone(payload.jobs[0]);
   entry.id = id;
@@ -406,12 +445,15 @@ oversizedTimelineJob.result.metadata.frameCount = sourcePointCount * 4_800;
 oversizedTimelineJob.result.metrics.loudnessRangeUnstable = false;
 oversizedTimelineJob.result.metrics.timeline = {
   stepDurationSeconds: 0.1,
-  timeSeconds: Array.from({ length: sourcePointCount }, (_, index) => (index + 1) * 0.1),
-  momentaryLufs: Array(sourcePointCount).fill(null),
-  shortTermLufs: Array(sourcePointCount).fill(null),
-  truePeakDbtp: Array(sourcePointCount).fill(-1),
+  // Float32Array here, not plain arrays with nulls: the exporter normalizes
+  // either form to the same float32 series, and the in-memory type is typed.
+  timeSeconds: Float32Array.from({ length: sourcePointCount }, (_, index) => (index + 1) * 0.1),
+  momentaryLufs: new Float32Array(sourcePointCount).fill(Number.NaN),
+  shortTermLufs: new Float32Array(sourcePointCount).fill(Number.NaN),
+  truePeakDbtp: new Float32Array(sourcePointCount).fill(-1),
 };
 let downsampledText = "";
+/** @type {SessionImportResult} */
 let downsampledImport = { jobs: [], error: "not built" };
 try {
   downsampledText = buildSessionFile([oversizedTimelineJob]);
@@ -492,6 +534,10 @@ console.log("\n[G] Portable-import merge shares the global session cap");
 // intake: an import onto a full session is turned away, not silently merged
 // past the limit. A local job has no import provenance key, so it counts toward
 // the cap denominator but is never a dedupe target.
+/**
+ * @param {number} id
+ * @returns {AnalysisJob}
+ */
 const makeMergeLocalJob = (id) => ({
   id: `local-${id}`,
   fileName: `local-${id}.wav`,
@@ -506,6 +552,11 @@ const makeMergeLocalJob = (id) => ({
 // `slot` drives the provenance identity (so two jobs sharing a slot collide as
 // duplicates); `id` only varies the row id, which is deliberately NOT part of
 // the dedupe key.
+/**
+ * @param {number} slot
+ * @param {string} [id]
+ * @returns {AnalysisJob}
+ */
 const makeMergeImportedJob = (slot, id = `slot-${slot}`) => ({
   id: `analysis-import-${id}`,
   fileName: `import-${slot}.wav`,
@@ -609,5 +660,84 @@ const makeMergeImportedJob = (slot, id = `slot-${slot}`) => ({
   );
 }
 
-console.log(`\n==== Session format: ${passed} passed, ${failed} failed ====\n`);
-process.exit(failed ? 1 : 0);
+console.log("\n[H] LOGIC-07 — persistence.ts keeps valid rows from a v2 recent-sessions envelope");
+{
+  // Fake window.localStorage the way validate-export.mjs does, scoped to this block.
+  class MemoryStorage {
+    /** @type {Map<string, string>} */
+    values = new Map();
+    get length() {
+      return this.values.size;
+    }
+    clear() {
+      this.values.clear();
+    }
+    /** @param {number} index */
+    key(index) {
+      return [...this.values.keys()][index] ?? null;
+    }
+    /** @param {string} key */
+    getItem(key) {
+      return this.values.get(key) ?? null;
+    }
+    /**
+     * @param {string} key
+     * @param {string} value
+     */
+    setItem(key, value) {
+      this.values.set(key, String(value));
+    }
+    /** @param {string} key */
+    removeItem(key) {
+      this.values.delete(key);
+    }
+  }
+  const storage = new MemoryStorage();
+  Object.defineProperty(globalThis, "window", {
+    configurable: true,
+    value: { localStorage: storage },
+  });
+
+  /**
+   * @param {string} id
+   * @param {number} second
+   * @returns {RecentSessionEntry}
+   */
+  const validEntry = (id, second) => ({
+    id,
+    fileName: `${id}.wav`,
+    analyzedAt: `2026-01-01T00:00:${String(second).padStart(2, "0")}.000Z`,
+    analysisMode: "measure-only",
+    recordTrust: "validated-v2",
+    provenanceKind: "local-analysis",
+    targetLabel: null,
+    integratedLufs: -14,
+    integratedValid: true,
+    truePeakDbtp: -1,
+    loudnessRange: 3,
+    loudnessRangeValid: true,
+    loudnessRangeUnstable: false,
+    sampleRate: 48000,
+    channelLayoutName: "Stereo",
+    decoderLabel: "native",
+    complianceLabel: null,
+  });
+  // Invalid: analysisMode "targeted" requires a string targetLabel; null fails
+  // isRecentSessionEntry's targetSemanticsValid check for the v2 schema.
+  const invalidEntry = { ...validEntry("row-bad", 3), analysisMode: "targeted" };
+  storage.setItem(
+    "truepeak-recent-sessions",
+    JSON.stringify({
+      version: 2,
+      entries: [invalidEntry, validEntry("row-1", 1), validEntry("row-2", 2)],
+    }),
+  );
+  const survivors = loadRecentSessions();
+  check(
+    "a v2 envelope with one invalid row keeps the valid rows instead of wiping the whole history",
+    survivors.length === 2 && survivors.every((entry) => entry.id !== "row-bad"),
+    JSON.stringify(survivors.map((entry) => entry.id)),
+  );
+
+  Reflect.deleteProperty(globalThis, "window");
+}

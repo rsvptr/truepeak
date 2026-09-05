@@ -1,15 +1,21 @@
 // Adversarial-input / robustness validation for the TruePeak decode + analysis path.
 // Feeds garbage, truncated, degenerate, and hostile buffers to the real parser and
 // analyzer and asserts each one fails CLEANLY: it must either throw a sane Error or
-// return finite output — never hang, never return NaN/garbage.
+// return bounded output — never hang or return unexpected NaN/garbage. Timeline
+// loudness series deliberately use a leading NaN sentinel before their first
+// complete measurement window.
 //
-// Run: node scripts/dsp/validate-robustness.mjs
+// Run: npm run test:robustness
+import assert from "node:assert/strict";
 import { register } from "node:module";
+import test from "node:test";
+import { encodeWav } from "./lib/fixtures.mjs";
 
 register("./alias-loader.mjs", import.meta.url);
 
 const { parseWavBuffer } = await import("../../src/audio/wav.ts");
 const { parseAiffBuffer } = await import("../../src/audio/aiff.ts");
+const { inspectAudioContainer } = await import("../../src/audio/decode-budget.ts");
 const {
   analyzeDecodedAsset,
   MIN_SUPPORTED_SAMPLE_RATE,
@@ -18,20 +24,44 @@ const {
 } = await import("../../src/audio/analysis.ts");
 const { deriveChannelLayout } = await import("../../src/audio/channel-layout.ts");
 
-let passed = 0;
-let failed = 0;
+// Each outcome becomes one named test, so a failing case reports its detail
+// through the runner instead of a console line.
+/** @typedef {import("../../src/types/audio.ts").AnalysisResult} AnalysisResult */
+/** @typedef {import("../../src/types/audio.ts").DecodedAudioAsset} DecodedAudioAsset */
+/** @typedef {import("../../src/audio/container-chunks.ts").BeforePcmAllocation} BeforePcmAllocation */
+/** @typedef {import("../../src/audio/container-chunks.ts").ContainerPcmGeometry} ContainerPcmGeometry */
 
-function pass(name, detail = "") {
-  console.log(`  PASS  ${name}${detail ? ` — ${detail}` : ""}`);
-  passed += 1;
+/**
+ * @param {string} name
+ * @param {unknown} ok
+ * @param {string | undefined} detail
+ */
+function record(name, ok, detail) {
+  test(name, () => {
+    assert.ok(ok, detail);
+  });
 }
+/**
+ * @param {string} name
+ * @param {string} [detail]
+ */
+function pass(name, detail = "") {
+  record(name, true, detail);
+}
+/**
+ * @param {string} name
+ * @param {string} [detail]
+ */
 function fail(name, detail = "") {
-  console.log(`  FAIL  ${name}${detail ? ` — ${detail}` : ""}`);
-  failed += 1;
+  record(name, false, detail);
 }
 
 // Assert fn throws (any Error). Also bounds runtime so an infinite loop shows as a
 // failure of the surrounding process timeout rather than a silent hang.
+/**
+ * @param {string} name
+ * @param {() => unknown} fn
+ */
 function expectThrow(name, fn) {
   const start = performance.now();
   try {
@@ -48,6 +78,12 @@ function expectThrow(name, fn) {
 }
 
 // Assert fn returns and the result passes a validator (no throw, sane output).
+/**
+ * @template T
+ * @param {string} name
+ * @param {() => T} fn
+ * @param {(result: T) => boolean | string} [validate]
+ */
 function expectOk(name, fn, validate) {
   const start = performance.now();
   try {
@@ -64,8 +100,14 @@ function expectOk(name, fn, validate) {
   }
 }
 
+/**
+ * @param {string} name
+ * @param {() => unknown} fn
+ * @param {number} maxMs
+ */
 function expectFast(name, fn, maxMs) {
   const start = performance.now();
+  /** @type {unknown} */
   let threw = null;
   try {
     fn();
@@ -74,49 +116,21 @@ function expectFast(name, fn, maxMs) {
   }
   const ms = performance.now() - start;
   if (ms <= maxMs) {
-    pass(name, `${ms.toFixed(0)}ms ≤ ${maxMs}ms${threw ? ` (threw "${threw.message.slice(0, 40)}", fine)` : ""}`);
+    pass(
+      name,
+      `${ms.toFixed(0)}ms ≤ ${maxMs}ms${threw instanceof Error ? ` (threw "${threw.message.slice(0, 40)}", fine)` : ""}`,
+    );
   } else {
     fail(name, `took ${ms.toFixed(0)}ms (> ${maxMs}ms) — possible pathological scaling`);
   }
 }
 
-// ---- WAV encoder knobs (lets us craft hostile headers) ----
-function encodeWav({ channels, sampleRate, formatTag = 3, bitsPerSample = 32, declaredChannels, declaredDataBytes }) {
-  const channelCount = channels.length;
-  const writtenChannels = declaredChannels ?? channelCount;
-  const bytesPerSample = bitsPerSample / 8;
-  const blockAlign = writtenChannels * bytesPerSample;
-  const frameCount = channels[0]?.length ?? 0;
-  const realDataBytes = frameCount * channelCount * bytesPerSample;
-  const buffer = new ArrayBuffer(44 + realDataBytes);
-  const view = new DataView(buffer);
-  const writeAscii = (offset, text) => {
-    for (let i = 0; i < text.length; i += 1) view.setUint8(offset + i, text.charCodeAt(i));
-  };
-  writeAscii(0, "RIFF");
-  view.setUint32(4, 36 + realDataBytes, true);
-  writeAscii(8, "WAVE");
-  writeAscii(12, "fmt ");
-  view.setUint32(16, 16, true);
-  view.setUint16(20, formatTag, true);
-  view.setUint16(22, writtenChannels, true);
-  view.setUint32(24, sampleRate, true);
-  view.setUint32(28, sampleRate * blockAlign, true);
-  view.setUint16(32, blockAlign, true);
-  view.setUint16(34, bitsPerSample, true);
-  writeAscii(36, "data");
-  view.setUint32(40, declaredDataBytes ?? realDataBytes, true);
-  let offset = 44;
-  for (let frame = 0; frame < frameCount; frame += 1) {
-    for (let ch = 0; ch < channelCount; ch += 1) {
-      if (bitsPerSample === 32 && formatTag === 3) view.setFloat32(offset, channels[ch][frame], true);
-      else if (bitsPerSample === 16) view.setInt16(offset, Math.round(channels[ch][frame] * 32767), true);
-      offset += bytesPerSample;
-    }
-  }
-  return buffer;
-}
-
+/**
+ * @param {number} frameCount
+ * @param {number} [amp]
+ * @param {number} [channels]
+ * @returns {Float32Array[]}
+ */
 function tone(frameCount, amp = 0.5, channels = 2) {
   const data = Array.from({ length: channels }, () => new Float32Array(frameCount));
   for (let n = 0; n < frameCount; n += 1) {
@@ -126,6 +140,11 @@ function tone(frameCount, amp = 0.5, channels = 2) {
   return data;
 }
 
+/**
+ * @param {Float32Array[]} channels
+ * @param {number} [sampleRate]
+ * @returns {DecodedAudioAsset}
+ */
 function makeAsset(channels, sampleRate = 48000) {
   const channelCount = channels.length;
   const frameCount = channels[0]?.length ?? 0;
@@ -148,20 +167,33 @@ function makeAsset(channels, sampleRate = 48000) {
   };
 }
 
+/**
+ * @param {AnalysisResult} result
+ * @returns {true | string}
+ */
 function metricsAreSane(result) {
   const m = result.metrics;
+  /** @type {("integratedLufs" | "ungatedLufs" | "loudnessRange" | "samplePeakDbfs" | "truePeakDbtp")[]} */
   const finiteFields = ["integratedLufs", "ungatedLufs", "loudnessRange", "samplePeakDbfs", "truePeakDbtp"];
   for (const field of finiteFields) {
     if (!Number.isFinite(m[field])) return `${field} is not finite: ${m[field]}`;
   }
+  /** @type {("maxMomentaryLufs" | "maxShortTermLufs" | "unclampedTargetDeltaDb" | "targetDeltaDb" | "projectedTruePeakDbtp")[]} */
   const nullableFields = ["maxMomentaryLufs", "maxShortTermLufs", "unclampedTargetDeltaDb", "targetDeltaDb", "projectedTruePeakDbtp"];
   for (const field of nullableFields) {
     if (m[field] != null && !Number.isFinite(m[field])) return `${field} is neither null nor finite: ${m[field]}`;
   }
   for (const arr of [m.timeline.momentaryLufs, m.timeline.shortTermLufs]) {
-    if (arr.some((v) => v != null && !Number.isFinite(v))) return "timeline contains NaN/Infinity";
+    let sawMeasurement = false;
+    for (const value of arr) {
+      if (Number.isFinite(value)) {
+        sawMeasurement = true;
+      } else if (!Number.isNaN(value) || sawMeasurement) {
+        return "timeline contains an invalid or non-leading sentinel";
+      }
+    }
   }
-  if (m.timeline.truePeakDbtp.some((v) => !Number.isFinite(v))) return "timeline true peak contains NaN/Infinity";
+  if (m.timeline.truePeakDbtp.some((/** @type {number} */ v) => !Number.isFinite(v))) return "timeline true peak contains NaN/Infinity";
   return true;
 }
 
@@ -293,7 +325,7 @@ expectThrow("mismatched channel lengths rejected (no garbage output)", () => {
   analyzeDecodedAsset(makeAsset([new Float32Array(48000).fill(0.1), new Float32Array(10).fill(0.1)], 48000), null);
 });
 
-console.log("\n[D] Analyzer: valid-but-extreme inputs produce finite output (no crash, no NaN)");
+console.log("\n[D] Analyzer: valid-but-extreme inputs produce bounded output");
 
 expectOk("single sample", () => analyzeDecodedAsset(makeAsset([new Float32Array([0.5]), new Float32Array([0.5])], 48000), null), metricsAreSane);
 expectOk("sub-window clip (100 frames < one 100ms step)", () => analyzeDecodedAsset(makeAsset(tone(100), 48000), null), metricsAreSane);
@@ -314,12 +346,18 @@ expectFast(
 
 console.log("\n[F] Analyzer: sample-rate bounds (M-15)");
 
+/**
+ * @param {string} name
+ * @param {unknown} cond
+ * @param {string} [detail]
+ */
 function assertBool(name, cond, detail) {
   cond ? pass(name, detail) : fail(name, detail);
 }
 assertBool(`MIN_SUPPORTED_SAMPLE_RATE === 8000 (contract §5)`, MIN_SUPPORTED_SAMPLE_RATE === 8000, `got ${MIN_SUPPORTED_SAMPLE_RATE}`);
 assertBool(`MAX_SUPPORTED_SAMPLE_RATE === 384000 (contract §5)`, MAX_SUPPORTED_SAMPLE_RATE === 384000, `got ${MAX_SUPPORTED_SAMPLE_RATE}`);
 
+/** @param {number} rate */
 function analyzeAtRate(rate) {
   const frames = Math.max(1, Math.round(rate * 0.5));
   const l = new Float32Array(frames);
@@ -331,6 +369,7 @@ function analyzeAtRate(rate) {
   }
   return analyzeDecodedAsset(makeAsset([l, r], rate), null).metrics;
 }
+/** @param {number} rate */
 function expectRateOk(rate) {
   const name = `${rate} Hz accepted -> finite metrics`;
   try {
@@ -344,6 +383,7 @@ function expectRateOk(rate) {
     fail(name, `unexpected throw: ${error instanceof Error ? error.message : String(error)}`);
   }
 }
+/** @param {number} rate */
 function expectRateRejected(rate) {
   const name = `${rate} Hz rejected with the exported prefix`;
   try {
@@ -369,9 +409,19 @@ expectRateRejected(384001); // just above the documented ceiling
 
 console.log("\n[G] Parsers: fail closed on malformed RF64 / AIFC / truncated chunks (M-10, M-13, NEW-1)");
 
+/**
+ * @param {DataView} view
+ * @param {number} offset
+ * @param {string} text
+ */
 function putAscii(view, offset, text) {
   for (let i = 0; i < text.length; i += 1) view.setUint8(offset + i, text.charCodeAt(i));
 }
+/**
+ * @param {DataView} view
+ * @param {number} offset
+ * @param {number} value
+ */
 function putFloat80(view, offset, value) {
   const exponent = Math.floor(Math.log2(value));
   const mantissa = value / 2 ** exponent;
@@ -382,6 +432,11 @@ function putFloat80(view, offset, value) {
 // Assert fn throws a descriptive Error that is NOT a raw RangeError (NEW-1: no
 // DataView out-of-bounds error may escape the parser). RangeError extends Error,
 // so the existing `instanceof Error` check alone would not catch it.
+/**
+ * @param {string} name
+ * @param {() => unknown} fn
+ * @param {string} [mustInclude]
+ */
 function expectThrowDescriptive(name, fn, mustInclude) {
   try {
     fn();
@@ -592,6 +647,22 @@ expectOk(
 // (1 count byte + the name). overrideNameCount forges a bad count byte for the
 // bounds tests; commSizeDeclared / commDataBytes let a caller declare or physically
 // write a different amount than the well-formed length.
+/**
+ * @param {{
+ *   formType?: string,
+ *   commSizeDeclared?: number,
+ *   commDataBytes?: number,
+ *   compressionType?: string | null,
+ *   compressionName?: string,
+ *   overrideNameCount?: number | null,
+ *   includeFver?: boolean,
+ *   fverVersion?: number,
+ *   sampleRate?: number,
+ *   channelCount?: number,
+ *   frames?: number,
+ *   bitsPerSample?: number,
+ * }} [options]
+ */
 function buildAiffFixture({
   formType = "AIFF",
   commSizeDeclared,
@@ -700,6 +771,7 @@ function buildAiffcCommPastBuffer() {
   return buffer;
 }
 // AIFF whose final SSND chunk header fits but the declared data runs past EOF.
+/** @param {number} ssndDataBytes */
 function buildAiffTruncatedSsnd(ssndDataBytes) {
   const total = 12 + 8 + 18 + 8 + ssndDataBytes;
   const buffer = new ArrayBuffer(total);
@@ -778,13 +850,11 @@ for (const n of [0, 1, 2, 3]) {
     parseAiffBuffer(buildAiffTruncatedSsnd(n), "x.aiff", "audio/aiff"), "SSND");
 }
 
-console.log("\n[H] AIFC unbounded-scan DoS: parseAiffBuffer bounds its chunk walk (finding [0])");
-// An AIFC with COMM+SSND discovered early but NO FVER and a large padded tail of
-// size-0 chunks must NOT scan to EOF. parseAiffBuffer caps its chunk walk at 100k
-// iterations exactly like inspectAiff, so the flood is rejected as "missing FVER"
-// cheaply instead of freezing the synchronous, budget-immune decoder lane for
-// seconds. (COMM contents need only be recognized: for AIFC the parser throws
-// "missing FVER" before it ever validates COMM.)
+console.log("\n[H] AIFC bounded chunk selection");
+// An AIFC with COMM+SSND discovered early but no preceding FVER must not scan a
+// padded tail. The shared selection rule stops as soon as COMM and SSND are known,
+// then the parser rejects the missing mandatory version before decoding.
+/** @param {DataView} view */
 function writeAifcFloodHeader(view) {
   putAscii(view, 0, "FORM");
   view.setUint32(4, view.byteLength - 8, false);
@@ -802,14 +872,15 @@ function writeAifcFloodHeader(view) {
   // The next chunk begins at offset 54; the rest of the (zeroed) buffer forms
   // size-0 chunks — id "\0\0\0\0", size 0 — that a walk marches through 8 bytes at a time.
 }
+/** @param {number} totalBytes */
 function buildAifcFloodNoFver(totalBytes) {
   const buffer = new ArrayBuffer(totalBytes);
   writeAifcFloodHeader(new DataView(buffer));
   return buffer;
 }
 function buildAifcFloodFverBeyondCap(zeroChunksBeforeFver = 120_000) {
-  // COMM(chunk 1) + SSND(chunk 2) + zeroChunksBeforeFver zero chunks, then a VALID
-  // FVER at chunk (zeroChunksBeforeFver + 3) — comfortably past the 100k cap.
+  // A trailing FVER cannot change the result after the first COMM/SSND pair has
+  // completed. Keeping it beyond the global cap also guards the bounded iterator.
   const fverAt = 54 + zeroChunksBeforeFver * 8;
   const buffer = new ArrayBuffer(fverAt + 12);
   const view = new DataView(buffer);
@@ -820,10 +891,7 @@ function buildAifcFloodFverBeyondCap(zeroChunksBeforeFver = 120_000) {
   return buffer;
 }
 
-// Timing guard (the acceptance repro): a 256 MiB in-budget flood must be rejected in
-// well under a second. Pre-cap this walked ~33.5M chunks — a multi-hundred-ms to
-// multi-second synchronous freeze; the cap stops after 100k regardless of file size.
-// The buffer is built OUTSIDE the timed region so only the parse is measured.
+// The buffer is built outside the timed region so only selection is measured.
 const aifcFloodBuffer = buildAifcFloodNoFver(256 * 1024 * 1024);
 expectFast(
   "256 MiB AIFC flood (COMM+SSND early, no FVER, padded tail) rejected fast",
@@ -836,12 +904,9 @@ expectThrowDescriptive(
   () => parseAiffBuffer(buildAifcFloodNoFver(2 * 1024 * 1024), "flood.aifc", "audio/aiff"),
   "FVER",
 );
-// Deterministic cap proof (no wall-clock reliance): a valid FVER hidden beyond the
-// 100k cap must NOT be found, so the file is rejected as missing FVER. An unbounded
-// walk would instead find the far FVER and throw a different, non-FVER error — so
-// this assertion fails the moment the cap is removed.
+// FVER is not allowed to override the completed first-header/data selection.
 expectThrowDescriptive(
-  "AIFC hiding a valid FVER beyond the 100k chunk cap is rejected as missing FVER",
+  "AIFC with FVER trailing after COMM/SSND is rejected as missing FVER",
   () => parseAiffBuffer(buildAifcFloodFverBeyondCap(), "flood.aifc", "audio/aiff"),
   "FVER",
 );
@@ -853,77 +918,173 @@ expectOk(
   (asset) => asset.frameCount > 0 && asset.channels[0].every((v) => Number.isFinite(v)),
 );
 
-// ---- AIFC duplicate COMM/SSND: preflight and parser must agree ----
-// inspectAiff (decode-budget.ts) latches the first COMM+SSND pair and stops. The
-// parser keeps walking for AIFC because FVER may legitimately trail them, so
-// without a first-wins latch a file laid out COMM#1, SSND, COMM#2, FVER had its
-// decode budget approved from COMM#1 while the parser sized its allocation from
-// COMM#2. Both chunks are individually well-formed, so nothing else caught it.
-function buildAiffcDuplicateComm(firstFrames, secondFrames) {
-  const channels = 1;
-  const bits = 8;
-  const audioBytes = secondFrames * channels * (bits / 8);
-  const commBody = 18 + 4 + 1 + 4; // extended COMM: fixed + 'NONE' + pstring("none")
-  // AIFF chunks are word-aligned: an odd body carries a trailing pad byte, and
-  // the parser advances by chunkSize + (chunkSize % 2). commBody is 27 here.
-  const commChunk = 8 + commBody + (commBody % 2);
-  const ssndChunk = 8 + 8 + audioBytes;
-  const fverChunk = 12;
-  const total = 12 + commChunk + ssndChunk + commChunk + fverChunk;
+console.log("\n[I] Shared chunk selection: duplicate headers and bounded walks");
+
+const MISMATCH_PAYLOAD_BYTES = 4096;
+
+function buildDuplicateFmtWave() {
+  const dataChunkBytes = 8 + MISMATCH_PAYLOAD_BYTES;
+  const fmtChunkBytes = 8 + 16;
+  const total = 12 + dataChunkBytes + fmtChunkBytes * 2;
+  const buffer = new ArrayBuffer(total);
+  const view = new DataView(buffer);
+  putAscii(view, 0, "RIFF");
+  view.setUint32(4, total - 8, true);
+  putAscii(view, 8, "WAVE");
+
+  putAscii(view, 12, "data");
+  view.setUint32(16, MISMATCH_PAYLOAD_BYTES, true);
+
+  /**
+   * @param {number} offset
+   * @param {number} formatTag
+   * @param {number} bitsPerSample
+   */
+  const writeFmt = (offset, formatTag, bitsPerSample) => {
+    const bytesPerSample = bitsPerSample / 8;
+    putAscii(view, offset, "fmt ");
+    view.setUint32(offset + 4, 16, true);
+    view.setUint16(offset + 8, formatTag, true);
+    view.setUint16(offset + 10, 1, true);
+    view.setUint32(offset + 12, 48000, true);
+    view.setUint32(offset + 16, 48000 * bytesPerSample, true);
+    view.setUint16(offset + 20, bytesPerSample, true);
+    view.setUint16(offset + 22, bitsPerSample, true);
+  };
+  const firstFmt = 20 + MISMATCH_PAYLOAD_BYTES;
+  writeFmt(firstFmt, 1, 8);
+  writeFmt(firstFmt + fmtChunkBytes, 3, 64);
+  return buffer;
+}
+
+function buildDuplicateCommAiff() {
+  const commChunkBytes = 8 + 18;
+  const ssndChunkBytes = 8 + 8 + MISMATCH_PAYLOAD_BYTES;
+  const total = 12 + commChunkBytes * 2 + ssndChunkBytes;
   const buffer = new ArrayBuffer(total);
   const view = new DataView(buffer);
   putAscii(view, 0, "FORM");
   view.setUint32(4, total - 8, false);
-  putAscii(view, 8, "AIFC");
+  putAscii(view, 8, "AIFF");
 
-  const writeComm = (offset, frames) => {
+  /**
+   * @param {number} offset
+   * @param {number} frames
+   * @param {number} bitsPerSample
+   */
+  const writeComm = (offset, frames, bitsPerSample) => {
     putAscii(view, offset, "COMM");
-    view.setUint32(offset + 4, commBody, false);
+    view.setUint32(offset + 4, 18, false);
     const data = offset + 8;
-    view.setUint16(data, channels, false);
+    view.setUint16(data, 1, false);
     view.setUint32(data + 2, frames, false);
-    view.setUint16(data + 6, bits, false);
+    view.setUint16(data + 6, bitsPerSample, false);
     putFloat80(view, data + 8, 48000);
-    putAscii(view, data + 18, "NONE");
-    view.setUint8(data + 22, 4);
-    putAscii(view, data + 23, "none");
   };
 
   let o = 12;
-  writeComm(o, firstFrames);
-  o += commChunk;
+  writeComm(o, MISMATCH_PAYLOAD_BYTES, 8);
+  o += commChunkBytes;
+  writeComm(o, MISMATCH_PAYLOAD_BYTES / 8, 64);
+  o += commChunkBytes;
   putAscii(view, o, "SSND");
-  view.setUint32(o + 4, 8 + audioBytes, false);
+  view.setUint32(o + 4, 8 + MISMATCH_PAYLOAD_BYTES, false);
   view.setUint32(o + 8, 0, false);
   view.setUint32(o + 12, 0, false);
-  o += ssndChunk;
-  writeComm(o, secondFrames);
-  o += commChunk;
-  putAscii(view, o, "FVER");
-  view.setUint32(o + 4, 4, false);
-  view.setUint32(o + 8, 0xa2805140, false);
   return buffer;
 }
 
-{
-  const declaredFirst = 1;
-  const declaredSecond = 4096;
-  const asset = parseAiffBuffer(
-    buildAiffcDuplicateComm(declaredFirst, declaredSecond),
-    "dup.aifc",
-    "audio/aiff",
+/**
+ * @param {string} name
+ * @param {ArrayBuffer} buffer
+ * @param {(buffer: ArrayBuffer, beforeAllocation: BeforePcmAllocation) => DecodedAudioAsset} parse
+ */
+function assertPreflightMatchesParser(name, buffer, parse) {
+  const preflight = inspectAudioContainer(buffer);
+  // Held on an object so the recorded geometry reads as its declared type after
+  // the parse call rather than staying narrowed to its initial null.
+  /** @type {{ geometry: ContainerPcmGeometry | null }} */
+  const checked = { geometry: null };
+  const asset = parse(buffer, (geometry) => {
+    checked.geometry = geometry;
+  });
+  assertBool(`${name}: preflight is available`, preflight != null);
+  assertBool(
+    `${name}: parser validates the first header before allocation`,
+    checked.geometry != null &&
+      checked.geometry.channelCount === 1 &&
+      checked.geometry.bitDepth === 8 &&
+      checked.geometry.frameCount === MISMATCH_PAYLOAD_BYTES,
+    JSON.stringify(checked.geometry),
   );
   assertBool(
-    "AIFC duplicate COMM: the parser uses the FIRST COMM, matching the preflight",
-    asset.frameCount === declaredFirst,
-    `frameCount ${asset.frameCount}, expected ${declaredFirst}`,
+    `${name}: parser and preflight geometry are identical`,
+    preflight != null &&
+      asset.channelCount === preflight.channelCount &&
+      asset.bitDepth === preflight.bitDepth &&
+      asset.frameCount === preflight.frameCount,
+    preflight == null
+      ? "preflight null"
+      : `parser ${asset.channelCount}/${asset.bitDepth}/${asset.frameCount}, preflight ${preflight.channelCount}/${preflight.bitDepth}/${preflight.frameCount}`,
   );
   assertBool(
-    "AIFC duplicate COMM: no channel is allocated past the first COMM's frame count",
-    asset.channels.every((channel) => channel.length === declaredFirst),
+    `${name}: allocation uses the authorised frame count`,
+    preflight != null && asset.channels.every((channel) => channel.length === preflight.frameCount),
     asset.channels.map((channel) => channel.length).join(","),
   );
 }
 
-console.log(`\n==== Robustness: ${passed} passed, ${failed} failed ====\n`);
-process.exit(failed ? 1 : 0);
+assertPreflightMatchesParser(
+  "WAV data, fmt#1, fmt#2 uses first 1ch/8-bit fmt",
+  buildDuplicateFmtWave(),
+  (buffer, beforeAllocation) => parseWavBuffer(buffer, "dup.wav", "audio/wav", beforeAllocation),
+);
+assertPreflightMatchesParser(
+  "AIFF COMM#1, COMM#2, SSND uses first 1ch/8-bit COMM",
+  buildDuplicateCommAiff(),
+  (buffer, beforeAllocation) => parseAiffBuffer(buffer, "dup.aiff", "audio/aiff", beforeAllocation),
+);
+
+for (const byteLength of [0, 1, 2, 3]) {
+  expectThrowDescriptive(
+    `WAV ${byteLength}-byte input is rejected before ASCII reads`,
+    () => parseWavBuffer(new ArrayBuffer(byteLength), "short.wav", "audio/wav"),
+    "truncated",
+  );
+  expectThrowDescriptive(
+    `AIFF ${byteLength}-byte input is rejected before ASCII reads`,
+    () => parseAiffBuffer(new ArrayBuffer(byteLength), "short.aiff", "audio/aiff"),
+    "truncated",
+  );
+}
+
+function buildWaveWithChunksBeyondCap(chunkCount = 100_001) {
+  const buffer = new ArrayBuffer(12 + chunkCount * 8 + 8 + 16 + 8 + 1);
+  const view = new DataView(buffer);
+  putAscii(view, 0, "RIFF");
+  view.setUint32(4, buffer.byteLength - 8, true);
+  putAscii(view, 8, "WAVE");
+  for (let index = 0; index < chunkCount; index += 1) {
+    putAscii(view, 12 + index * 8, "JUNK");
+  }
+  let offset = 12 + chunkCount * 8;
+  putAscii(view, offset, "fmt ");
+  view.setUint32(offset + 4, 16, true);
+  view.setUint16(offset + 8, 1, true);
+  view.setUint16(offset + 10, 1, true);
+  view.setUint32(offset + 12, 48000, true);
+  view.setUint32(offset + 16, 48000, true);
+  view.setUint16(offset + 20, 1, true);
+  view.setUint16(offset + 22, 8, true);
+  offset += 24;
+  putAscii(view, offset, "data");
+  view.setUint32(offset + 4, 1, true);
+  view.setUint8(offset + 8, 128);
+  return buffer;
+}
+
+expectThrowDescriptive(
+  "WAV does not scan valid fmt/data hidden beyond the 100k chunk cap",
+  () => parseWavBuffer(buildWaveWithChunksBeyondCap(), "flood.wav", "audio/wav"),
+  "missing fmt or data",
+);

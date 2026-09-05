@@ -1,30 +1,19 @@
 "use client";
 
+import { memo } from "react";
 import { BarChart3, SlidersHorizontal } from "lucide-react";
-import type { ComplianceState } from "@/audio/compliance";
+import { useWorkspaceCommands, useWorkspaceSession } from "@/components/workspace-contexts";
 import { formatLufs, formatPeakDbtp, formatPresetLufs, formatPresetPeakDbtp } from "@/lib/format";
-import type { AnalysisMode, TargetPreset } from "@/types/audio";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 
 interface WorkspaceSummaryRailProps {
-  analysisMode: AnalysisMode;
-  currentTarget: TargetPreset | null;
   variant?: "default" | "compact";
-  queueCount: number;
-  completedCount: number;
-  issueCount: number;
-  averageLufs: number | null;
-  hottestTruePeak: number | null;
-  complianceCounts?: Record<ComplianceState, number>;
-  onOpenPresetLibrary: () => void;
-  onOpenCompare: () => void;
-  canOpenCompare: boolean;
 }
 
 function RailMetric({ label, value, hint }: { label: string; value: string; hint: string }) {
   return (
-    <div className="flex h-full min-h-[96px] min-w-[150px] shrink-0 snap-start flex-col justify-between rounded-[20px] border border-[var(--line)]/60 bg-[var(--surface-1)]/50 px-3 py-3 sm:min-h-[124px] sm:min-w-0 sm:px-4 sm:py-4">
+    <div className="flex h-full min-h-[96px] min-w-[42%] shrink-0 snap-start flex-col justify-between rounded-[20px] border border-[var(--line)]/60 bg-[var(--surface-1)]/50 px-3 py-3 sm:min-h-[124px] sm:min-w-0 sm:px-4 sm:py-4">
       <div className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">{label}</div>
       <div className="mt-2 break-words text-lg font-semibold text-[var(--ink)] tabular-nums sm:mt-3">{value}</div>
       <div className="mt-1 text-xs leading-5 text-[var(--muted)] sm:mt-2">{hint}</div>
@@ -34,27 +23,30 @@ function RailMetric({ label, value, hint }: { label: string; value: string; hint
 
 function CompactMetric({ label, value }: { label: string; value: string }) {
   return (
-    <div className="min-w-[104px] shrink-0 snap-start rounded-[16px] border border-[var(--line)]/60 bg-[var(--surface-1)]/46 px-3 py-2.5">
+    <div className="min-w-[42%] shrink-0 snap-start rounded-[16px] border border-[var(--line)]/60 bg-[var(--surface-1)]/46 px-3 py-2.5 sm:min-w-[104px]">
       <div className="text-[10px] uppercase tracking-[0.16em] text-[var(--muted)]">{label}</div>
       <div className="mt-1 text-sm font-semibold tabular-nums text-[var(--ink)]">{value}</div>
     </div>
   );
 }
 
-export function WorkspaceSummaryRail({
-  analysisMode,
-  currentTarget,
+export const WorkspaceSummaryRail = memo(function WorkspaceSummaryRail({
   variant = "default",
-  queueCount,
-  completedCount,
-  issueCount,
-  averageLufs,
-  hottestTruePeak,
-  complianceCounts,
-  onOpenPresetLibrary,
-  onOpenCompare,
-  canOpenCompare,
 }: WorkspaceSummaryRailProps) {
+  const {
+    currentTarget,
+    openCompare: onOpenCompare,
+    openPresetLibrary: onOpenPresetLibrary,
+    route: { analysisMode, uiMode },
+  } = useWorkspaceCommands();
+  const { completedJobs, jobs, queueCounts, sessionStats } = useWorkspaceSession();
+  const averageLufs = sessionStats.averageIntegrated;
+  const canOpenCompare = uiMode === "advanced" && completedJobs.length > 1;
+  const completedCount = completedJobs.length;
+  const complianceCounts = analysisMode === "targeted" ? sessionStats.complianceCounts : undefined;
+  const hottestTruePeak = sessionStats.hottestPeakJob?.result?.metrics.truePeakDbtp ?? null;
+  const issueCount = queueCounts.issues;
+  const queueCount = jobs.length;
   if (variant === "compact") {
     return (
       <div className="rounded-[20px] border border-[var(--line)]/60 bg-[var(--surface-0)]/82 px-3 py-3">
@@ -62,7 +54,7 @@ export function WorkspaceSummaryRail({
           {/* Mobile: single-row horizontal snap rail so the six metrics stay
               one compact strip above the results instead of three stacked rows
               (UX-010). sm and up restore the original grid/flex layout. */}
-          <div className="flex min-w-0 snap-x gap-2 overflow-x-auto pb-1 sm:grid sm:grid-cols-3 sm:overflow-visible sm:pb-0 lg:grid-cols-6 xl:flex xl:flex-wrap">
+          <div className="flex min-w-0 snap-x gap-2 overflow-x-auto overscroll-x-contain pb-1 sm:grid sm:grid-cols-3 sm:overflow-visible sm:pb-0 lg:grid-cols-6 xl:flex xl:flex-wrap">
             <CompactMetric label="Queue" value={String(queueCount)} />
             <CompactMetric label="Complete" value={String(completedCount)} />
             <CompactMetric label="Issues" value={String(issueCount)} />
@@ -111,7 +103,7 @@ export function WorkspaceSummaryRail({
       <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_minmax(320px,0.84fr)] xl:items-stretch">
         {/* Mobile: single-row horizontal snap rail (UX-010); sm and up restore
             the original responsive grid. */}
-        <div className="flex snap-x gap-3 overflow-x-auto pb-1 sm:grid sm:grid-cols-2 sm:overflow-visible sm:pb-0 xl:grid-cols-3 2xl:grid-cols-6">
+        <div className="flex snap-x gap-3 overflow-x-auto overscroll-x-contain pb-1 sm:grid sm:grid-cols-2 sm:overflow-visible sm:pb-0 xl:grid-cols-3 2xl:grid-cols-6">
           <RailMetric label="Queue" value={String(queueCount)} hint="Files in this session" />
           <RailMetric label="Complete" value={String(completedCount)} hint="Ready to inspect" />
           <RailMetric label="Issues" value={String(issueCount)} hint="Failed or canceled" />
@@ -162,4 +154,4 @@ export function WorkspaceSummaryRail({
       </div>
     </div>
   );
-}
+});

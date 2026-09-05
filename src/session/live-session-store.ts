@@ -45,15 +45,29 @@ const RESTORE_LIMIT = MAX_SESSION_JOBS;
 // persisted, destroying that peer's only crash-recovery copy. Every record this
 // tab writes is stamped with a per-tab ownerId and a heartbeatMs timestamp:
 //
-//   * ownerId is minted once per tab and kept in sessionStorage, so it survives
-//     a same-tab hard refresh (the store's primary purpose) yet is distinct in
-//     any other tab and gone once a tab closes.
-//   * A tab may overwrite/delete/clear ONLY records it owns, legacy rows with no
-//     owner (pre-ownership data, treated as stale-owned), or foreign rows whose
-//     heartbeat has gone stale (a crashed/closed peer). A foreign row with a
-//     fresh heartbeat is a live peer's and is left strictly untouched.
+//   * ownerId is this tab's persisted sessionStorage id joined to a nonce held
+//     only in memory for this script evaluation (see resolveOwnerId). The
+//     sessionStorage half alone is NOT distinct in any other tab: a browsing
+//     context created by cloning (Chrome/Edge/Firefox/Safari "Duplicate Tab",
+//     some session restores) starts with a copy of the original's session
+//     storage, so the clone would resolve the exact same id. The in-memory
+//     nonce fixes that -- a clone gets a fresh JS context, so it mints its own
+//     nonce even though its sessionStorage was copied.
+//   * A tab may overwrite/delete/clear ONLY records whose full ownerId (stored
+//     half + nonce) matches its own, legacy rows with no owner (pre-ownership
+//     data, treated as stale-owned), or foreign rows whose heartbeat has gone
+//     stale (a crashed/closed peer). A foreign row with a fresh heartbeat is a
+//     live peer's and is left strictly untouched -- this is what stops a
+//     cloned tab from clearing or deleting the original's rows just because it
+//     inherited the same sessionStorage id.
 //   * Restore SURFACES every valid row view-only (showing a completed result
-//     mutates nothing), and adopts own/stale/legacy rows by re-stamping them. A
+//     mutates nothing), and ADOPTS (re-stamps) own/stale/legacy rows, plus rows
+//     whose stored half matches even if the nonce differs -- a plain reload of
+//     this same tab re-evaluates the script (new nonce) but keeps the same
+//     sessionStorage, so without this the reloaded tab could not reclaim its
+//     own just-written rows until they aged past the stale window. This
+//     relaxation is restore-only: write/delete/clear never use it, so it can
+//     never become a way for a cloned tab to destroy the original's data. A
 //     live peer's fresh row is surfaced but left owned by the peer -- only the
 //     mutating write/delete/clear paths withhold it. Surfacing (not withholding)
 //     on restore is what keeps single-tab recovery working after an accidental
@@ -64,10 +78,16 @@ const RESTORE_LIMIT = MAX_SESSION_JOBS;
 //     periodic timer, so an active tab's rows never look crashed to a peer.
 const OWNER_STORAGE_KEY = "truepeak-live-session-owner";
 // A tab with no usable sessionStorage (private mode, storage disabled) shares
-// this fixed id. That disables cross-tab protection for such a tab -- matching
-// the pre-ownership behaviour, so it is no worse than before -- but the id is
-// identical on the next load, so same-tab refresh recovery still works.
+// this fixed id for its stored half. That disables cross-tab protection for
+// such a tab's stored half -- matching the pre-ownership behaviour, so it is
+// no worse than before -- but the per-load nonce still applies on top of it
+// (see resolveOwnerId), and the stored half is identical on the next load, so
+// same-tab refresh recovery still works via the restore-only relaxation above.
 const FALLBACK_OWNER_ID = "truepeak-live-session-fallback-owner";
+// Joins the persisted (sessionStorage) half of an owner id to the in-memory
+// per-load nonce. Chosen so it cannot collide with a mintOwnerId() output
+// (crypto.randomUUID hyphens, or the base36/base36 fallback format).
+const OWNER_ID_SEPARATOR = "::";
 // A foreign record whose owner has not refreshed within this window is treated
 // as a crashed/closed tab's leftover: adoptable. Two minutes rides out a
 // backgrounded or GC-paused tab and a slow write cycle, yet reclaims a genuinely
@@ -86,7 +106,7 @@ export interface LiveSessionOwnershipOptions {
   staleAfterMs?: number;
 }
 
-let cachedOwnerId: string | null = null;
+let cachedStoredOwnerId: string | null = null;
 
 function mintOwnerId(): string {
   try {
@@ -99,30 +119,58 @@ function mintOwnerId(): string {
   return `owner-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
-// This tab's id: a sessionStorage-persisted uuid when possible, else a fixed
-// shared fallback. Cached so every operation in one page uses a single id.
-function resolveOwnerId(): string {
-  if (cachedOwnerId != null) {
-    return cachedOwnerId;
+// Minted once, the moment this module is evaluated -- i.e. once per page load,
+// including a duplicated tab, which gets a fresh JS context of its own even
+// though it inherits a copy of sessionStorage. Held only in memory, so a
+// cloned sessionStorage can never carry it over.
+const LOAD_NONCE = mintOwnerId();
+
+// This tab's persisted id: a sessionStorage-persisted uuid when possible, else
+// a fixed shared fallback. Cached so every operation in one page uses a single
+// id. This is only the STORED half of ownership -- see resolveOwnerId, which
+// is what every caller in this module actually uses.
+function resolveStoredOwnerId(): string {
+  if (cachedStoredOwnerId != null) {
+    return cachedStoredOwnerId;
   }
   try {
     if (typeof sessionStorage !== "undefined") {
       const existing = sessionStorage.getItem(OWNER_STORAGE_KEY);
       if (typeof existing === "string" && existing.length > 0) {
-        cachedOwnerId = existing;
+        cachedStoredOwnerId = existing;
         return existing;
       }
       const minted = mintOwnerId();
       sessionStorage.setItem(OWNER_STORAGE_KEY, minted);
-      cachedOwnerId = minted;
+      cachedStoredOwnerId = minted;
       return minted;
     }
   } catch {
     // sessionStorage can be unavailable or throw (private mode, quota). Use the
     // fixed fallback so recovery still degrades gracefully.
   }
-  cachedOwnerId = FALLBACK_OWNER_ID;
-  return cachedOwnerId;
+  cachedStoredOwnerId = FALLBACK_OWNER_ID;
+  return cachedStoredOwnerId;
+}
+
+// This tab's effective owner id: the persisted half (above) joined to the
+// in-memory LOAD_NONCE. The persisted half alone is not unique to this tab --
+// a duplicated tab inherits a copy of sessionStorage and would resolve the
+// same one -- so every write/delete/clear ownership check below is scoped to
+// the FULL id. Restore additionally accepts a stored-half-only match (see
+// isRestoreAdoptable) so a plain reload of this same tab, which mints a new
+// nonce, can still reclaim its own rows without waiting out the stale window.
+function resolveOwnerId(): string {
+  return `${resolveStoredOwnerId()}${OWNER_ID_SEPARATOR}${LOAD_NONCE}`;
+}
+
+// The persisted (sessionStorage) half of a full owner id, i.e. everything
+// before the nonce separator. Two tabs sharing this value either are the same
+// tab across a reload, or are a duplicated tab pair -- isRestoreAdoptable is
+// the only place that distinction is deliberately not made.
+function storedOwnerPart(ownerId: string): string {
+  const separatorIndex = ownerId.indexOf(OWNER_ID_SEPARATOR);
+  return separatorIndex === -1 ? ownerId : ownerId.slice(0, separatorIndex);
 }
 
 function recordOwnerId(record: Record<string, unknown>): string | null {
@@ -135,10 +183,14 @@ function recordHeartbeat(record: Record<string, unknown>): number | null {
   return typeof heartbeat === "number" && Number.isFinite(heartbeat) ? heartbeat : null;
 }
 
-// Whether this tab may restore, overwrite, or delete a record: one it owns, a
-// legacy row with no owner, or a foreign row whose heartbeat has gone stale. The
-// sole protected case is a foreign row with a fresh heartbeat -- a live peer's,
-// which must never be touched.
+// Whether this tab may overwrite, delete, or clear a record outright: one it
+// owns (full id match), a legacy row with no owner, or a foreign row whose
+// heartbeat has gone stale. The sole protected case is a foreign row with a
+// fresh heartbeat -- a live peer's, which must never be touched. Deliberately
+// strict on ownership (no stored-half fallback): a duplicated tab shares the
+// stored half by construction, and must never be able to overwrite, delete, or
+// clear the original's rows just because of that. See isRestoreAdoptable for
+// the read-only path's relaxed rule.
 function isClaimable(
   record: Record<string, unknown>,
   ownerId: string,
@@ -157,6 +209,27 @@ function isClaimable(
     return true; // owned but unheartbeated: cannot prove a live peer, so adopt
   }
   return now - heartbeat > staleAfterMs;
+}
+
+// Restore-only relaxation of isClaimable: a foreign row is also adoptable here
+// when its stored owner shares this tab's persisted (sessionStorage) half,
+// even though the in-memory nonce differs. That covers a plain reload of this
+// same tab, whose previous script evaluation minted a different nonce and
+// whose heartbeat may still look fresh. Never used by write, delete, or clear
+// (rule: adoptable on restore only) -- those must keep requiring the full id,
+// or a duplicated tab, which shares the persisted half by construction, could
+// use its own restore to claim and then destroy the original's rows.
+function isRestoreAdoptable(
+  record: Record<string, unknown>,
+  ownerId: string,
+  now: number,
+  staleAfterMs: number,
+): boolean {
+  if (isClaimable(record, ownerId, now, staleAfterMs)) {
+    return true;
+  }
+  const owner = recordOwnerId(record);
+  return owner !== null && storedOwnerPart(owner) === storedOwnerPart(ownerId);
 }
 
 function stampOwnership<T extends Record<string, unknown>>(
@@ -726,10 +799,13 @@ export async function readLiveSessionJobs(
           // break single-tab recovery after an accidental close/crash: the
           // per-tab sessionStorage ownerId dies with the tab, so within the stale
           // window the just-closed tab's OWN rows look exactly like a live peer's
-          // and would be silently dropped from the reopened tab's session.
+          // and would be silently dropped from the reopened tab's session. Uses
+          // the restore-only isRestoreAdoptable (not isClaimable) so a plain
+          // reload -- new in-memory nonce, same sessionStorage -- also adopts its
+          // own rows immediately rather than waiting out the stale window.
           const claimable =
             record && typeof record === "object"
-              ? isClaimable(record as Record<string, unknown>, ownerId, now, staleAfterMs)
+              ? isRestoreAdoptable(record as Record<string, unknown>, ownerId, now, staleAfterMs)
               : true;
 
           const job = normalizeSessionJob(record);
@@ -920,13 +996,4 @@ export async function persistLiveSessionJobs(jobs: AnalysisJob[]): Promise<boole
 export async function removeLiveSessionJobs(jobIds: string[]): Promise<boolean> {
   const outcome = await deleteLiveSessionJobs(jobIds);
   return outcome.status === "committed" || outcome.status === "empty";
-}
-
-export async function clearLiveSession(): Promise<LiveSessionMutationOutcome<"clear">> {
-  return clearLiveSessionStore();
-}
-
-export async function loadLiveSessionJobs(): Promise<AnalysisJob[]> {
-  const outcome = await readLiveSessionJobs();
-  return outcome.status === "committed" || outcome.status === "empty" ? outcome.jobs : [];
 }

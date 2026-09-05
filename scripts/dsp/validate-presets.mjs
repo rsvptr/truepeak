@@ -5,13 +5,26 @@
 //   UX-003  gain-policy labels + consequence copy
 //   UX-029  defensible domain ranges
 // The compliance-window check ties the selected tolerance to the actual verdict.
-// Run: node scripts/dsp/validate-presets.mjs
+// Run: npm run test:presets
+import assert from "node:assert/strict";
 import { register } from "node:module";
+import test from "node:test";
+import { makeAudioMetadata, makeMetrics, makeTimeline } from "./lib/job-fixtures.mjs";
 
 register("./alias-loader.mjs", import.meta.url);
 
+/** @typedef {import("../../src/types/audio.ts").AnalysisResult} AnalysisResult */
+/** @typedef {import("../../src/types/audio.ts").LoudnessMetrics} LoudnessMetrics */
+/** @typedef {import("../../src/types/audio.ts").TargetPreset} TargetPreset */
+/** @typedef {import("../../src/audio/presets.ts").TargetDraft} TargetDraft */
+
 const P = await import("../../src/audio/presets.ts");
 const { getComplianceSummary } = await import("../../src/audio/compliance.ts");
+const {
+  MEASUREMENT_PRECISION,
+  formatLufs,
+  formatPeakDbtp,
+} = await import("../../src/lib/format.ts");
 const { applyTargetToMetrics } = await import("../../src/audio/targeting.ts");
 
 const {
@@ -39,30 +52,48 @@ const {
   updateDraft,
 } = P;
 
-let passed = 0;
-let failed = 0;
-function check(name, condition, detail = "") {
-  if (condition) {
-    console.log(`  PASS  ${name}`);
-    passed += 1;
-  } else {
-    console.log(`  FAIL  ${name}${detail ? ` — ${detail}` : ""}`);
-    failed += 1;
+/**
+ * @param {string} id
+ * @returns {TargetPreset}
+ */
+function presetById(id) {
+  const preset = TARGET_PRESETS.find((entry) => entry.id === id);
+  if (!preset) {
+    throw new Error(`Missing target preset fixture: ${id}`);
   }
+  return preset;
+}
+
+/**
+ * @param {string} name
+ * @param {unknown} condition
+ * @param {string | null} [detail]
+ */
+function check(name, condition, detail = "") {
+  test(name, () => {
+    assert.ok(condition, detail ?? undefined);
+  });
 }
 
 // Build a minimal completed result so getComplianceSummary can be exercised.
+/**
+ * @param {TargetPreset} target
+ * @param {number} integratedLufs
+ * @returns {AnalysisResult}
+ */
 function resultWithTarget(target, integratedLufs) {
   return {
     analysisMode: "targeted",
     target,
     analyzedAt: "2026-07-19T00:00:00.000Z",
-    metadata: { fileName: "probe.wav" },
-    metrics: {
+    metadata: makeAudioMetadata({ fileName: "probe.wav" }),
+    metrics: makeMetrics({
       integratedLufs,
       integratedValid: true,
+      truePeakDbtp: -3,
+      projectedTruePeakDbtp: -3,
       normalizationLimited: false,
-    },
+    }),
   };
 }
 
@@ -70,7 +101,14 @@ function resultWithTarget(target, integratedLufs) {
 // normalizationLimited, projectedTruePeakDbtp) come from the REAL targeting
 // engine, so the compliance verdict is exercised against production wiring
 // rather than hand-set flags. `truePeakDbtp` is the measured true peak.
+/**
+ * @param {TargetPreset} target
+ * @param {number} integratedLufs
+ * @param {number} truePeakDbtp
+ * @returns {AnalysisResult}
+ */
 function targetedResult(target, integratedLufs, truePeakDbtp) {
+  /** @type {LoudnessMetrics} */
   const baseMetrics = {
     integratedLufs,
     integratedValid: true,
@@ -84,14 +122,14 @@ function targetedResult(target, integratedLufs, truePeakDbtp) {
     targetDeltaDb: null,
     projectedTruePeakDbtp: null,
     normalizationLimited: false,
-    timeline: { stepDurationSeconds: 0.1, timeSeconds: [], momentaryLufs: [], shortTermLufs: [], truePeakDbtp: [] },
+    timeline: makeTimeline(),
     warnings: [],
   };
   return {
     analysisMode: "targeted",
     target,
     analyzedAt: "2026-07-19T00:00:00.000Z",
-    metadata: { fileName: "probe.wav" },
+    metadata: makeAudioMetadata({ fileName: "probe.wav" }),
     metrics: applyTargetToMetrics(baseMetrics, target),
   };
 }
@@ -133,11 +171,13 @@ for (const preset of TARGET_PRESETS) {
 // EBU -> 0.5, ATSC -> 2, HiFi -> 1.5.
 check("default tolerance is 1 LU", DEFAULT_TARGET_PRESET.toleranceLufs === 1);
 let seq = createDefaultTargetState();
-for (const [id, want] of [
+/** @type {[string, number][]} */
+const toleranceAcceptance = [
   ["broadcast-ebu", 0.5],
   ["broadcast-atsc", 2],
   ["hifi-dynamic", 1.5],
-]) {
+];
+for (const [id, want] of toleranceAcceptance) {
   seq = selectPreset(seq, id);
   check(`acceptance: ${id} => ${want} LU active`, resolveActiveTarget(seq.committed).toleranceLufs === want);
 }
@@ -165,8 +205,8 @@ console.log("\n[A2] UX-001 — the selected tolerance drives the compliance wind
 console.log("\n[A3] Compliance verdict = WORST of loudness-vs-tolerance and true-peak-vs-ceiling");
 // A true-peak ceiling breach must never hide behind an on-target loudness read.
 {
-  const spotifyNormal = TARGET_PRESETS.find((p) => p.id === "spotify-normal"); // -14 / -1 / tol 1, protect-true-peak
-  const spotifyLoud = TARGET_PRESETS.find((p) => p.id === "spotify-loud"); // -11 / -1 / tol 1, loudness-first
+  const spotifyNormal = presetById("spotify-normal"); // -14 / -1 / tol 1, protect-true-peak
+  const spotifyLoud = presetById("spotify-loud"); // -11 / -2 / tol 1, loudness-first
 
   // Acceptance repro (finding [1]): loudness inside tolerance (-14.2 vs -14, tol 1)
   // but the measured true peak (-0.3) is over the -1 ceiling. Must NOT read compliant.
@@ -190,6 +230,52 @@ console.log("\n[A3] Compliance verdict = WORST of loudness-vs-tolerance and true
   check("true peak EXACTLY at the ceiling (on target) reads on-target", atCeiling?.state === "on-target", atCeiling?.state);
   const overCeiling = getComplianceSummary(targetedResult(spotifyNormal, -14, -0.99));
   check("true peak a hair over the ceiling (on target) reads ceiling-limited", overCeiling?.state === "ceiling-limited", overCeiling?.state);
+
+  check("measurement and compliance precision is 0.01", MEASUREMENT_PRECISION === 0.01);
+  /** @type {[number, string][]} */
+  const roundedPeakCases = [
+    [-0.996, "-1.00 dBTP"],
+    [-0.9951, "-1.00 dBTP"],
+    [-1.004, "-1.00 dBTP"],
+  ];
+  for (const [truePeakDbtp, rendered] of roundedPeakCases) {
+    const summary = getComplianceSummary(targetedResult(spotifyNormal, -14, truePeakDbtp));
+    check(
+      `rounded true peak ${truePeakDbtp} agrees with the on-target verdict`,
+      formatPeakDbtp(truePeakDbtp) === rendered && summary?.state === "on-target",
+      `${formatPeakDbtp(truePeakDbtp)} / ${summary?.state}`,
+    );
+  }
+
+  const broadcastTarget = {
+    ...presetById("broadcast-ebu"),
+    toleranceLufs: 1,
+  };
+  for (const integratedLufs of [-24.004, -21.996]) {
+    const summary = getComplianceSummary(targetedResult(broadcastTarget, integratedLufs, -3));
+    check(
+      `rounded loudness ${integratedLufs} agrees with the on-target verdict`,
+      ["-24.00 LUFS", "-22.00 LUFS"].includes(formatLufs(integratedLufs)) &&
+        summary?.state === "on-target",
+      `${formatLufs(integratedLufs)} / ${summary?.state}`,
+    );
+  }
+
+  // Negative control: the rounding fix must not swallow a genuine miss.
+  // -24.006 still rounds to -24.01 (outside the -24/-22 window) and -0.994
+  // still rounds to -0.99 (hotter than the -1.00 ceiling).
+  const belowTargetRounded = getComplianceSummary(targetedResult(broadcastTarget, -24.006, -3));
+  check(
+    "rounded loudness -24.006 (rounds away from the boundary) reads below-target",
+    formatLufs(-24.006) === "-24.01 LUFS" && belowTargetRounded?.state === "below-target",
+    `${formatLufs(-24.006)} / ${belowTargetRounded?.state}`,
+  );
+  const ceilingLimitedRounded = getComplianceSummary(targetedResult(spotifyNormal, -14, -0.994));
+  check(
+    "rounded true peak -0.994 (rounds above the ceiling) reads ceiling-limited",
+    formatPeakDbtp(-0.994) === "-0.99 dBTP" && ceilingLimitedRounded?.state === "ceiling-limited",
+    `${formatPeakDbtp(-0.994)} / ${ceilingLimitedRounded?.state}`,
+  );
 
   // Control: on target and comfortably under the ceiling stays on-target (the fix must
   // not turn every targeted file ceiling-limited).
@@ -216,6 +302,16 @@ console.log("\n[A3] Compliance verdict = WORST of loudness-vs-tolerance and true
   const loudFirstSummary = getComplianceSummary(loudFirst);
   check("loudness-first leaves normalizationLimited=false", loudFirst.metrics.normalizationLimited === false);
   check("loudness-first on-target-loudness with peak over ceiling reads ceiling-limited", loudFirstSummary?.state === "ceiling-limited", loudFirstSummary?.state);
+}
+
+{
+  const spotifyLoud = presetById("spotify-loud");
+  check("Spotify Loud uses the -2 dBTP ceiling", spotifyLoud?.truePeakCeilingDbtp === -2);
+  check(
+    "Spotify Loud reference note states the louder-than--14 guidance",
+    spotifyLoud?.referenceNote.includes("louder than -14 LUFS") &&
+      spotifyLoud.referenceNote.includes("below -2 dBTP"),
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -291,6 +387,7 @@ console.log("\n[C] UX-004 — Modified state + Reset to Published Value");
 // ---------------------------------------------------------------------------
 console.log("\n[D] UX-004 — draft-validation gating");
 {
+  /** @type {TargetDraft} */
   const base = { presetId: CUSTOM_PRESET_ID, customTargetLufs: "-14", customTruePeak: "-1", toleranceLufs: "1", policy: "protect-true-peak" };
   check("valid custom draft resolves", resolveDraftTarget(base).isValid === true);
   check("blank tolerance is invalid", resolveDraftTarget({ ...base, toleranceLufs: "" }).isValid === false);
@@ -309,6 +406,7 @@ console.log("\n[E] UX-029 — defensible domain ranges");
   check("true-peak range is [-20, +3]", TRUE_PEAK_LIMIT_RANGE.min === -20 && TRUE_PEAK_LIMIT_RANGE.max === 3);
   check("tolerance range is (0, 10]", TOLERANCE_RANGE.min === 0 && TOLERANCE_RANGE.max === 10 && TOLERANCE_RANGE.minExclusive === true);
 
+  /** @param {Partial<TargetDraft>} patch */
   const custom = (patch) =>
     resolveDraftTarget({ presetId: CUSTOM_PRESET_ID, customTargetLufs: "-14", customTruePeak: "-1", toleranceLufs: "1", policy: "protect-true-peak", ...patch }).isValid;
 
@@ -403,6 +501,3 @@ console.log("\n[G] persistence round-trips the committed target");
   });
   check("out-of-range stored tolerance falls back to default", resolveActiveTarget(tampered.committed).id === DEFAULT_TARGET_PRESET.id);
 }
-
-console.log(`\n==== Presets: ${passed} passed, ${failed} failed ====\n`);
-process.exit(failed ? 1 : 0);

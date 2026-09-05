@@ -1,5 +1,7 @@
 import { countComplianceStates, getComplianceSummary } from "@/audio/compliance";
-import type { AnalysisJob } from "@/types/audio";
+import { resolveAnalysisProvenance } from "@/audio/session-file";
+import type { AnalysisJob, AnalysisMode, TargetPreset } from "@/types/audio";
+import type { QueueFilter, QueueSort } from "@/lib/workspace-route";
 
 export interface CompletedAnalysisJob extends AnalysisJob {
   result: NonNullable<AnalysisJob["result"]>;
@@ -34,13 +36,144 @@ const ACTIVE_STATUSES = new Set<AnalysisJob["status"]>([
   "analyzing",
 ]);
 const ISSUE_STATUSES = new Set<AnalysisJob["status"]>(["failed", "canceled"]);
+const queueCollator = new Intl.Collator("en", { numeric: true, sensitivity: "base" });
+
+export const ANALYSIS_PAUSED_LABEL = "Paused: analysis stopped";
+
+export function isPausedAnalysisJob(job: AnalysisJob) {
+  return job.status === "queued" && job.progressLabel === ANALYSIS_PAUSED_LABEL;
+}
 
 export function isActiveJob(job: AnalysisJob) {
-  return ACTIVE_STATUSES.has(job.status);
+  return ACTIVE_STATUSES.has(job.status) && !isPausedAnalysisJob(job);
 }
 
 export function isIssueJob(job: AnalysisJob) {
   return ISSUE_STATUSES.has(job.status);
+}
+
+export function isUnverifiedAnalysisJob(job: AnalysisJob) {
+  return resolveAnalysisProvenance(job).kind === "unverified-import";
+}
+
+function queueStatusRank(status: AnalysisJob["status"]) {
+  switch (status) {
+    case "analyzing":
+      return 0;
+    case "decoding":
+      return 1;
+    case "reading":
+      return 2;
+    case "queued":
+      return 3;
+    case "complete":
+      return 4;
+    case "failed":
+      return 5;
+    case "canceled":
+    default:
+      return 6;
+  }
+}
+
+export function sortQueueJobs(left: AnalysisJob, right: AnalysisJob, queueSort: QueueSort) {
+  switch (queueSort) {
+    case "oldest":
+      return left.createdAt.localeCompare(right.createdAt);
+    case "status": {
+      const statusDelta = queueStatusRank(left.status) - queueStatusRank(right.status);
+      return statusDelta || right.createdAt.localeCompare(left.createdAt);
+    }
+    case "integrated": {
+      const leftValue = left.result?.metrics.integratedValid === false
+        ? undefined
+        : left.result?.metrics.integratedLufs;
+      const rightValue = right.result?.metrics.integratedValid === false
+        ? undefined
+        : right.result?.metrics.integratedLufs;
+      return compareOptionalMetric(leftValue, rightValue, "desc") ||
+        right.createdAt.localeCompare(left.createdAt);
+    }
+    case "truePeak":
+      return compareOptionalMetric(
+        left.result?.metrics.truePeakDbtp,
+        right.result?.metrics.truePeakDbtp,
+        "desc",
+      ) || right.createdAt.localeCompare(left.createdAt);
+    case "name":
+      return queueCollator.compare(left.fileName, right.fileName);
+    case "recent":
+    default:
+      return right.createdAt.localeCompare(left.createdAt);
+  }
+}
+
+export function buildQueueSearchHaystack(job: AnalysisJob) {
+  return [
+    job.fileName,
+    job.status,
+    job.result?.metadata.decoderLabel ?? "",
+    job.result?.metadata.channelLayout.name ?? "",
+    job.result?.target?.label ?? "",
+    job.result ? getComplianceSummary(job.result)?.label ?? "" : "",
+  ].join("\n").toLowerCase();
+}
+
+export function queueJobMatchesView(
+  job: AnalysisJob,
+  queueFilter: QueueFilter,
+  normalizedSearchQuery: string,
+) {
+  const matchesFilter =
+    queueFilter === "all" ||
+    (queueFilter === "active" && isActiveJob(job)) ||
+    (queueFilter === "complete" && job.status === "complete") ||
+    (queueFilter === "issues" && isIssueJob(job));
+  return matchesFilter && (
+    !normalizedSearchQuery || buildQueueSearchHaystack(job).includes(normalizedSearchQuery)
+  );
+}
+
+export interface BatchProgress {
+  etaSeconds: number | null;
+  finished: number;
+  percent: number;
+  total: number;
+}
+
+export function deriveBatchProgress(
+  jobs: readonly AnalysisJob[],
+  parallelLimit: number,
+): BatchProgress | null {
+  if (!jobs.length) {
+    return null;
+  }
+
+  const activeJobs = jobs.filter(isActiveJob);
+  if (!activeJobs.length) {
+    return null;
+  }
+
+  const finished = jobs.length - activeJobs.length;
+  const inFlightProgress = activeJobs.reduce(
+    (sum, job) => sum + Math.min(Math.max(job.progressPercent, 0), 1),
+    0,
+  );
+  const durations = jobs
+    .filter((job) => job.status === "complete" && job.startedAtMs != null && job.finishedAtMs != null)
+    .map((job) => job.finishedAtMs! - job.startedAtMs!)
+    .sort((left, right) => left - right);
+  const median = durations.length ? durations[Math.floor(durations.length / 2)] : null;
+  const lanes = Math.max(1, parallelLimit);
+
+  return {
+    etaSeconds: median != null
+      ? Math.max(1, Math.round((Math.ceil(activeJobs.length / lanes) * median) / 1000))
+      : null,
+    finished,
+    percent: ((finished + inFlightProgress) / jobs.length) * 100,
+    total: jobs.length,
+  };
 }
 
 export function getCompletedAnalysisJobs(jobs: AnalysisJob[]) {
@@ -49,6 +182,10 @@ export function getCompletedAnalysisJobs(jobs: AnalysisJob[]) {
 
 export function hasValidIntegratedMeasurement(job: AnalysisJob) {
   return job.result != null && job.result.metrics.integratedValid !== false;
+}
+
+function hasValidLoudnessRange(job: AnalysisJob) {
+  return job.result != null && job.result.metrics.loudnessRangeValid !== false;
 }
 
 export function countQueueJobs(jobs: AnalysisJob[]) {
@@ -82,18 +219,6 @@ export function averageIntegratedLufs(jobs: AnalysisJob[]) {
   return count ? sum / count : null;
 }
 
-export function highestTruePeakDbtp(jobs: AnalysisJob[]) {
-  let max: number | null = null;
-  for (const job of jobs) {
-    const value = job.result?.metrics.truePeakDbtp;
-    if (value != null && (max == null || value > max)) {
-      max = value;
-    }
-  }
-
-  return max;
-}
-
 export function getAttentionJobs(jobs: CompletedAnalysisJob[]) {
   return jobs.filter((job) => {
     if (job.result.metrics.integratedValid === false) {
@@ -104,11 +229,11 @@ export function getAttentionJobs(jobs: CompletedAnalysisJob[]) {
   });
 }
 
-export function getComplianceCounts(jobs: CompletedAnalysisJob[]) {
+function getComplianceCounts(jobs: CompletedAnalysisJob[]) {
   return countComplianceStates(jobs);
 }
 
-export function getDecoderMix(jobs: CompletedAnalysisJob[]) {
+function getDecoderMix(jobs: CompletedAnalysisJob[]) {
   const buckets = new Map<string, number>();
 
   jobs.forEach((job) => {
@@ -157,15 +282,18 @@ export function getLoudestJob(jobs: CompletedAnalysisJob[]) {
   );
 }
 
-export function getHottestPeakJob(jobs: CompletedAnalysisJob[]) {
+function getHottestPeakJob(jobs: CompletedAnalysisJob[]) {
   return pickExtreme(jobs, (job) => job.result.metrics.truePeakDbtp);
 }
 
 export function getWidestRangeJob(jobs: CompletedAnalysisJob[]) {
-  return pickExtreme(jobs, (job) => job.result.metrics.loudnessRange);
+  return pickExtreme(
+    jobs.filter(hasValidLoudnessRange),
+    (job) => job.result.metrics.loudnessRange,
+  );
 }
 
-export function getLongestJob(jobs: CompletedAnalysisJob[]) {
+function getLongestJob(jobs: CompletedAnalysisJob[]) {
   return pickExtreme(jobs, (job) => job.result.metadata.durationSeconds);
 }
 
@@ -191,7 +319,7 @@ export function getLargestMoveJob(jobs: CompletedAnalysisJob[]) {
   );
 }
 
-export function getClosestToTargetJob(jobs: CompletedAnalysisJob[], targetLufs: number | null) {
+function getClosestToTargetJob(jobs: CompletedAnalysisJob[], targetLufs: number | null) {
   if (targetLufs == null) {
     return null;
   }
@@ -203,11 +331,11 @@ export function getClosestToTargetJob(jobs: CompletedAnalysisJob[], targetLufs: 
   );
 }
 
-export function getSessionSampleRates(jobs: CompletedAnalysisJob[]) {
+function getSessionSampleRates(jobs: CompletedAnalysisJob[]) {
   return [...new Set(jobs.map((job) => job.result.metadata.sampleRate))].sort((a, b) => a - b);
 }
 
-export function getSessionChannelLayouts(jobs: CompletedAnalysisJob[]) {
+function getSessionChannelLayouts(jobs: CompletedAnalysisJob[]) {
   return [...new Set(jobs.map((job) => job.result.metadata.channelLayout.name))];
 }
 
@@ -250,11 +378,14 @@ export function getTargetedFocusJobs(jobs: CompletedAnalysisJob[]) {
   });
 }
 
-export function getMeasureOnlyFocusJobs(jobs: CompletedAnalysisJob[]) {
+function getMeasureOnlyFocusJobs(jobs: CompletedAnalysisJob[]) {
   const seen = new Set<string>();
   const ordered = [
     ...sortByMetric(jobs, (job) => job.result.metrics.truePeakDbtp),
-    ...sortByMetric(jobs, (job) => job.result.metrics.loudnessRange),
+    ...sortByMetric(
+      jobs.filter(hasValidLoudnessRange),
+      (job) => job.result.metrics.loudnessRange,
+    ),
     ...sortByMetric(
       jobs.filter(hasValidIntegratedMeasurement),
       (job) => job.result.metrics.integratedLufs,
@@ -269,3 +400,64 @@ export function getMeasureOnlyFocusJobs(jobs: CompletedAnalysisJob[]) {
     return true;
   });
 }
+
+function average(values: number[]) {
+  return values.length
+    ? values.reduce((sum, value) => sum + value, 0) / values.length
+    : null;
+}
+
+export function deriveSessionStats(
+  jobs: AnalysisJob[],
+  currentTarget: TargetPreset | null,
+  analysisMode: AnalysisMode,
+) {
+  const readyJobs = getCompletedAnalysisJobs(jobs);
+  const quietestJob = getQuietestJob(readyJobs);
+  const hottestPeakJob = getHottestPeakJob(readyJobs);
+  const widestRangeJob = getWidestRangeJob(readyJobs);
+  const longestJob = getLongestJob(readyJobs);
+  const largestMoveJob = getLargestMoveJob(readyJobs);
+  const attentionJobs = getAttentionJobs(readyJobs);
+  const complianceCounts = getComplianceCounts(readyJobs);
+
+  return {
+    attentionJobs,
+    averageIntegrated: averageIntegratedLufs(readyJobs),
+    averageMove: average(
+      readyJobs
+        .map((job) => job.result.metrics.targetDeltaDb)
+        .filter((value): value is number => value != null),
+    ),
+    averagePeak: average(readyJobs.map((job) => job.result.metrics.truePeakDbtp)),
+    ceilingLimitedJobs: readyJobs.filter(
+      (job) => getComplianceSummary(job.result)?.state === "ceiling-limited",
+    ),
+    channelLayouts: getSessionChannelLayouts(readyJobs),
+    closestToTargetJob: getClosestToTargetJob(
+      readyJobs,
+      analysisMode === "targeted" && currentTarget
+        ? currentTarget.loudnessTargetLufs
+        : null,
+    ),
+    complianceCounts,
+    decoderMix: getDecoderMix(readyJobs),
+    highestProjectedPeak: getHighestProjectedPeakJob(readyJobs),
+    hottestPeakJob,
+    invalidIntegratedCount: readyJobs.filter(
+      (job) => job.result.metrics.integratedValid === false,
+    ).length,
+    largestMoveJob,
+    longestJob,
+    loudestJob: getLoudestJob(readyJobs),
+    measureOnlyFocusJobs: getMeasureOnlyFocusJobs(readyJobs).slice(0, 4),
+    quietestJob,
+    readyJobs,
+    sampleRates: getSessionSampleRates(readyJobs),
+    targetedFocusJobs: getTargetedFocusJobs(readyJobs).slice(0, 4),
+    unverifiedCount: readyJobs.filter(isUnverifiedAnalysisJob).length,
+    widestRangeJob,
+  };
+}
+
+export type SessionStats = ReturnType<typeof deriveSessionStats>;

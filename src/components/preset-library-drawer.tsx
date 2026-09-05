@@ -1,10 +1,10 @@
 "use client";
 
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState, type FormEvent } from "react";
 import { Check, ChevronLeft, ChevronRight } from "lucide-react";
 import { CUSTOM_PRESET_ID, TARGET_PRESETS, type TargetDraftErrors } from "@/audio/presets";
 import { DrawerPanel } from "@/components/drawer-panel";
-import { PresetDetailPane } from "@/components/preset-detail-pane";
+import { PRESET_TARGET_FORM_ID, PresetDetailPane, type TargetFieldKey } from "@/components/preset-detail-pane";
 import { PresetListPane } from "@/components/preset-list-pane";
 import {
   formatTargetDbtp,
@@ -18,7 +18,7 @@ import type { TargetPreset } from "@/types/audio";
 
 // Field errors listed in DOM/visual order so the summary and first-error focus
 // walk them the same way the eye does.
-const ERROR_FIELDS: Array<{ key: keyof TargetDraftErrors; name: string; label: string }> = [
+const ERROR_FIELDS: Array<{ key: TargetFieldKey; name: string; label: string }> = [
   { key: "customTargetLufs", name: "custom-target-lufs", label: "Loudness Target" },
   { key: "customTruePeak", name: "custom-true-peak", label: "True Peak Limit" },
   { key: "toleranceLufs", name: "target-tolerance", label: "Target Tolerance" },
@@ -33,8 +33,9 @@ const ERROR_FIELDS: Array<{ key: keyof TargetDraftErrors; name: string; label: s
  * gate Apply / Cancel / Reset so an invalid draft never silently takes effect.
  *
  * `initialFocusError` lets the workbench force the open-at-first-error behavior
- * (UX-008). When omitted, the drawer still auto-focuses the first invalid field
- * whenever it opens with a draft that already has errors.
+ * (UX-008), treating the open as an Apply attempt so the error is shown and
+ * focused 80ms later. Without it, opening with a stale invalid draft stays
+ * silent until a field is touched or Apply is attempted (UX-02).
  */
 interface PresetLibraryDrawerProps {
   open: boolean;
@@ -66,7 +67,6 @@ export function PresetLibraryDrawer({
   open,
   onClose,
   activeTarget,
-  draftTarget,
   fieldErrors,
   draftStatusMessage,
   draftIsValid,
@@ -103,26 +103,69 @@ export function PresetLibraryDrawer({
   const pendingStepFocusRef = useRef<"list" | "detail" | null>(null);
   const detailHeadingRef = useRef<HTMLHeadingElement | null>(null);
 
-  const activeErrors = ERROR_FIELDS.filter((field) => fieldErrors?.[field.key]);
-  const hasFieldErrors = activeErrors.length > 0;
+  // Live validation errors (resolveDraftTarget, unchanged) vs. what is actually
+  // displayed/announced (UX-02): a field's error only counts as "displayed"
+  // once it has been touched (blurred) or an Apply attempt has been made.
+  const hasFieldErrors = ERROR_FIELDS.some((field) => fieldErrors?.[field.key]);
+  const [touched, setTouched] = useState<Partial<Record<TargetFieldKey, boolean>>>({});
+  const [applyAttempted, setApplyAttempted] = useState(false);
+  const displayedErrors = ERROR_FIELDS.filter(
+    (field) => fieldErrors?.[field.key] && (applyAttempted || touched[field.key]),
+  );
+  const hasDisplayedErrors = displayedErrors.length > 0;
 
-  // Keep the newest error/force-focus state in refs so the open effect can read
-  // it while depending only on `open` (it must fire once per open, not per edit).
-  const shouldFocusOnOpenRef = useRef(false);
+  const handleFieldBlur = (field: TargetFieldKey) => {
+    setTouched((current) => (current[field] ? current : { ...current, [field]: true }));
+  };
+
+  const handleDetailSubmit = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!draftIsValid) {
+      setApplyAttempted(true);
+      return;
+    }
+    onApply();
+  };
+
+  // Reset touched/apply-attempt state whenever the drawer closes or the
+  // preset selection changes (UX-02): each fresh editing context starts
+  // silent again instead of carrying over what a previous field said.
   useEffect(() => {
-    shouldFocusOnOpenRef.current = hasFieldErrors || Boolean(initialFocusError);
+    setTouched({});
+    setApplyAttempted(false);
+  }, [open, selectedPresetId]);
+
+  // `initialFocusError` is a one-shot, caller-driven "open at the first error"
+  // signal (UX-008) - kept in a ref so the open effect below can read its
+  // latest value while depending only on `open`.
+  const initialFocusErrorRef = useRef(false);
+  useEffect(() => {
+    initialFocusErrorRef.current = Boolean(initialFocusError);
   });
 
-  // First-error focus on open (UX-008). The delay clears DrawerPanel's own
-  // initial focus (it focuses Close on a 0ms timer) so the error wins.
+  // Land on the detail step (and treat it as an Apply attempt) only when the
+  // caller explicitly asked to open at the first error. Merely opening with a
+  // stale invalid draft must stay silent until the user touches something
+  // (UX-02) - that used to also trigger this via `hasFieldErrors`.
   useEffect(() => {
     if (!open) {
       return;
     }
-    const focusFirstError = shouldFocusOnOpenRef.current;
-    setMobileView(focusFirstError ? "detail" : "list");
     listScrollTopRef.current = 0;
-    if (!focusFirstError) {
+    if (!initialFocusErrorRef.current) {
+      setMobileView("list");
+      return;
+    }
+    setMobileView("detail");
+    setApplyAttempted(true);
+  }, [open]);
+
+  // First-error focus, 80ms after any Apply attempt (UX-008) - whether that
+  // came from `initialFocusError` on open or a submit while invalid in this
+  // drawer. The delay clears DrawerPanel's own initial focus (it focuses
+  // Close on a 0ms timer) so the error wins.
+  useEffect(() => {
+    if (!applyAttempted) {
       return;
     }
     const timer = window.setTimeout(() => {
@@ -133,7 +176,7 @@ export function PresetLibraryDrawer({
       }
     }, 80);
     return () => window.clearTimeout(timer);
-  }, [open]);
+  }, [applyAttempted]);
 
   // Restore the preserved list scroll position when returning to it (mobile).
   useLayoutEffect(() => {
@@ -246,35 +289,37 @@ export function PresetLibraryDrawer({
           </div>
         </div>
 
-        {/* Error summary near the top (UX-008); role=alert announces the issue. */}
-        {hasFieldErrors ? (
-          <div
-            role="alert"
-            className="mt-4 shrink-0 rounded-2xl border tone-danger px-4 py-3"
-          >
-            <div className="text-sm font-semibold">Fix these settings to apply</div>
-            {draftStatusMessage ? (
-              <p className="mt-1 text-sm leading-6">{draftStatusMessage}</p>
-            ) : null}
-            <ul className="mt-2 space-y-1">
-              {activeErrors.map((field) => (
-                <li key={field.key}>
-                  <button
-                    type="button"
-                    onClick={() => requestFieldFocus(field.name)}
-                    className="text-left text-sm underline underline-offset-2 hover:no-underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--danger)]"
-                  >
-                    {field.label}: {fieldErrors?.[field.key]}
-                  </button>
-                </li>
-              ))}
-            </ul>
-          </div>
-        ) : null}
+        {/* Error summary near the top (UX-008/UX-02): stays mounted the whole
+            time the drawer is open so aria-live="polite" reliably announces
+            new errors, and only shows errors for touched fields or after an
+            Apply attempt - never merely because they exist. */}
+        <div aria-live="polite" className="shrink-0 empty:hidden">
+          {hasDisplayedErrors ? (
+            <div className="mt-4 rounded-2xl border tone-danger px-4 py-3">
+              <div className="text-sm font-semibold">Fix these settings to apply</div>
+              {draftStatusMessage ? (
+                <p className="mt-1 text-sm leading-6">{draftStatusMessage}</p>
+              ) : null}
+              <ul className="mt-2 space-y-1">
+                {displayedErrors.map((field) => (
+                  <li key={field.key}>
+                    <button
+                      type="button"
+                      onClick={() => requestFieldFocus(field.name)}
+                      className="text-left text-sm underline underline-offset-2 hover:no-underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--danger)]"
+                    >
+                      {field.label}: {fieldErrors?.[field.key]}
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          ) : null}
+        </div>
 
         {/* Mobile-only back affordance; hidden once the master/detail layout kicks in. */}
         {mobileView === "detail" ? (
-          <div className="mt-4 shrink-0 @[46rem]:hidden">
+          <div className="mt-4 shrink-0 @[44rem]:hidden">
             <button
               type="button"
               onClick={handleBack}
@@ -287,14 +332,14 @@ export function PresetLibraryDrawer({
         ) : null}
 
         {/* Master / detail. Container-query driven, never viewport (UX-002). */}
-        <div className="mt-4 flex min-h-0 flex-1 flex-col @[46rem]:flex-row @[46rem]:gap-5">
+        <div className="mt-4 flex min-h-0 flex-1 flex-col @[44rem]:flex-row @[44rem]:gap-5">
           <PresetListPane
             selectedPresetId={selectedPresetId}
             onSelect={handleSelect}
             scrollRef={listScrollRef}
             className={cn(
-              "min-h-0 flex-1 @[46rem]:w-80 @[46rem]:flex-none",
-              mobileView === "detail" ? "hidden @[46rem]:block" : "block",
+              "min-h-0 flex-1 @[44rem]:w-80 @[44rem]:flex-none",
+              mobileView === "detail" ? "hidden @[44rem]:block" : "block",
             )}
           />
           <PresetDetailPane
@@ -305,25 +350,29 @@ export function PresetLibraryDrawer({
             policy={policy}
             fieldErrors={fieldErrors}
             draftIsModified={draftIsModified}
+            touchedFields={touched}
+            showAllErrors={applyAttempted}
             onToleranceChange={onToleranceChange}
             onCustomTargetLufsChange={onCustomTargetLufsChange}
             onCustomTruePeakChange={onCustomTruePeakChange}
             onPolicyChange={onPolicyChange}
+            onFieldBlur={handleFieldBlur}
             onResetToPublished={onResetToPublished}
+            onSubmit={handleDetailSubmit}
             headingRef={detailHeadingRef}
             className={cn(
               "min-h-0 flex-1",
-              mobileView === "list" ? "hidden @[46rem]:block" : "block",
+              mobileView === "list" ? "hidden @[44rem]:block" : "block",
             )}
           />
         </div>
 
         {/* Keyboard (and any non-pointer) route into the detail step. Selecting
             with the arrow keys deliberately stays on the list, so without this
-            the detail pane would be unreachable below 46rem. Hidden once both
+            the detail pane would be unreachable below 44rem. Hidden once both
             panes are on screen together. */}
         {mobileView === "list" ? (
-          <div className="mt-3 shrink-0 @[46rem]:hidden">
+          <div className="mt-3 shrink-0 @[44rem]:hidden">
             <Button
               type="button"
               size="sm"
@@ -354,12 +403,12 @@ export function PresetLibraryDrawer({
             Cancel
           </Button>
           <Button
-            type="button"
-            onClick={onApply}
+            type="submit"
+            form={PRESET_TARGET_FORM_ID}
             disabled={!draftIsDirty || !draftIsValid}
-            className="flex-1 @[30rem]:flex-none"
+            className="min-w-0 flex-1 whitespace-normal text-balance @[30rem]:flex-none"
           >
-            <Check className="h-4 w-4" aria-hidden="true" />
+            <Check className="h-4 w-4 shrink-0" aria-hidden="true" />
             Apply {applyLabel}
           </Button>
         </div>

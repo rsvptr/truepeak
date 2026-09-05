@@ -3,6 +3,7 @@
 import { useEffect, useId, useMemo, useRef, useState } from "react";
 import uPlot from "uplot";
 import { ChevronDown, ChevronUp, Download, RotateCcw, ZoomIn, ZoomOut } from "lucide-react";
+import { useMediaQuery } from "@/hooks/use-media-query";
 import { fileNameTimestamp, formatDuration, formatLufs, formatPeakDbtp } from "@/lib/format";
 import { downloadTextFile } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
@@ -38,7 +39,7 @@ function readThemeToken(name: string, fallback: string) {
   return value || fallback;
 }
 
-function minMax(values: number[]) {
+function minMax(values: Iterable<number>) {
   let min = Infinity;
   let max = -Infinity;
   for (const value of values) {
@@ -60,6 +61,33 @@ function clamp(value: number, low: number, high: number) {
   return Math.min(Math.max(value, low), high);
 }
 
+// Legend value formatter shared by all three series. Replaces the previous
+// `.map(v => Number(v.toFixed(2)))` passes over the whole series (PERF-10):
+// same rounding (toFixed(2)) and the same uPlot.fmtNum rendering, just done
+// lazily per legend read instead of once for every point on every rebuild.
+function formatSeriesLegendValue(
+  _self: uPlot,
+  rawValue: number | null,
+  _seriesIdx: number,
+  dataIdx: number | null,
+) {
+  if (dataIdx == null) {
+    return "--";
+  }
+  if (rawValue == null || !Number.isFinite(rawValue)) {
+    return "";
+  }
+  return uPlot.fmtNum(Number(rawValue.toFixed(2)));
+}
+
+// uPlot treats a point as a gap only when it is `null` (`v != null`); it never
+// tests for NaN, so the NaN sentinels the typed loudness series carry would be
+// fed into the y-scale min/max and blank the chart. Translate them once per
+// timeline on the way into uPlot. Exported for `validate-render-smoke.mjs`.
+export function toNullGappedSeries(series: ArrayLike<number>): Array<number | null> {
+  return Array.from(series, (value) => (Number.isFinite(value) ? value : null));
+}
+
 export function TimelineChart({ timeline }: TimelineChartProps) {
   const loudnessContainerRef = useRef<HTMLDivElement | null>(null);
   const peakContainerRef = useRef<HTMLDivElement | null>(null);
@@ -74,6 +102,18 @@ export function TimelineChart({ timeline }: TimelineChartProps) {
   // Zoom/pan carried across a rebuild (theme toggle, pointer-type change).
   // Written by the effect's cleanup, read by the next effect body.
   const lastScaleRef = useRef<XDomain | null>(null);
+  // Cursor readout cells. Their text is written imperatively from uPlot's
+  // setCursor hook rather than through React state: the hook fires on every
+  // pointer move, and a re-render would rebuild the data table (up to 200
+  // rows) each time. React only rewrites these nodes when the JSX values
+  // below change, which happens when a new timeline arrives.
+  const loudnessTimeRef = useRef<HTMLElement | null>(null);
+  const loudnessMomentaryRef = useRef<HTMLElement | null>(null);
+  const loudnessShortTermRef = useRef<HTMLElement | null>(null);
+  const loudnessStatusRef = useRef<HTMLParagraphElement | null>(null);
+  const peakTimeRef = useRef<HTMLElement | null>(null);
+  const peakValueRef = useRef<HTMLElement | null>(null);
+  const peakStatusRef = useRef<HTMLParagraphElement | null>(null);
 
   const summaryId = useId();
   const tableId = useId();
@@ -97,18 +137,10 @@ export function TimelineChart({ timeline }: TimelineChartProps) {
 
   // Drag-to-zoom on a touch screen fights with native scroll panning, so it's
   // disabled for coarse pointers in favour of the explicit zoom buttons
-  // below (which remain available to every input type).
-  const [isCoarsePointer, setIsCoarsePointer] = useState(false);
-  useEffect(() => {
-    if (typeof window === "undefined" || !window.matchMedia) {
-      return;
-    }
-    const query = window.matchMedia("(pointer: coarse)");
-    setIsCoarsePointer(query.matches);
-    const handleChange = (event: MediaQueryListEvent) => setIsCoarsePointer(event.matches);
-    query.addEventListener("change", handleChange);
-    return () => query.removeEventListener("change", handleChange);
-  }, []);
+  // below (which remain available to every input type). Hydration-safe
+  // (MOB-15): reads matchMedia during render, so this never flips after mount
+  // and rebuilds the uPlot instances.
+  const isCoarsePointer = useMediaQuery("(pointer: coarse)");
 
   // uPlot reads its axis/series colours from CSS custom properties once, at
   // creation. Watch the document theme so a light/dark toggle restyles the charts.
@@ -172,8 +204,8 @@ export function TimelineChart({ timeline }: TimelineChartProps) {
       rows.push({
         index,
         timeSeconds: timeSeconds[index],
-        momentaryLufs: momentaryLufs[index] ?? null,
-        shortTermLufs: shortTermLufs[index] ?? null,
+        momentaryLufs: Number.isFinite(momentaryLufs[index]) ? momentaryLufs[index] : null,
+        shortTermLufs: Number.isFinite(shortTermLufs[index]) ? shortTermLufs[index] : null,
         truePeakDbtp: truePeakDbtp[index],
       });
     }
@@ -183,8 +215,8 @@ export function TimelineChart({ timeline }: TimelineChartProps) {
       rows.push({
         index: lastIndex,
         timeSeconds: timeSeconds[lastIndex],
-        momentaryLufs: momentaryLufs[lastIndex] ?? null,
-        shortTermLufs: shortTermLufs[lastIndex] ?? null,
+        momentaryLufs: Number.isFinite(momentaryLufs[lastIndex]) ? momentaryLufs[lastIndex] : null,
+        shortTermLufs: Number.isFinite(shortTermLufs[lastIndex]) ? shortTermLufs[lastIndex] : null,
         truePeakDbtp: truePeakDbtp[lastIndex],
       });
     }
@@ -193,6 +225,13 @@ export function TimelineChart({ timeline }: TimelineChartProps) {
   }, [timeline]);
 
   const isTableDownsampled = tableRows.length < timeline.timeSeconds.length;
+
+  // Keyed on the timeline object so a theme toggle or resize reuses the same
+  // converted arrays instead of copying both series again.
+  const loudnessSeries = useMemo(
+    () => [toNullGappedSeries(timeline.momentaryLufs), toNullGappedSeries(timeline.shortTermLufs)],
+    [timeline],
+  );
 
   useEffect(() => {
     const loudnessContainer = loudnessContainerRef.current;
@@ -221,13 +260,6 @@ export function TimelineChart({ timeline }: TimelineChartProps) {
     peakContainer.innerHTML = "";
 
     const x = timeline.timeSeconds;
-    const momentary = timeline.momentaryLufs.map((value) =>
-      value == null ? null : Number(value.toFixed(2)),
-    );
-    const shortTerm = timeline.shortTermLufs.map((value) =>
-      value == null ? null : Number(value.toFixed(2)),
-    );
-    const truePeak = timeline.truePeakDbtp.map((value) => Number(value.toFixed(2)));
     const loudnessHeight = 250;
     const peakHeight = 220;
     // Keep the floor low enough for narrow phones (the deepest nesting leaves
@@ -266,6 +298,47 @@ export function TimelineChart({ timeline }: TimelineChartProps) {
 
     const dragEnabled = !isCoarsePointer;
 
+    // Cursor readout (MOB-11). uPlot's own legend needs a hover, which a touch
+    // screen cannot produce, so the values at the cursor are mirrored into a
+    // row under each chart. The last cursor position stays on screen after the
+    // pointer leaves, so there is always a value to read.
+    const setText = (node: HTMLElement | null, text: string) => {
+      if (node && node.textContent !== text) {
+        node.textContent = text;
+      }
+    };
+    let loudnessCursorIndex = x.length - 1;
+    let peakCursorIndex = x.length - 1;
+
+    const showLoudnessAt = (index: number) => {
+      loudnessCursorIndex = index;
+      setText(loudnessTimeRef.current, formatDuration(x[index]));
+      setText(loudnessMomentaryRef.current, formatLufs(loudnessSeries[0][index]));
+      setText(loudnessShortTermRef.current, formatLufs(loudnessSeries[1][index]));
+    };
+    const showPeakAt = (index: number) => {
+      peakCursorIndex = index;
+      setText(peakTimeRef.current, formatDuration(x[index]));
+      setText(peakValueRef.current, formatPeakDbtp(timeline.truePeakDbtp[index]));
+    };
+
+    // Announced only when an interaction ends (touch end, mouse leave), not on
+    // every move, so the live region does not flood a screen reader.
+    const announceLoudness = () => {
+      const index = loudnessCursorIndex;
+      setText(
+        loudnessStatusRef.current,
+        `Loudness at ${formatDuration(x[index])}: momentary ${formatLufs(loudnessSeries[0][index])}, short-term ${formatLufs(loudnessSeries[1][index])}.`,
+      );
+    };
+    const announcePeak = () => {
+      const index = peakCursorIndex;
+      setText(
+        peakStatusRef.current,
+        `True peak at ${formatDuration(x[index])}: ${formatPeakDbtp(timeline.truePeakDbtp[index])}.`,
+      );
+    };
+
     loudnessPlotRef.current = new uPlot(
       {
         width: Math.max(loudnessContainer.clientWidth, minChartWidth),
@@ -298,6 +371,7 @@ export function TimelineChart({ timeline }: TimelineChartProps) {
             width: 2,
             spanGaps: false,
             show: loudnessSeriesShownRef.current[0],
+            value: formatSeriesLegendValue,
           },
           {
             label: "Short-term (LUFS)",
@@ -305,10 +379,19 @@ export function TimelineChart({ timeline }: TimelineChartProps) {
             width: 2,
             spanGaps: false,
             show: loudnessSeriesShownRef.current[1],
+            value: formatSeriesLegendValue,
           },
         ],
         hooks: {
           setScale: [makeSyncHook(() => peakPlotRef.current)],
+          setCursor: [
+            (plot) => {
+              const index = plot.cursor.idx;
+              if (index != null) {
+                showLoudnessAt(index);
+              }
+            },
+          ],
           // Mirror a legend click back into React so the accessible toggles
           // below never disagree with what the chart is actually drawing.
           setSeries: [
@@ -324,7 +407,7 @@ export function TimelineChart({ timeline }: TimelineChartProps) {
           ],
         },
       },
-      [x, momentary, shortTerm],
+      [x, loudnessSeries[0], loudnessSeries[1]],
       loudnessContainer,
     );
 
@@ -359,13 +442,22 @@ export function TimelineChart({ timeline }: TimelineChartProps) {
             stroke: readThemeToken("--chart-truepeak", "#ff9c55"),
             width: 2,
             spanGaps: true,
+            value: formatSeriesLegendValue,
           },
         ],
         hooks: {
           setScale: [makeSyncHook(() => loudnessPlotRef.current)],
+          setCursor: [
+            (plot) => {
+              const index = plot.cursor.idx;
+              if (index != null) {
+                showPeakAt(index);
+              }
+            },
+          ],
         },
       },
-      [x, truePeak],
+      [x, timeline.truePeakDbtp],
       peakContainer,
     );
 
@@ -380,7 +472,69 @@ export function TimelineChart({ timeline }: TimelineChartProps) {
       });
     }
 
-    const resizeObserver = new ResizeObserver(() => {
+    // uPlot moves its cursor from mouse events only, so on a touch screen the
+    // cursor never moves and the readout above would stay on the last sample
+    // (MOB-11). Map a drag on the plot area onto setCursor, which fires the
+    // hooks above. The listeners live on uPlot's own overlay element and go
+    // away with it when the plot is destroyed below.
+    const wireCursorInput = (plot: uPlot, announce: () => void) => {
+      const over = plot.over;
+      let startX = 0;
+      let startY = 0;
+
+      const moveCursorTo = (touch: Touch) => {
+        const bounds = over.getBoundingClientRect();
+        plot.setCursor({ left: touch.clientX - bounds.left, top: touch.clientY - bounds.top });
+      };
+
+      over.addEventListener("mouseleave", announce);
+      if (!isCoarsePointer) {
+        return;
+      }
+
+      over.addEventListener(
+        "touchstart",
+        (event) => {
+          const touch = event.touches[0];
+          if (!touch) {
+            return;
+          }
+          startX = touch.clientX;
+          startY = touch.clientY;
+          moveCursorTo(touch);
+        },
+        { passive: false },
+      );
+      over.addEventListener(
+        "touchmove",
+        (event) => {
+          const touch = event.touches[0];
+          if (!touch) {
+            return;
+          }
+          // `.u-over` is `touch-action: pan-y`, so a vertical drag still
+          // scrolls the page; claim the gesture only once it is mostly
+          // horizontal.
+          if (Math.abs(touch.clientX - startX) > Math.abs(touch.clientY - startY) && event.cancelable) {
+            event.preventDefault();
+          }
+          moveCursorTo(touch);
+        },
+        { passive: false },
+      );
+      over.addEventListener("touchend", announce);
+    };
+
+    wireCursorInput(loudnessPlotRef.current, announceLoudness);
+    wireCursorInput(peakPlotRef.current, announcePeak);
+
+    // rAF-throttled: a CSS width transition (drawer open/close, sidebar
+    // resize) fires the observer once per frame, and each callback used to
+    // trigger a full uPlot redraw on both charts. Coalesce to at most one
+    // setSize per animation frame (PERF-10).
+    let resizeFrame: number | null = null;
+    const applyResize = () => {
+      resizeFrame = null;
       if (!loudnessContainerRef.current || !peakContainerRef.current) {
         return;
       }
@@ -393,12 +547,22 @@ export function TimelineChart({ timeline }: TimelineChartProps) {
         width: Math.max(peakContainerRef.current.clientWidth, minChartWidth),
         height: peakHeight,
       });
+    };
+    const resizeObserver = new ResizeObserver(() => {
+      if (resizeFrame != null) {
+        cancelAnimationFrame(resizeFrame);
+      }
+      resizeFrame = requestAnimationFrame(applyResize);
     });
 
     resizeObserver.observe(loudnessContainer);
     resizeObserver.observe(peakContainer);
     return () => {
       resizeObserver.disconnect();
+      if (resizeFrame != null) {
+        cancelAnimationFrame(resizeFrame);
+        resizeFrame = null;
+      }
       // Stash the current zoom before the instances go away. This is the only
       // point at which it is still readable: the next effect body runs after
       // this cleanup has already nulled the refs.
@@ -412,7 +576,7 @@ export function TimelineChart({ timeline }: TimelineChartProps) {
       loudnessPlotRef.current = null;
       peakPlotRef.current = null;
     };
-  }, [timeline, themeVersion, isCoarsePointer]);
+  }, [timeline, loudnessSeries, themeVersion, isCoarsePointer]);
 
   const applyZoom = (factor: number) => {
     const domain = xDomainRef.current;
@@ -467,16 +631,20 @@ export function TimelineChart({ timeline }: TimelineChartProps) {
     loudnessPlotRef.current?.setSeries(seriesIndex + 1, { show: next });
   };
 
+  // Starting values for the readout row under each chart: the last sample,
+  // until a pointer moves the cursor.
+  const lastSampleIndex = timeline.timeSeconds.length - 1;
+
   const downloadTimelineCsv = () => {
     const { timeSeconds, momentaryLufs, shortTermLufs, truePeakDbtp } = timeline;
-    const rows = timeSeconds.map((time, index) => {
+    const rows = Array.from(timeSeconds, (time, index) => {
       const momentary = momentaryLufs[index];
       const shortTerm = shortTermLufs[index];
       const peak = truePeakDbtp[index];
       return [
         time.toFixed(3),
-        momentary == null ? "" : momentary.toFixed(2),
-        shortTerm == null ? "" : shortTerm.toFixed(2),
+        Number.isFinite(momentary) ? momentary.toFixed(2) : "",
+        Number.isFinite(shortTerm) ? shortTerm.toFixed(2) : "",
         Number.isFinite(peak) ? peak.toFixed(2) : "",
       ].join(",");
     });
@@ -522,7 +690,6 @@ export function TimelineChart({ timeline }: TimelineChartProps) {
             variant="ghost"
             aria-pressed={loudnessSeriesShown[index]}
             onClick={() => toggleLoudnessSeries(index as 0 | 1)}
-            className={loudnessSeriesShown[index] ? undefined : "opacity-60"}
           >
             <span
               aria-hidden="true"
@@ -554,6 +721,30 @@ export function TimelineChart({ timeline }: TimelineChartProps) {
             className="min-h-[250px] min-w-[240px]"
           />
         </div>
+        <dl
+          data-timeline-readout="loudness"
+          className="mt-2 flex flex-wrap items-baseline gap-x-4 gap-y-1 border-t border-[var(--line)]/60 pt-2 text-xs tabular-nums text-[var(--muted)]"
+        >
+          <div className="flex items-baseline gap-1.5">
+            <dt>Time</dt>
+            <dd ref={loudnessTimeRef} className="text-[var(--ink)]">
+              {formatDuration(timeline.timeSeconds[lastSampleIndex])}
+            </dd>
+          </div>
+          <div className="flex items-baseline gap-1.5">
+            <dt>Momentary</dt>
+            <dd ref={loudnessMomentaryRef} className="text-[var(--ink)]">
+              {formatLufs(timeline.momentaryLufs[lastSampleIndex])}
+            </dd>
+          </div>
+          <div className="flex items-baseline gap-1.5">
+            <dt>Short-term</dt>
+            <dd ref={loudnessShortTermRef} className="text-[var(--ink)]">
+              {formatLufs(timeline.shortTermLufs[lastSampleIndex])}
+            </dd>
+          </div>
+        </dl>
+        <p ref={loudnessStatusRef} role="status" className="sr-only" />
       </div>
       <div className="rounded-[24px] border border-[var(--line)] bg-[var(--surface-1)] p-3">
         <div className="overflow-x-auto overscroll-x-contain">
@@ -565,6 +756,24 @@ export function TimelineChart({ timeline }: TimelineChartProps) {
             className="min-h-[220px] min-w-[240px]"
           />
         </div>
+        <dl
+          data-timeline-readout="peak"
+          className="mt-2 flex flex-wrap items-baseline gap-x-4 gap-y-1 border-t border-[var(--line)]/60 pt-2 text-xs tabular-nums text-[var(--muted)]"
+        >
+          <div className="flex items-baseline gap-1.5">
+            <dt>Time</dt>
+            <dd ref={peakTimeRef} className="text-[var(--ink)]">
+              {formatDuration(timeline.timeSeconds[lastSampleIndex])}
+            </dd>
+          </div>
+          <div className="flex items-baseline gap-1.5">
+            <dt>True peak</dt>
+            <dd ref={peakValueRef} className="text-[var(--ink)]">
+              {formatPeakDbtp(timeline.truePeakDbtp[lastSampleIndex])}
+            </dd>
+          </div>
+        </dl>
+        <p ref={peakStatusRef} role="status" className="sr-only" />
       </div>
 
       <details

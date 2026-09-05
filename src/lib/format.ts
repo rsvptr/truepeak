@@ -1,6 +1,9 @@
 import type { IntegratedInvalidReason, LoudnessMetrics } from "@/types/audio";
 
-const NEGATIVE_FLOOR = -144;
+export const MEASUREMENT_PRECISION = 0.01;
+const PEAK_SILENCE_FLOOR_DB = -144;
+const MEASUREMENT_DECIMAL_PLACES = Math.round(Math.log10(1 / MEASUREMENT_PRECISION));
+const INVALID_MEASUREMENT_LABEL = "No valid measurement";
 const timestampFormatter = new Intl.DateTimeFormat("en-GB", {
   year: "numeric",
   month: "short",
@@ -18,7 +21,19 @@ function toFixedClean(value: number, precision: number) {
   return fixed === `-${zero}` ? zero : fixed;
 }
 
-export function formatLufs(value: number | null | undefined, precision = 2) {
+export function roundToMeasurementPrecision(value: number) {
+  return Number(value.toFixed(MEASUREMENT_DECIMAL_PLACES));
+}
+
+export function formatMeasurementNumber(value: number) {
+  return toFixedClean(value, MEASUREMENT_DECIMAL_PLACES);
+}
+
+export function isSilencePeak(value: number | null | undefined) {
+  return value === PEAK_SILENCE_FLOOR_DB;
+}
+
+export function formatLufs(value: number | null | undefined, precision = MEASUREMENT_DECIMAL_PLACES) {
   if (value == null || !Number.isFinite(value)) {
     return "n/a";
   }
@@ -45,24 +60,41 @@ export function describeIntegratedInvalidReason(
  */
 export function formatIntegratedLufs(
   metrics: Pick<LoudnessMetrics, "integratedLufs" | "integratedValid">,
-  precision = 2,
+  precision = MEASUREMENT_DECIMAL_PLACES,
 ) {
   return metrics.integratedValid === false
-    ? "No valid measurement"
+    ? INVALID_MEASUREMENT_LABEL
     : formatLufs(metrics.integratedLufs, precision);
 }
 
 export function formatLoudnessRange(
-  metrics: Pick<LoudnessMetrics, "loudnessRange" | "loudnessRangeUnstable">,
-  precision = 2,
+  metrics: Pick<
+    LoudnessMetrics,
+    "loudnessRange" | "loudnessRangeValid" | "loudnessRangeUnstable"
+  >,
+  precision = MEASUREMENT_DECIMAL_PLACES,
 ) {
+  if (metrics.loudnessRangeValid === false) {
+    return INVALID_MEASUREMENT_LABEL;
+  }
+
   const value = formatDb(metrics.loudnessRange, "LU", precision);
-  return metrics.loudnessRangeUnstable === true ? `${value} (unstable)` : value;
+  return metrics.loudnessRangeUnstable === true
+    ? `${value} (unstable)`
+    : value;
 }
 
-export function formatDb(value: number | null | undefined, suffix = "dB", precision = 2) {
+export function formatDb(
+  value: number | null | undefined,
+  suffix = "dB",
+  precision = MEASUREMENT_DECIMAL_PLACES,
+) {
   if (value == null || !Number.isFinite(value)) {
     return "n/a";
+  }
+
+  if ((suffix === "dBFS" || suffix === "dBTP") && isSilencePeak(value)) {
+    return "Silence";
   }
 
   return `${toFixedClean(value, precision)} ${suffix}`;
@@ -88,7 +120,10 @@ function trimTrailingZeros(fixed: string) {
  * precision it doesn't have. Custom targets can still carry real decimal
  * input (e.g. -14.5), which this preserves instead of rounding it away.
  */
-export function formatPresetLufs(value: number | null | undefined, precision = 2) {
+export function formatPresetLufs(
+  value: number | null | undefined,
+  precision = MEASUREMENT_DECIMAL_PLACES,
+) {
   if (value == null || !Number.isFinite(value)) {
     return "n/a";
   }
@@ -97,7 +132,10 @@ export function formatPresetLufs(value: number | null | undefined, precision = 2
 }
 
 /** Preset/ceiling counterpart to {@link formatPresetLufs}; see its docs. */
-export function formatPresetPeakDbtp(value: number | null | undefined, precision = 2) {
+export function formatPresetPeakDbtp(
+  value: number | null | undefined,
+  precision = MEASUREMENT_DECIMAL_PLACES,
+) {
   if (value == null || !Number.isFinite(value)) {
     return "n/a";
   }
@@ -110,7 +148,11 @@ export function formatPeakDbtp(value: number | null | undefined) {
     return "n/a";
   }
 
-  return `${toFixedClean(value, 2)} dBTP`;
+  if (isSilencePeak(value)) {
+    return "Silence";
+  }
+
+  return `${formatMeasurementNumber(value)} dBTP`;
 }
 
 export function formatDuration(seconds: number | null | undefined) {
@@ -130,7 +172,10 @@ export function formatDuration(seconds: number | null | undefined) {
   return `${mins}:${String(secs).padStart(2, "0")}`;
 }
 
-export function formatRelativeDb(value: number | null | undefined, precision = 2) {
+export function formatRelativeDb(
+  value: number | null | undefined,
+  precision = MEASUREMENT_DECIMAL_PLACES,
+) {
   if (value == null || !Number.isFinite(value)) {
     return "n/a";
   }
@@ -140,7 +185,10 @@ export function formatRelativeDb(value: number | null | undefined, precision = 2
   return `${sign}${fixed} dB`;
 }
 
-export function formatRelativeLu(value: number | null | undefined, precision = 2) {
+export function formatRelativeLu(
+  value: number | null | undefined,
+  precision = MEASUREMENT_DECIMAL_PLACES,
+) {
   if (value == null || !Number.isFinite(value)) {
     return "n/a";
   }
@@ -198,7 +246,7 @@ export function fileNameTimestamp(scope = "default", now = new Date()) {
 
 export function peakToDb(value: number) {
   if (!Number.isFinite(value) || value <= 0) {
-    return NEGATIVE_FLOOR;
+    return PEAK_SILENCE_FLOOR_DB;
   }
 
   return 20 * Math.log10(value);

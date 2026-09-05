@@ -1,9 +1,7 @@
 "use client";
 
 import {
-  memo,
   useCallback,
-  useDeferredValue,
   useEffect,
   useMemo,
   useRef,
@@ -11,104 +9,151 @@ import {
   useSyncExternalStore,
   type KeyboardEvent,
 } from "react";
-import { usePathname, useSearchParams } from "next/navigation";
+import dynamic from "next/dynamic";
 import {
-  AlertTriangle,
-  ArrowLeft,
   ArrowUpDown,
   AudioLines,
   BarChart3,
   FolderOpen,
   Gauge,
   Info,
-  Moon,
   Plus,
   RefreshCcw,
   Search,
-  Square,
-  Sun,
-  Trash2,
   Waves,
 } from "lucide-react";
-import { getComplianceSummary } from "@/audio/compliance";
-import {
-  applyDraft,
-  cancelDraft,
-  createDefaultTargetState,
-  draftStatusMessage,
-  isDraftDirty,
-  isDraftModified,
-  resetToPublished,
-  resolveActiveTarget,
-  resolveDraftTarget,
-  selectPreset,
-  serializeCommittedDraft,
-  stateFromStoredSettings,
-  updateDraft,
-  type TargetWorkspaceState,
-} from "@/audio/presets";
-import { MAX_DROPPED_FILES, collectDroppedFiles } from "@/lib/dropped-files";
+import { AdvancedQueueRow } from "@/components/advanced-queue-row";
 import { HistoryPreferenceCard, RecentSessionsPanel } from "@/components/history-panels";
-import { isModalStackOpen } from "@/hooks/use-modal-focus";
-import { useTruePeakAnalyzer } from "@/hooks/use-truepeak-analyzer";
+import { WorkbenchEmptyState as EmptyState } from "@/components/workbench-empty-state";
+import { WorkspaceMetricTile as MetricTile } from "@/components/workspace-metric-tile";
+import { WorkspaceNotices } from "@/components/workspace-notices";
+import { WorkspaceThemeToggle as ThemeToggle } from "@/components/workspace-theme-toggle";
 import {
-  formatDuration,
-  formatIntegratedLufs,
+  WorkspaceCommandProvider,
+  WorkspaceSessionProvider,
+  type WorkspaceCommandContextValue,
+  type WorkspaceSessionContextValue,
+} from "@/components/workspace-contexts";
+import { useAnalysisSettings } from "@/hooks/use-analysis-settings";
+import { useCompletionAnnouncer } from "@/hooks/use-completion-announcer";
+import { useConfirmDialog } from "@/hooks/use-confirm-dialog";
+import { useConnectionSavingStatus } from "@/hooks/use-data-saver";
+import { useFileIntake } from "@/hooks/use-file-intake";
+import { useQueueView } from "@/hooks/use-queue-view";
+import { useTruePeakAnalyzer } from "@/hooks/use-truepeak-analyzer";
+import { useNormalizeWorkspaceRoute, useWorkspaceRoute } from "@/hooks/use-workspace-route";
+import {
   formatLufs,
   formatPeakDbtp,
-  formatRelativeDb,
 } from "@/lib/format";
-import { getJobErrorDisplay } from "@/lib/job-ui";
-import { complianceToneClass, statusToneClass } from "@/lib/status-tone";
 import { cn } from "@/lib/utils";
 import type {
-  AnalysisJob,
-  AnalysisMode,
   DecodePreference,
-  TargetPreset,
 } from "@/types/audio";
-import { CompareStudio, type CompareFilter, type CompareSort, type CompareView, type SortDirection } from "@/components/compare-studio";
 import { ConfirmDialog } from "@/components/confirm-dialog";
 import { DrawerPanel } from "@/components/drawer-panel";
 import { HomeStage } from "@/components/home-stage";
-import { InspectorPanel, type InspectorDetailTab } from "@/components/inspector-panel";
-import { PresetLibraryDrawer } from "@/components/preset-library-drawer";
-import { SessionInsightsPanel } from "@/components/session-insights";
+import { InspectorPanel } from "@/components/inspector-panel";
 import { SimpleResultsTable } from "@/components/simple-results-table";
 import { StudioToolbar } from "@/components/studio-toolbar";
 import { TruePeakLogo } from "@/components/truepeak-logo";
 import {
-  averageIntegratedLufs,
-  countQueueJobs,
-  getComplianceCounts,
-  highestTruePeakDbtp,
-  isActiveJob,
-  isIssueJob,
-} from "@/lib/session-selectors";
+  type QueueFilter,
+  type QueueSort,
+  type WorkspaceTab,
+} from "@/lib/workspace-route";
 import {
-  readAnalysisSettingsPreference,
   readHistoryPreference,
+  readHistoryPreferenceServerSnapshot,
   readParallelPreference,
+  readParallelPreferenceServerSnapshot,
   readThemePreference,
-  readUiModePreference,
+  readThemePreferenceHydrationSnapshot,
   subscribeHistoryPreference,
   subscribeParallelPreference,
   subscribeThemePreference,
-  subscribeUiModePreference,
   type ParallelLanesPreference,
-  type WorkspaceTheme,
-  type WorkspaceUiMode,
   writeHistoryPreference,
-  writeAnalysisSettingsPreference,
   writeParallelPreference,
   writeThemePreference,
-  writeUiModePreference,
 } from "@/lib/workspace-preferences";
 import { WorkspaceSummaryRail } from "@/components/workspace-summary-rail";
-import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
-import { Progress } from "@/components/ui/progress";
+
+export { WorkspaceNotices };
+
+function ThemeSynchronizer() {
+  const theme = useSyncExternalStore(
+    subscribeThemePreference,
+    readThemePreference,
+    readThemePreferenceHydrationSnapshot,
+  );
+
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme;
+    const color = theme === "light" ? "#f6faf8" : "#071412";
+    document.querySelectorAll<HTMLMetaElement>('meta[name="theme-color"]').forEach((meta) => {
+      meta.content = color;
+    });
+  }, [theme]);
+
+  return null;
+}
+
+const LARGE_WORKSPACE_QUERY = "(min-width: 1024px)";
+
+function readLargeWorkspace() {
+  return typeof window !== "undefined" && window.matchMedia(LARGE_WORKSPACE_QUERY).matches;
+}
+
+function subscribeLargeWorkspace(listener: () => void) {
+  const media = window.matchMedia(LARGE_WORKSPACE_QUERY);
+  media.addEventListener("change", listener);
+  return () => media.removeEventListener("change", listener);
+}
+
+// The static shell never has a selected job, so the inspector breakpoint
+// cannot change its generated markup. Reading the real client breakpoint for
+// hydration therefore avoids an otherwise guaranteed corrective commit while
+// preserving a deterministic server render.
+function readLargeWorkspaceHydrationSnapshot() {
+  return typeof window === "undefined" ? false : readLargeWorkspace();
+}
+
+// CompareStudio and SessionInsightsPanel only matter once the Compare/Insights
+// session tab is opened, and PresetLibraryDrawer only once the preset drawer
+// is opened, so keep all three out of the initial workbench chunk (NEXT-06).
+// The tab panels keep SSR (default); the drawer is closed by default and
+// renders nothing until then, so it can skip SSR entirely.
+const CompareStudio = dynamic(
+  () => import("@/components/compare-studio").then((module) => module.CompareStudio),
+  {
+    loading: () => (
+      <div
+        className="min-h-[420px] w-full animate-pulse rounded-[24px] border border-[var(--line)] bg-[var(--surface-1)]"
+        aria-hidden="true"
+      />
+    ),
+  },
+);
+
+const SessionInsightsPanel = dynamic(
+  () => import("@/components/session-insights").then((module) => module.SessionInsightsPanel),
+  {
+    loading: () => (
+      <div
+        className="min-h-[420px] w-full animate-pulse rounded-[24px] border border-[var(--line)] bg-[var(--surface-1)]"
+        aria-hidden="true"
+      />
+    ),
+  },
+);
+
+const PresetLibraryDrawer = dynamic(
+  () => import("@/components/preset-library-drawer").then((module) => module.PresetLibraryDrawer),
+  { ssr: false, loading: () => null },
+);
 
 const SUPPORTED_FORMATS = [
   "WAV",
@@ -121,21 +166,6 @@ const SUPPORTED_FORMATS = [
   "OGG/Opus",
 ];
 const numberFormatter = new Intl.NumberFormat("en-GB");
-const queueCollator = new Intl.Collator("en", { numeric: true, sensitivity: "base" });
-type UiMode = WorkspaceUiMode;
-type WorkspaceScreen = "home" | "session";
-type WorkspaceTab = "queue" | "compare" | "insights";
-type WorkspaceDrawer = "none" | "presets" | "inspector" | "history";
-type QueueFilter = "all" | "active" | "complete" | "issues";
-type QueueSort = "recent" | "oldest" | "status" | "integrated" | "truePeak" | "name";
-type DetailTab = InspectorDetailTab;
-type ConfirmDialogState =
-  | { type: "remove-job"; jobId: string }
-  | { type: "clear-finished" }
-  | { type: "clear-session" }
-  | { type: "clear-history" }
-  | null;
-
 const QUEUE_FILTERS: Array<{ id: QueueFilter; label: string }> = [
   { id: "all", label: "All" },
   { id: "active", label: "Active" },
@@ -154,11 +184,6 @@ const SESSION_TABS: Array<{ id: WorkspaceTab; label: string; icon: typeof Gauge 
   { id: "queue", label: "Queue", icon: Gauge },
   { id: "compare", label: "Compare", icon: BarChart3 },
   { id: "insights", label: "Insights", icon: Info },
-];
-const DETAIL_TABS: Array<{ id: DetailTab; label: string }> = [
-  { id: "overview", label: "Overview" },
-  { id: "timeline", label: "Timeline" },
-  { id: "metadata", label: "Technical" },
 ];
 const DECODE_PREFERENCES: Array<{
   id: DecodePreference;
@@ -181,80 +206,9 @@ const DECODE_PREFERENCES: Array<{
     id: "compatibility-first",
     label: "Compatibility first",
     description:
-      "Sends compressed files through the compatibility decoder first. Slower, but worth it when a browser's own codecs give inconsistent results.",
+      "Sends compressed files through the compatibility decoder first. Slower, and it downloads a decoder of about 31 MB (32,232,419 bytes) the first time it runs, but worth it when a browser's own codecs give inconsistent results.",
   },
 ];
-
-function queueStatusRank(status: AnalysisJob["status"]) {
-  switch (status) {
-    case "analyzing":
-      return 0;
-    case "decoding":
-      return 1;
-    case "reading":
-      return 2;
-    case "queued":
-      return 3;
-    case "complete":
-      return 4;
-    case "failed":
-      return 5;
-    case "canceled":
-    default:
-      return 6;
-  }
-}
-
-function sortQueueJobs(left: AnalysisJob, right: AnalysisJob, queueSort: QueueSort) {
-  switch (queueSort) {
-    case "oldest":
-      return left.createdAt.localeCompare(right.createdAt);
-    case "status": {
-      const statusDelta = queueStatusRank(left.status) - queueStatusRank(right.status);
-      if (statusDelta !== 0) {
-        return statusDelta;
-      }
-      return right.createdAt.localeCompare(left.createdAt);
-    }
-    case "integrated": {
-      const leftValue = left.result?.metrics.integratedValid === false
-        ? undefined
-        : left.result?.metrics.integratedLufs;
-      const rightValue = right.result?.metrics.integratedValid === false
-        ? undefined
-        : right.result?.metrics.integratedLufs;
-      if (leftValue == null && rightValue == null) {
-        return right.createdAt.localeCompare(left.createdAt);
-      }
-      if (leftValue == null) {
-        return 1;
-      }
-      if (rightValue == null) {
-        return -1;
-      }
-      return rightValue - leftValue;
-    }
-    case "truePeak": {
-      const leftValue = left.result?.metrics.truePeakDbtp;
-      const rightValue = right.result?.metrics.truePeakDbtp;
-      if (leftValue == null && rightValue == null) {
-        return right.createdAt.localeCompare(left.createdAt);
-      }
-      if (leftValue == null) {
-        return 1;
-      }
-      if (rightValue == null) {
-        return -1;
-      }
-      return rightValue - leftValue;
-    }
-    case "name":
-      return queueCollator.compare(left.fileName, right.fileName);
-    case "recent":
-    default:
-      return right.createdAt.localeCompare(left.createdAt);
-  }
-}
 
 function formatDecodePreferenceLabel(value: DecodePreference) {
   return DECODE_PREFERENCES.find((option) => option.id === value)?.label ?? "Auto";
@@ -274,413 +228,97 @@ function shouldIgnoreQueueNavigationTarget(target: EventTarget | null) {
   );
 }
 
-function MetricTile({
-  label,
-  value,
-  hint,
-  accent = false,
-}: {
-  label: string;
-  value: string;
-  hint?: string;
-  accent?: boolean;
-}) {
-  return (
-    <div
-      className={cn(
-        "flex h-full min-h-[148px] flex-col justify-between rounded-[24px] border p-5",
-        accent
-          ? "border-[color:var(--accent)]/25 bg-[color:var(--accent-soft)]"
-          : "border-[var(--line)] bg-[var(--surface-1)]",
-      )}
-    >
-      <div className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">
-        {label}
-      </div>
-      <div className="mt-3 space-y-2">
-        <div className="text-[clamp(1.7rem,2vw,2.35rem)] font-semibold leading-tight tabular-nums text-[var(--ink)] break-words">
-          {value}
-        </div>
-        {hint ? <div className="max-w-[30ch] text-xs leading-5 text-[var(--muted)]">{hint}</div> : null}
-      </div>
-    </div>
-  );
-}
-function EmptyState({
-  title,
-  body,
-  icon: Icon,
-  actionLabel,
-  onAction,
-}: {
-  title: string;
-  body: string;
-  icon: typeof Waves;
-  actionLabel?: string;
-  onAction?: () => void;
-}) {
-  return (
-    <Card className="p-8 text-center">
-      <div className="mx-auto flex h-16 w-16 items-center justify-center rounded-[22px] border border-[var(--line)] bg-[var(--surface-1)] text-[var(--muted)]">
-        <Icon className="h-7 w-7" aria-hidden="true" />
-      </div>
-      <h2 className="mt-5 text-2xl font-semibold text-[var(--ink)]">{title}</h2>
-      <p className="mt-3 text-sm leading-6 text-[var(--muted)]">{body}</p>
-      {actionLabel && onAction ? (
-        <Button type="button" size="sm" variant="secondary" onClick={onAction} className="mt-5">
-          <Plus className="h-4 w-4" aria-hidden="true" />
-          {actionLabel}
-        </Button>
-      ) : null}
-    </Card>
-  );
-}
-
-function AdvancedQueueMetric({
-  label,
-  value,
-}: {
-  label: string;
-  value: string;
-}) {
-  return (
-    <div className="min-w-0 rounded-[14px] border border-[var(--line)]/60 bg-[var(--surface-0)]/46 px-3 py-2">
-      <div className="text-[10px] uppercase tracking-[0.16em] text-[var(--muted)]">{label}</div>
-      <div className="mt-1 break-words text-sm font-semibold leading-tight tabular-nums text-[var(--ink)]">{value}</div>
-    </div>
-  );
-}
-
-function ThemeToggle({ theme, onToggle }: { theme: WorkspaceTheme; onToggle: () => void }) {
-  const nextLabel = theme === "dark" ? "Switch to light theme" : "Switch to dark theme";
-  return (
-    <Button
-      type="button"
-      size="sm"
-      variant="secondary"
-      onClick={onToggle}
-      aria-label={nextLabel}
-      title={nextLabel}
-    >
-      {theme === "dark" ? (
-        <Sun className="h-4 w-4" aria-hidden="true" />
-      ) : (
-        <Moon className="h-4 w-4" aria-hidden="true" />
-      )}
-      <span className="hidden sm:inline">{theme === "dark" ? "Light" : "Dark"}</span>
-    </Button>
-  );
-}
-
-const AdvancedQueueRow = memo(function AdvancedQueueRow({
-  job,
-  selected,
-  analysisMode,
-  onCancelJob,
-  onOpenJob,
-  onRemoveJob,
-  onRetryJob,
-}: {
-  job: AnalysisJob;
-  selected: boolean;
-  analysisMode: AnalysisMode;
-  onCancelJob: (jobId: string) => void;
-  onOpenJob: (jobId: string) => void;
-  onRemoveJob: (jobId: string) => void;
-  onRetryJob: (jobId: string) => void;
-}) {
-  const compliance = job.result ? getComplianceSummary(job.result) : null;
-  const errorDisplay = getJobErrorDisplay(job.error);
-  const active = isActiveJob(job);
-
-  return (
-    <article
-      className={cn(
-        "tp-selected-row rounded-[18px] border overflow-hidden [content-visibility:auto] [contain-intrinsic-size:96px]",
-        selected
-          ? "border-[color:var(--accent)]/36 bg-[color:var(--accent-soft)] shadow-[0_14px_34px_rgba(0,0,0,0.12)]"
-          : "border-[var(--line)]/72 bg-[var(--surface-0)]/48 hover:border-[color:var(--accent)]/24 hover:bg-[var(--surface-1)]/64",
-      )}
-      data-selected={selected}
-      aria-current={selected ? "true" : undefined}
-    >
-      <div className="grid gap-3 p-3 lg:grid-cols-[minmax(0,1fr)_minmax(380px,0.9fr)_auto] lg:items-center">
-        <div className="flex min-w-0 items-start gap-3">
-          <span
-            className={cn(
-              "mt-1 h-9 w-1.5 shrink-0 rounded-full",
-              selected ? "bg-[var(--accent)]" : active ? "bg-[var(--warning)]" : "bg-[var(--line)]",
-            )}
-            aria-hidden="true"
-          />
-          <div className="min-w-0">
-            {/* Only the file name is inside the button: its aria-label would
-                otherwise hide the status and compliance badges from screen
-                readers, since button descendants are presentational. */}
-            <button
-              type="button"
-              data-queue-nav="true"
-              data-job-id={job.id}
-              onClick={() => onOpenJob(job.id)}
-              className="min-w-0 rounded-[10px] text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)]"
-              aria-label={`Inspect ${job.fileName}`}
-            >
-              <div className="break-words text-sm font-semibold leading-6 text-[var(--ink)]">
-                {job.fileName}
-              </div>
-            </button>
-            <div className="mt-2 flex flex-wrap gap-1.5">
-              <Badge className={statusToneClass(job.status)}>{job.status}</Badge>
-              {job.imported ? <Badge className="tone-warning">Unverified import</Badge> : null}
-              {job.restored ? (
-                <Badge className="border-[var(--line)] bg-[var(--surface-0)] text-[var(--muted)]">
-                  Restored
-                </Badge>
-              ) : null}
-              {compliance ? <Badge className={complianceToneClass(compliance.state)}>{compliance.label}</Badge> : null}
-              {job.result?.metrics.integratedValid === false ? <Badge className="tone-warning">Integrated unavailable</Badge> : null}
-              {job.result?.target ? <Badge>{job.result.target.label}</Badge> : null}
-              {!compliance && job.result && analysisMode === "measure-only" ? <Badge>Measure Only</Badge> : null}
-              {job.result?.metadata.decoderLabel ? (
-                <Badge className="max-w-full break-words border-[var(--line)] bg-[var(--surface-0)] text-[var(--muted)]">
-                  {job.result.metadata.decoderLabel}
-                </Badge>
-              ) : null}
-            </div>
-          </div>
-        </div>
-
-        <div className={cn("grid min-w-0 gap-2", analysisMode === "targeted" ? "grid-cols-2 sm:grid-cols-4" : "grid-cols-2 sm:grid-cols-3")}>
-          <AdvancedQueueMetric label="Integrated" value={job.result ? formatIntegratedLufs(job.result.metrics) : "Waiting"} />
-          <AdvancedQueueMetric label="True peak" value={job.result ? formatPeakDbtp(job.result.metrics.truePeakDbtp) : "n/a"} />
-          {analysisMode === "targeted" ? (
-            <AdvancedQueueMetric label="Gain" value={job.result ? formatRelativeDb(job.result.metrics.targetDeltaDb) : "n/a"} />
-          ) : null}
-          <AdvancedQueueMetric label="Duration" value={job.result ? formatDuration(job.result.metadata.durationSeconds) : "n/a"} />
-        </div>
-
-        <div className="flex shrink-0 flex-wrap gap-1.5 lg:justify-end">
-          <Button type="button" size="sm" variant={selected ? "primary" : "secondary"} onClick={() => onOpenJob(job.id)} aria-label={`Inspect ${job.fileName}`}>
-            Inspect
-          </Button>
-          {job.status === "failed" || job.status === "canceled" ? (
-            <Button type="button" size="sm" variant="secondary" onClick={() => onRetryJob(job.id)} aria-label={`Retry ${job.fileName}`}>
-              <RefreshCcw className="h-4 w-4" aria-hidden="true" />
-            </Button>
-          ) : null}
-          {active ? (
-            <Button type="button" size="sm" variant="ghost" onClick={() => onCancelJob(job.id)} aria-label={`Cancel ${job.fileName}`}>
-              <Square className="h-4 w-4" aria-hidden="true" />
-            </Button>
-          ) : null}
-          <Button type="button" size="sm" variant="ghost" onClick={() => onRemoveJob(job.id)} aria-label={`Remove ${job.fileName}`}>
-            <Trash2 className="h-4 w-4" aria-hidden="true" />
-          </Button>
-        </div>
-      </div>
-
-      {active ? (
-        <div className="border-t border-[var(--line)]/55 px-3 pb-3 pt-2">
-          <div className="flex items-center justify-between gap-3 text-xs text-[var(--muted)]">
-            <span className="min-w-0 break-words">{job.progressLabel}</span>
-            <span className="shrink-0 tabular-nums">{Math.round(job.progressPercent * 100)}%</span>
-          </div>
-          <div className="mt-2">
-            <Progress value={job.progressPercent * 100} label={`${job.fileName}: ${job.progressLabel}`} />
-          </div>
-        </div>
-      ) : null}
-
-      {errorDisplay ? (
-        <div className="border-t border-[var(--danger-line)] px-3 pb-3 pt-2 text-sm leading-6 text-[var(--danger)]">
-          {errorDisplay.summary}
-          {errorDisplay.detail ? (
-            <details className="mt-2 rounded-[14px] border border-[var(--danger-line)] bg-[var(--danger-soft)] px-3 py-2 text-xs leading-5 text-[var(--ink)]/85">
-              <summary className="cursor-pointer font-semibold uppercase tracking-[0.14em] text-[var(--danger)]">
-                Why it failed
-              </summary>
-              <p className="mt-2 normal-case tracking-normal text-[var(--ink)]/75">{errorDisplay.detail}</p>
-            </details>
-          ) : null}
-        </div>
-      ) : null}
-    </article>
-  );
-});
-
-// Hydration-safe media-query store (UX-033). The previous useState+useEffect
-// version initialized `false` and only corrected after mount, so a desktop deep
-// link briefly rendered the mobile/modal path - mounting a drawer and locking
-// body scroll - before switching to the inline layout. A useSyncExternalStore
-// store reads matchMedia during render (matching the committed DOM), shares one
-// subscription per query, and reports `false` on the server for a stable SSR
-// snapshot.
-const mediaQueryStores = new Map<
-  string,
-  { subscribe: (onChange: () => void) => () => void; getSnapshot: () => boolean }
->();
-
-function getMediaQueryStore(query: string) {
-  let store = mediaQueryStores.get(query);
-  if (!store) {
-    let mediaQuery: MediaQueryList | null = null;
-    const resolve = () => {
-      if (mediaQuery == null && typeof window !== "undefined" && typeof window.matchMedia === "function") {
-        mediaQuery = window.matchMedia(query);
-      }
-      return mediaQuery;
-    };
-    store = {
-      subscribe: (onChange: () => void) => {
-        const media = resolve();
-        if (!media) {
-          return () => {};
-        }
-        media.addEventListener("change", onChange);
-        return () => media.removeEventListener("change", onChange);
-      },
-      getSnapshot: () => resolve()?.matches ?? false,
-    };
-    mediaQueryStores.set(query, store);
-  }
-  return store;
-}
-
-const getMediaQueryServerSnapshot = () => false;
-
-function useMediaQuery(query: string) {
-  const store = getMediaQueryStore(query);
-  return useSyncExternalStore(store.subscribe, store.getSnapshot, getMediaQueryServerSnapshot);
-}
-
-// True only after the first client commit. Viewport-dependent modal/drawer
-// mounting waits on this so a desktop deep link never momentarily mounts the
-// mobile drawer (and its focus trap / scroll lock) before the media query
-// resolves (UX-033).
-const subscribeToHydration = () => () => {};
-function useIsHydrated() {
-  return useSyncExternalStore(
-    subscribeToHydration,
-    () => true,
-    () => false,
-  );
-}
-
-// Two distinct notice channels (UX-035). The persistent warning region keeps a
-// storage/recovery failure visible with clear warning styling (and, when it is
-// the retryable settings write, a recovery action) until it resolves. The
-// transient region is a separate polite live region for short-lived action
-// confirmations, so a persistent problem can no longer mask later feedback or
-// its announcement. Both stay mounted (empty -> sr-only) so screen readers pick
-// up content that appears after mount.
-function WorkspaceNotices({
-  persistentWarning,
-  transientNotice,
-  canRetrySettings,
-  onRetrySettings,
-}: {
-  persistentWarning: string | null;
-  transientNotice: string | null;
-  canRetrySettings: boolean;
-  onRetrySettings: () => void;
-}) {
-  // Both notices are rendered as direct-child live regions (a fragment, not a
-  // wrapping div) so the modal inert-walk in use-modal-focus.ts can exempt them
-  // by element and keep alerts/confirmations announceable while a drawer or
-  // dialog is open. Do not wrap them in a non-live container.
-  return (
-    <>
-      <div
-        role="alert"
-        className={
-          persistentWarning
-            ? "tp-notice-in flex items-start gap-3 rounded-[22px] border tone-warning px-4 py-3 text-sm"
-            : "sr-only"
-        }
-      >
-        {persistentWarning ? (
-          <>
-            <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" aria-hidden="true" />
-            <div className="min-w-0 flex-1">
-              <span>{persistentWarning}</span>
-              {canRetrySettings ? (
-                <div className="mt-2">
-                  <Button type="button" size="sm" variant="secondary" onClick={onRetrySettings}>
-                    <RefreshCcw className="h-4 w-4" aria-hidden="true" />
-                    Try saving again
-                  </Button>
-                </div>
-              ) : null}
-            </div>
-          </>
-        ) : null}
-      </div>
-      <div
-        role="status"
-        aria-live="polite"
-        className={
-          transientNotice
-            ? "tp-notice-in flex items-start gap-3 rounded-[22px] border border-[color:var(--accent)]/15 bg-[color:var(--accent-soft)] px-4 py-3 text-sm text-[var(--ink)]"
-            : "sr-only"
-        }
-      >
-        {transientNotice ? (
-          <>
-            <Info className="mt-0.5 h-4 w-4 shrink-0 text-[var(--accent-text)]" />
-            <span>{transientNotice}</span>
-          </>
-        ) : null}
-      </div>
-    </>
-  );
-}
-
 export function TruePeakWorkbench() {
-  const inputRef = useRef<HTMLInputElement | null>(null);
-  const sessionInputRef = useRef<HTMLInputElement | null>(null);
-  const pathname = usePathname();
-  const searchParams = useSearchParams();
-  // Active vs draft target (UX-004). `targetState.committed` is the applied
-  // target that drives verdicts and persistence; `targetState.draft` is the
-  // live edit shown in the Preset Library. The pure engine in @/audio/presets
-  // owns every transition so the rules stay testable outside React.
-  const [targetState, setTargetState] = useState<TargetWorkspaceState>(createDefaultTargetState);
-  const [decodePreference, setDecodePreference] = useState<DecodePreference>("auto");
-  const [persistedAnalysisMode, setPersistedAnalysisMode] = useState<AnalysisMode>("targeted");
-  const [analysisSettingsHydrated, setAnalysisSettingsHydrated] = useState(false);
-  const settingsRecoveryWriteAllowedRef = useRef(true);
-  const [settingsPersistenceRevision, setSettingsPersistenceRevision] = useState(0);
-  const [settingsPersistenceIssue, setSettingsPersistenceIssue] = useState<string | null>(null);
-  // Bumped by the persistent warning's "Try saving again" action so the effect
-  // below re-attempts the settings write after a storage failure (UX-035).
-  const [settingsSaveAttempt, setSettingsSaveAttempt] = useState(0);
-  const preferredUiMode = useSyncExternalStore<UiMode>(subscribeUiModePreference, readUiModePreference, () => "simple");
-  const historyEnabled = useSyncExternalStore(subscribeHistoryPreference, readHistoryPreference, () => false);
-  const theme = useSyncExternalStore<WorkspaceTheme>(subscribeThemePreference, readThemePreference, () => "dark");
-  const parallelPreference = useSyncExternalStore<ParallelLanesPreference>(subscribeParallelPreference, readParallelPreference, () => "auto");
+  const {
+    activeTarget,
+    decodePreference,
+    draftIsDirty,
+    draftIsModified,
+    draftPreviewTarget,
+    draftResolution,
+    draftStatus,
+    handleApplyDraft,
+    handleCancelDraft,
+    handleCustomTargetLufsChange,
+    handleCustomTruePeakChange,
+    handlePolicyChange,
+    handleResetToPublished,
+    handleSelectPreset,
+    handleToleranceChange,
+    persistedAnalysisMode,
+    recoveryWritesAllowed,
+    retrySettingsPersistence,
+    setDecodePreference,
+    setPersistedAnalysisMode,
+    settingsPersistenceIssue,
+    targetState,
+  } = useAnalysisSettings();
+  const workspaceRoute = useWorkspaceRoute({
+    onAnalysisModeChange: setPersistedAnalysisMode,
+    persistedAnalysisMode,
+  });
+  const {
+    activeWorkspaceTab,
+    analysisMode,
+    compareDirection,
+    compareFilter,
+    compareSort,
+    compareView,
+    deferredSearchQuery,
+    detailTab,
+    queueFilter,
+    queueSearchDraft,
+    queueSort,
+    referenceId,
+    resetQueueView,
+    selectedJobId,
+    setAnalysisMode,
+    setCompareFilter,
+    setCompareSort,
+    setCompareView,
+    setDetailTab,
+    setQueueFilter,
+    setQueueSearchDraft,
+    setQueueSort,
+    setReferenceId,
+    setUiMode,
+    setWorkspaceDrawer,
+    setWorkspaceScreen,
+    setWorkspaceTab,
+    uiMode,
+    updateWorkspaceRoute,
+    workspaceDrawer,
+    workspaceScreen,
+    workspaceTab,
+  } = workspaceRoute;
+  const historyEnabled = useSyncExternalStore(
+    subscribeHistoryPreference,
+    readHistoryPreference,
+    readHistoryPreferenceServerSnapshot,
+  );
+  const parallelPreference = useSyncExternalStore<ParallelLanesPreference>(
+    subscribeParallelPreference,
+    readParallelPreference,
+    readParallelPreferenceServerSnapshot,
+  );
+  const connectionSavingStatus = useConnectionSavingStatus();
+  const [compatibilityDecoderOptIn, setCompatibilityDecoderOptIn] = useState(false);
+  const connectionSavingActive = connectionSavingStatus !== "normal";
+  const compatibilityDecoderAllowed = !connectionSavingActive || compatibilityDecoderOptIn;
   const setParallelPreference = useCallback((next: ParallelLanesPreference) => {
     writeParallelPreference(next);
   }, []);
-  useEffect(() => {
-    document.documentElement.dataset.theme = theme;
-    // Keep the browser chrome color in step with the applied theme. The server
-    // writes this meta from the cookie alone, so a first visit that resolves
-    // to the OS preference, and any in-session toggle, must update it here.
-    const color = theme === "light" ? "#f6faf8" : "#071412";
-    document.querySelectorAll('meta[name="theme-color"]').forEach((meta) => meta.remove());
-    const meta = document.createElement("meta");
-    meta.name = "theme-color";
-    meta.content = color;
-    document.head.appendChild(meta);
-  }, [theme]);
   const toggleTheme = useCallback(() => {
-    writeThemePreference(theme === "dark" ? "light" : "dark");
-  }, [theme]);
-  const [isDragging, setIsDragging] = useState(false);
+    writeThemePreference(readThemePreference() === "dark" ? "light" : "dark");
+  }, []);
   const [uiNotice, setUiNotice] = useState<string | null>(null);
   const uiNoticeTimeoutRef = useRef<number | null>(null);
-  const isLargeScreen = useMediaQuery("(min-width: 1024px)");
-  const hydrated = useIsHydrated();
+  const isLargeScreen = useSyncExternalStore(
+    subscribeLargeWorkspace,
+    readLargeWorkspace,
+    readLargeWorkspaceHydrationSnapshot,
+  );
+  const mainRef = useRef<HTMLElement | null>(null);
   const workspaceTabRefs = useRef<Array<HTMLButtonElement | null>>([]);
   const advancedInspectorSectionRef = useRef<HTMLElement | null>(null);
   const advancedInspectorHeadingRef = useRef<HTMLHeadingElement | null>(null);
@@ -692,332 +330,22 @@ export function TruePeakWorkbench() {
   const queueRegionRef = useRef<HTMLDivElement | null>(null);
   const pendingQueueFocusRef = useRef<string | null>(null);
   const [queueFocusTick, setQueueFocusTick] = useState(0);
-  const [confirmDialogState, setConfirmDialogState] = useState<ConfirmDialogState>(null);
-
-  const uiModeParam = searchParams.get("ui");
-  const uiMode: UiMode = uiModeParam === "advanced" || uiModeParam === "simple" ? (uiModeParam as UiMode) : preferredUiMode;
-  const analysisModeParam = searchParams.get("analysis");
-  const analysisMode: AnalysisMode =
-    analysisModeParam === "measure-only" || analysisModeParam === "targeted"
-      ? analysisModeParam
-      : persistedAnalysisMode;
-  const workspaceScreenParam = searchParams.get("screen");
-  const workspaceScreen: WorkspaceScreen = workspaceScreenParam === "session" ? "session" : "home";
-  const tabParam = searchParams.get("tab");
-  const workspaceTab: WorkspaceTab = tabParam != null && SESSION_TABS.some((tab) => tab.id === tabParam) ? (tabParam as WorkspaceTab) : "queue";
-  const detailParam = searchParams.get("detail");
-  const detailTab: DetailTab = detailParam != null && DETAIL_TABS.some((tab) => tab.id === detailParam) ? (detailParam as DetailTab) : "overview";
-  const drawerParam = searchParams.get("drawer");
-  const workspaceDrawer: WorkspaceDrawer = drawerParam === "presets" || drawerParam === "inspector" || drawerParam === "history" ? (drawerParam as WorkspaceDrawer) : "none";
-  const selectedJobId = searchParams.get("job");
-  const referenceParam = searchParams.get("reference");
-  const referenceId = referenceParam === "none" ? null : referenceParam;
-  const compareViewParam = searchParams.get("compareView");
-  const compareView: CompareView = compareViewParam === "board" || compareViewParam === "reference" || compareViewParam === "table" ? (compareViewParam as CompareView) : "cards";
-  const compareFilterParam = searchParams.get("compareFilter");
-  const compareFilter: CompareFilter = compareFilterParam === "on-target" || compareFilterParam === "attention" ? (compareFilterParam as CompareFilter) : "all";
-  const compareSortParam = searchParams.get("compareSort");
-  const compareSort: CompareSort = compareSortParam === "truePeak" || compareSortParam === "lra" || compareSortParam === "gain" || compareSortParam === "duration" || compareSortParam === "name" ? (compareSortParam as CompareSort) : "integrated";
-  const compareDirectionParam = searchParams.get("compareDirection");
-  const compareDirection: SortDirection = compareDirectionParam === "asc" || compareDirectionParam === "desc" ? (compareDirectionParam as SortDirection) : compareSort === "name" ? "asc" : "desc";
-  const queueFilterParam = searchParams.get("filter");
-  const queueFilter: QueueFilter = queueFilterParam != null && QUEUE_FILTERS.some((filter) => filter.id === queueFilterParam) ? (queueFilterParam as QueueFilter) : "all";
-  const queueSortParam = searchParams.get("sort");
-  const queueSort: QueueSort = queueSortParam != null && QUEUE_SORTS.some((option) => option.id === queueSortParam) ? (queueSortParam as QueueSort) : "recent";
-  const searchQuery = searchParams.get("search") ?? "";
-  const [queueSearchDraft, setQueueSearchDraft] = useState(searchQuery);
-  const deferredSearchQuery = useDeferredValue(queueSearchDraft.trim().toLowerCase());
-
-  // The last value this component pushed into ?search. Next applies the patched
-  // history.replaceState inside startTransition, so the resulting searchQuery
-  // arrives at transition priority, after any keystrokes that landed in the
-  // meantime. Echoing that back into the draft overwrote those characters
-  // permanently. Only a genuinely external change (Back/Forward, resetQueueView,
-  // selectJob) should reach the input.
-  const lastWrittenSearchRef = useRef(searchQuery);
-  useEffect(() => {
-    if (searchQuery === lastWrittenSearchRef.current) {
-      return;
-    }
-    lastWrittenSearchRef.current = searchQuery;
-    setQueueSearchDraft((current) => (current === searchQuery ? current : searchQuery));
-  }, [searchQuery]);
-
-  // Workspace state lives in the query string, but it is purely client
-  // state. Writing it through the native History API keeps useSearchParams
-  // in sync (Next supports this since 14.1) without router.replace's server
-  // round trip - this route renders dynamically for the theme cookie, so
-  // every replace used to invoke a server render just to switch a tab.
-  // location.search also updates synchronously, so back-to-back calls in one
-  // tick read each other's writes with no pending-state bookkeeping.
-  // `history: "push"` creates a real history entry for structural transitions
-  // (Home -> Session, opening a drawer/inspector, selecting an item) so browser
-  // and Android Back close the overlay or step back a screen instead of leaving
-  // the app (UX-013). Ephemeral refinements (search, sort, filter, arrow-key
-  // highlight, auto-normalization) keep the default "replace" so they never
-  // pollute history. popstate itself needs no manual wiring: every view is
-  // derived from useSearchParams, and Next keeps it in sync with native
-  // pushState/replaceState and browser Back/Forward (Next 14.1+), so a Back
-  // that restores the previous query re-renders the previous view.
-  const updateWorkspaceRoute = useCallback(
-    (updates: Record<string, string | null>, options?: { history?: "push" | "replace" }) => {
-      const nextParams = new URLSearchParams(window.location.search);
-      Object.entries(updates).forEach(([key, value]) => {
-        if (value == null || value === "") {
-          nextParams.delete(key);
-          return;
-        }
-
-        nextParams.set(key, value);
-      });
-
-      const nextQuery = nextParams.toString();
-      const nextSearch = nextQuery ? `?${nextQuery}` : "";
-      // Never write an identical entry: a redundant pushState would trap Back on
-      // a no-op, and a redundant replaceState is pointless churn.
-      if (nextSearch === window.location.search) {
-        return;
-      }
-
-      const nextUrl = `${pathname}${nextSearch}`;
-      if (options?.history === "push") {
-        window.history.pushState(null, "", nextUrl);
-      } else {
-        window.history.replaceState(null, "", nextUrl);
-      }
-    },
-    [pathname],
-  );
-
-  const setWorkspaceScreen = (screen: WorkspaceScreen) => {
-    if (screen === "home") {
-      updateWorkspaceRoute(
-        { screen: "home", tab: null, detail: null, job: null, drawer: null },
-        { history: "push" },
-      );
-      return;
-    }
-
-    updateWorkspaceRoute({ screen: "session" }, { history: "push" });
-  };
-
-  // Tab clicks are structural (push so Back returns to the prior view); roving
-  // arrow-key activation passes "replace" so scrubbing the tablist with the
-  // keyboard does not flood history with an entry per keystroke (UX-013).
-  const setWorkspaceTab = (tab: WorkspaceTab, options?: { history?: "push" | "replace" }) => {
-    updateWorkspaceRoute(
-      {
-        screen: "session",
-        tab,
-        detail: tab === "queue" ? detailTab : null,
-        drawer: tab === "queue" && workspaceDrawer === "presets" ? "presets" : null,
-      },
-      { history: options?.history ?? "push" },
-    );
-  };
-
-  const setDetailTab = (tab: DetailTab) => {
-    updateWorkspaceRoute({ detail: tab });
-  };
-
-  const setWorkspaceDrawer = (drawer: WorkspaceDrawer) => {
-    // Opening an overlay pushes so Back closes it; closing removes the param in
-    // place so a subsequent Back does not reopen what the user just dismissed.
-    updateWorkspaceRoute(
-      { drawer: drawer === "none" ? null : drawer },
-      { history: drawer === "none" ? "replace" : "push" },
-    );
-  };
-
-  const setUiMode = (next: UiMode) => {
-    writeUiModePreference(next);
-    updateWorkspaceRoute(
-      next === "simple"
-        ? {
-            ui: next,
-            tab: null,
-            compareView: null,
-            compareFilter: null,
-            compareSort: null,
-            compareDirection: null,
-            reference: null,
-            drawer: workspaceDrawer === "history" ? "history" : null,
-          }
-        : { ui: next },
-    );
-  };
-
-  const setAnalysisMode = (next: AnalysisMode) => {
-    setPersistedAnalysisMode(next);
-    updateWorkspaceRoute({
-      analysis: next,
-      drawer: next === "measure-only" && workspaceDrawer === "presets" ? null : workspaceDrawer === "history" ? "history" : null,
-    });
-  };
-
-  const setReferenceId = (next: string | null) => {
-    updateWorkspaceRoute({ reference: next });
-  };
-
-  const setCompareView = (next: CompareView) => {
-    updateWorkspaceRoute({ compareView: next === "cards" ? null : next });
-  };
-
-  const setCompareFilter = (next: CompareFilter) => {
-    updateWorkspaceRoute({ compareFilter: next === "all" ? null : next });
-  };
-
-  const setCompareSort = (next: CompareSort) => {
-    const nextDirection =
-      compareSort === next
-        ? compareDirection === "asc"
-          ? "desc"
-          : "asc"
-        : next === "name"
-          ? "asc"
-          : "desc";
-
-    updateWorkspaceRoute({
-      compareSort: next === "integrated" ? null : next,
-      compareDirection: nextDirection === "desc" ? null : nextDirection,
-    });
-  };
-
-  const setQueueFilter = (next: QueueFilter) => {
-    const normalizedSearch = queueSearchDraft.trim();
-    updateWorkspaceRoute({
-      search: normalizedSearch ? queueSearchDraft : null,
-      filter: next === "all" ? null : next,
-    });
-  };
-
-  const setQueueSort = (next: QueueSort) => {
-    const normalizedSearch = queueSearchDraft.trim();
-    updateWorkspaceRoute({
-      search: normalizedSearch ? queueSearchDraft : null,
-      sort: next === "recent" ? null : next,
-    });
-  };
-
-  const setSearchQuery = (next: string) => {
-    setQueueSearchDraft(next);
-  };
 
   useEffect(() => {
-    const trimmedDraft = queueSearchDraft.trim();
-    const trimmedQuery = searchQuery.trim();
-    if (trimmedDraft === trimmedQuery) {
-      return;
-    }
+    mainRef.current?.setAttribute("data-hydrated", "true");
+  }, []);
 
-    const timeout = window.setTimeout(() => {
-      const nextParams = new URLSearchParams(window.location.search);
-      if (trimmedDraft) {
-        nextParams.set("search", queueSearchDraft);
-      } else {
-        nextParams.delete("search");
-      }
-
-      // Record what we are about to write so the sync effect above can tell this
-      // echo apart from a real external navigation.
-      lastWrittenSearchRef.current = trimmedDraft ? queueSearchDraft : "";
-      const nextQuery = nextParams.toString();
-      window.history.replaceState(null, "", nextQuery ? `${pathname}?${nextQuery}` : pathname);
-    }, 120);
-
-    return () => window.clearTimeout(timeout);
-  }, [pathname, queueSearchDraft, searchQuery]);
-
-  const setHistoryEnabled = (next: boolean) => {
+  const setHistoryEnabled = useCallback((next: boolean) => {
     if (!next && workspaceDrawer === "history") {
       updateWorkspaceRoute({ drawer: null });
     }
 
     writeHistoryPreference(next);
-  };
+  }, [updateWorkspaceRoute, workspaceDrawer]);
 
-  const toggleHistoryEnabled = () => setHistoryEnabled(!historyEnabled);
-
-  // The committed target drives every verdict; it is referentially stable
-  // across draft keystrokes so retargeting only runs when the target is
-  // actually applied (UX-004), not on every intermediate edit.
-  const activeTarget = useMemo(
-    () => resolveActiveTarget(targetState.committed),
-    [targetState.committed],
-  );
-  const draftResolution = useMemo(
-    () => resolveDraftTarget(targetState.draft),
-    [targetState.draft],
-  );
-  const draftPreviewTarget = draftResolution.target;
-  const draftIsDirty = useMemo(() => isDraftDirty(targetState), [targetState]);
-  const draftIsModified = useMemo(() => isDraftModified(targetState.draft), [targetState.draft]);
-  const draftStatus = useMemo(() => draftStatusMessage(targetState), [targetState]);
-
-  const handleSelectPreset = useCallback((presetId: string) => {
-    setTargetState((state) => selectPreset(state, presetId));
-  }, []);
-  const handleToleranceChange = useCallback((value: string) => {
-    setTargetState((state) => updateDraft(state, { toleranceLufs: value }));
-  }, []);
-  const handleCustomTargetLufsChange = useCallback((value: string) => {
-    setTargetState((state) => updateDraft(state, { customTargetLufs: value }));
-  }, []);
-  const handleCustomTruePeakChange = useCallback((value: string) => {
-    setTargetState((state) => updateDraft(state, { customTruePeak: value }));
-  }, []);
-  const handlePolicyChange = useCallback((policy: TargetPreset["policy"]) => {
-    setTargetState((state) => updateDraft(state, { policy }));
-  }, []);
-  const handleApplyDraft = useCallback(() => {
-    setTargetState((state) => applyDraft(state));
-  }, []);
-  const handleCancelDraft = useCallback(() => {
-    setTargetState((state) => cancelDraft(state));
-  }, []);
-  const handleResetToPublished = useCallback(() => {
-    setTargetState((state) => resetToPublished(state));
-  }, []);
-
-  useEffect(() => {
-    const stored = readAnalysisSettingsPreference();
-    if (stored) {
-      setPersistedAnalysisMode(stored.analysisMode);
-      setDecodePreference(stored.decodePreference);
-      // The persisted draft is the last committed target; rehydrate both the
-      // draft and the committed baseline from it (invalid stored values fall
-      // back to the default inside stateFromStoredSettings).
-      setTargetState(stateFromStoredSettings(stored));
-    }
-    setAnalysisSettingsHydrated(true);
-  }, []);
-
-  useEffect(() => {
-    if (!analysisSettingsHydrated) {
-      return;
-    }
-
-    // Only the committed (applied) target is persisted. Unapplied or invalid
-    // draft edits never reach storage, so a reload restores exactly what was
-    // last applied. Independent mode/decoder changes ride along with it.
-    const committed = writeAnalysisSettingsPreference({
-      analysisMode,
-      ...serializeCommittedDraft(targetState.committed),
-      decodePreference,
-    });
-    settingsRecoveryWriteAllowedRef.current = committed;
-    setSettingsPersistenceIssue(
-      committed
-        ? null
-        : "TruePeak could not save the active target and decoder settings. New results stay out of browser recovery until settings storage works again.",
-    );
-    setSettingsPersistenceRevision((current) => current + 1);
-  }, [analysisMode, analysisSettingsHydrated, decodePreference, settingsSaveAttempt, targetState.committed]);
-
-  const recoveryWriteAllowed = useCallback(
-    () => settingsRecoveryWriteAllowedRef.current,
-    [],
-  );
+  const toggleHistoryEnabled = useCallback(() => {
+    setHistoryEnabled(!historyEnabled);
+  }, [historyEnabled, setHistoryEnabled]);
 
   useEffect(() => {
     return () => {
@@ -1040,6 +368,17 @@ export function TruePeakWorkbench() {
     }, 3600);
   }, []);
 
+  const connectionNoticeShownRef = useRef(false);
+  useEffect(() => {
+    if (!connectionSavingActive || connectionNoticeShownRef.current) {
+      return;
+    }
+    connectionNoticeShownRef.current = true;
+    pushUiNotice(
+      `${connectionSavingStatus === "save-data" ? "Data Saver is on" : "A slow connection was detected"}. The approximately 31 MB compatibility decoder will stay off unless you allow it in Advanced options.`,
+    );
+  }, [connectionSavingActive, connectionSavingStatus, pushUiNotice]);
+
   const {
     jobs,
     completedJobs,
@@ -1047,12 +386,14 @@ export function TruePeakWorkbench() {
     recentSessions,
     notice,
     persistenceIssue,
+    workerCircuitIssue,
     parallelLimit,
     enqueueFiles,
     cancelJob,
     cancelActiveJobs,
     retryJob,
     retryIssues,
+    retryAnalysis,
     removeJob,
     clearFinished,
     clearSession,
@@ -1063,201 +404,57 @@ export function TruePeakWorkbench() {
     exportSession,
     importSession,
   } = useTruePeakAnalyzer(activeTarget, {
+    allowCompatibilityDecoder: compatibilityDecoderAllowed,
     analysisMode,
     decodePreference,
     persistHistory: historyEnabled,
     parallelPreference,
-    recoveryWriteAllowed,
-    recoveryWriteRevision: settingsPersistenceRevision,
-    restoreReady: analysisSettingsHydrated,
+    recoveryWritesAllowed,
+    restoreReady: true,
   });
 
-  // Screen readers get no signal when a result lands (the row only changes
-  // visually), so status transitions are collected and read out as a
-  // debounced batch summary through an always-mounted polite region. The
-  // announced numbers are session totals: an unchanged text node would not
-  // re-announce, and totals only grow, so every flush produces new text.
-  const [completionAnnouncement, setCompletionAnnouncement] = useState("");
-  const announcedStatusesRef = useRef(new Map<string, AnalysisJob["status"]>());
-  const announcedTotalsRef = useRef({ completed: 0, failed: 0 });
-  const announcementTimeoutRef = useRef<number | null>(null);
-
-  useEffect(() => {
-    if (!jobs.length) {
-      // Fresh session: start the running totals (and the region) over.
-      announcedStatusesRef.current = new Map();
-      announcedTotalsRef.current = { completed: 0, failed: 0 };
-      setCompletionAnnouncement("");
-      return;
-    }
-
-    const previous = announcedStatusesRef.current;
-    const next = new Map<string, AnalysisJob["status"]>();
-    const totals = announcedTotalsRef.current;
-    let changed = false;
-    jobs.forEach((job) => {
-      next.set(job.id, job.status);
-      const before = previous.get(job.id);
-      // before == null covers first sight of a job: imports and restored
-      // results arrive already complete and have their own notices.
-      if (before == null || before === job.status) {
-        return;
-      }
-
-      if (job.status === "complete") {
-        totals.completed += 1;
-        changed = true;
-      } else if (job.status === "failed") {
-        totals.failed += 1;
-        changed = true;
-      }
-    });
-    announcedStatusesRef.current = next;
-
-    if (!changed || announcementTimeoutRef.current != null) {
-      return;
-    }
-
-    announcementTimeoutRef.current = window.setTimeout(() => {
-      announcementTimeoutRef.current = null;
-      const { completed, failed } = announcedTotalsRef.current;
-      const parts = [
-        completed ? `${completed} ${completed === 1 ? "analysis" : "analyses"} finished` : null,
-        failed ? `${failed} ${failed === 1 ? "file" : "files"} failed` : null,
-      ].filter(Boolean);
-      if (parts.length) {
-        setCompletionAnnouncement(`${parts.join(" and ")} in this session.`);
-      }
-    }, 800);
-  }, [jobs]);
-
-  useEffect(() => {
-    return () => {
-      if (announcementTimeoutRef.current != null) {
-        window.clearTimeout(announcementTimeoutRef.current);
-      }
-    };
-  }, []);
-
-  const filteredJobs = useMemo(
-    () =>
-      jobs.filter((job) => {
-        const matchesFilter =
-          queueFilter === "all" ||
-          (queueFilter === "active" && isActiveJob(job)) ||
-          (queueFilter === "complete" && job.status === "complete") ||
-          (queueFilter === "issues" && isIssueJob(job));
-        // Skip building the haystack entirely when there is no query; this
-        // filter re-runs on every progress tick.
-        const matchesSearch =
-          !deferredSearchQuery ||
-          [
-            job.fileName,
-            job.status,
-            job.result?.metadata.decoderLabel ?? "",
-            job.result?.metadata.channelLayout.name ?? "",
-            job.result?.target?.label ?? "",
-            job.result ? getComplianceSummary(job.result)?.label ?? "" : "",
-          ].some((value) => value.toLowerCase().includes(deferredSearchQuery));
-        return matchesFilter && matchesSearch;
-      }),
-    [deferredSearchQuery, jobs, queueFilter],
-  );
-
-  const sortedQueueJobs = useMemo(() => [...filteredJobs].sort((left, right) => sortQueueJobs(left, right, queueSort)), [filteredJobs, queueSort]);
-  // Latest-value ref so selection handlers can consult the visible queue without
-  // taking sortedQueueJobs as a dependency (it changes on every progress tick,
-  // which would give selectJob/chooseJob a new identity and defeat row memoization).
-  const sortedQueueJobsRef = useRef(sortedQueueJobs);
-  useEffect(() => {
-    sortedQueueJobsRef.current = sortedQueueJobs;
-  }, [sortedQueueJobs]);
-  const resolvedSelectedJobId =
-    selectedJobId && jobs.some((job) => job.id === selectedJobId)
-      ? selectedJobId
-      : sortedQueueJobs[0]?.id ?? jobs[0]?.id ?? null;
-  const activeWorkspaceTab: WorkspaceTab = uiMode === "simple" ? "queue" : workspaceTab;
-  const routeSelectedJob = useMemo(
-    () => (selectedJobId ? jobs.find((job) => job.id === selectedJobId) ?? null : null),
-    [jobs, selectedJobId],
-  );
-  const visibleSelectedJob = useMemo(
-    () => sortedQueueJobs.find((job) => job.id === routeSelectedJob?.id) ?? null,
-    [routeSelectedJob?.id, sortedQueueJobs],
-  );
-  // An explicit selection (routeSelectedJob) must never be silently swapped
-  // out for whatever the current filter/search happens to leave at the top
-  // of the list: only fall back to sortedQueueJobs[0] when there is truly no
-  // selection. When the selected job exists but the active filter/search
-  // hides it from the visible queue, selectedJobHiddenByFilter drives a
-  // "hidden by filter" affordance instead (see selectionHiddenNotice below).
-  const selectedJob = useMemo(() => {
-    if (activeWorkspaceTab === "queue") {
-      return routeSelectedJob ?? sortedQueueJobs[0] ?? null;
-    }
-
-    return routeSelectedJob ?? completedJobs[0] ?? jobs[0] ?? null;
-  }, [activeWorkspaceTab, completedJobs, jobs, routeSelectedJob, sortedQueueJobs]);
-  const selectedJobHiddenByFilter =
-    activeWorkspaceTab === "queue" && !!routeSelectedJob && !visibleSelectedJob;
-  const queueAverage = averageIntegratedLufs(completedJobs);
-  const hottestTruePeak = highestTruePeakDbtp(completedJobs);
-  const complianceCounts = useMemo(() => getComplianceCounts(completedJobs), [completedJobs]);
-  const targetingEnabled = analysisMode === "targeted";
-  const currentModeLabel = targetingEnabled ? activeTarget.label : "Measure Only";
-  const queueCounts = useMemo(() => countQueueJobs(jobs), [jobs]);
-  // Aggregate batch progress for the toolbar while anything is running.
-  // The ETA is deliberately rough: median completed duration in this session,
-  // scaled by how many files each parallel pass clears.
-  const batchProgress = useMemo(() => {
-    if (!jobs.length) {
-      return null;
-    }
-
-    const activeJobs = jobs.filter(isActiveJob);
-    if (!activeJobs.length) {
-      return null;
-    }
-
-    const finished = jobs.length - activeJobs.length;
-    const inFlightProgress = activeJobs.reduce(
-      (sum, job) => sum + Math.min(Math.max(job.progressPercent, 0), 1),
-      0,
-    );
-    const percent = ((finished + inFlightProgress) / jobs.length) * 100;
-
-    const durations = jobs
-      .filter((job) => job.status === "complete" && job.startedAtMs != null && job.finishedAtMs != null)
-      .map((job) => job.finishedAtMs! - job.startedAtMs!)
-      .sort((left, right) => left - right);
-    const median = durations.length ? durations[Math.floor(durations.length / 2)] : null;
-    const lanes = Math.max(1, parallelLimit);
-    const etaSeconds =
-      median != null
-        ? Math.max(1, Math.round((Math.ceil(activeJobs.length / lanes) * median) / 1000))
-        : null;
-
-    return { finished, total: jobs.length, percent, etaSeconds };
-  }, [jobs, parallelLimit]);
-  const visibleQueueCount = sortedQueueJobs.length;
-  const queueViewIsFiltered = queueSearchDraft.trim().length > 0 || queueFilter !== "all" || queueSort !== "recent";
-  const queueShownLabel = queueViewIsFiltered
-    ? `${visibleQueueCount} of ${jobs.length} shown`
-    : `${visibleQueueCount} shown`;
-  const sessionTabCounts: Record<WorkspaceTab, number> = { queue: jobs.length, compare: completedJobs.length, insights: completedJobs.length };
-  const finishedCount = queueCounts.complete + queueCounts.issues;
+  const completionAnnouncement = useCompletionAnnouncer(jobs);
+  const {
+    batchProgress,
+    currentModeLabel,
+    hottestTruePeak,
+    queueAverage,
+    queueCounts,
+    queueShownLabel,
+    queueViewIsFiltered,
+    resolvedSelectedJobId,
+    selectedJob,
+    selectedJobHiddenByFilter,
+    sessionStats,
+    sessionTabCounts,
+    sortedQueueJobs,
+    sortedQueueJobsRef,
+    targetingEnabled,
+  } = useQueueView({
+    activeTarget,
+    activeWorkspaceTab,
+    analysisMode,
+    completedJobs,
+    deferredSearchQuery,
+    jobs,
+    parallelLimit,
+    queueFilter,
+    queueSearchDraft,
+    queueSort,
+    selectedJobId,
+  });
   // Two independent channels (UX-035): a persistent warning region holds
-  // storage/recovery failures with clear warning styling until they resolve,
+  // worker and storage/recovery failures with clear warning styling until they resolve,
   // while a separate transient polite region carries short-lived action
   // confirmations. Sharing one slot meant a persistent failure permanently
-  // masked later feedback (and its announcement). Only the settings write is
-  // retryable from here, so the recovery action shows only for that case.
-  const persistentWarning = persistenceIssue ?? settingsPersistenceIssue;
+  // masked later feedback (and its announcement).
+  const persistentWarning = workerCircuitIssue ?? persistenceIssue ?? settingsPersistenceIssue;
   const transientNotice = uiNotice ?? notice;
-  const canRetrySettings = persistenceIssue == null && settingsPersistenceIssue != null;
-  const retrySettingsPersistence = useCallback(() => {
-    setSettingsSaveAttempt((current) => current + 1);
-  }, []);
+  const persistentAction = workerCircuitIssue
+    ? { label: "Retry analysis", onClick: retryAnalysis }
+    : persistenceIssue == null && settingsPersistenceIssue != null
+      ? { label: "Try saving again", onClick: retrySettingsPersistence }
+      : null;
   const showHomeSupportSection = jobs.length > 0 || historyEnabled || recentSessions.length > 0;
   const queueEmptyCopy = jobs.length
     ? {
@@ -1277,186 +474,54 @@ export function TruePeakWorkbench() {
   const advancedInlineInspector = activeWorkspaceTab === "queue" && uiMode === "advanced" && isLargeScreen;
   const useInlineInspector = simpleInlineInspector || advancedInlineInspector;
   const showInlineInspector = !!selectedJob && useInlineInspector;
-  // Gated on `hydrated` so a desktop deep link resolves to the inline layout
-  // before this modal path can mount and lock body scroll (UX-033).
   const inspectorDrawerOpen =
-    hydrated &&
     workspaceDrawer === "inspector" &&
     !!selectedJob &&
     activeWorkspaceTab === "queue" &&
     !useInlineInspector;
 
-  useEffect(() => {
-    // Wait for the live-session restore to settle before pruning URL state
-    // against the job list. On the first client commit `jobs` is unconditionally
-    // empty and the restore is an async IndexedDB round trip, so pruning here
-    // used to strip ?job/?drawer/?reference a few hundred ms before the restore
-    // added those exact ids back: reloading with the inspector open always
-    // closed it and reset the selection to the first row.
-    if (!restoreSettled) {
-      return;
-    }
-
-    const updates: Record<string, string | null> = {};
-
-    if (selectedJobId && !jobs.some((job) => job.id === selectedJobId)) {
-      updates.job = resolvedSelectedJobId;
-      if (!resolvedSelectedJobId && workspaceDrawer === "inspector") {
-        updates.drawer = null;
-      }
-    }
-
-    if (referenceId && !completedJobs.some((job) => job.id === referenceId)) {
-      updates.reference = null;
-    }
-
-    if (Object.keys(updates).length) {
-      updateWorkspaceRoute(updates);
-    }
-  }, [completedJobs, jobs, referenceId, resolvedSelectedJobId, restoreSettled, selectedJobId, updateWorkspaceRoute, workspaceDrawer]);
-
-  useEffect(() => {
-    const updates: Record<string, string | null> = {};
-    const drawerIsPreset = workspaceDrawer === "presets";
-    const drawerIsHistory = workspaceDrawer === "history";
-    const drawerIsInspector = workspaceDrawer === "inspector";
-
-    if (referenceParam === "none") {
-      updates.reference = null;
-    }
-
-    if (workspaceScreen === "home") {
-      if (tabParam) updates.tab = null;
-      if (detailParam) updates.detail = null;
-      if (selectedJobId) updates.job = null;
-      if (referenceParam) updates.reference = null;
-      if (queueFilterParam) updates.filter = null;
-      if (queueSortParam) updates.sort = null;
-      if (searchQuery) updates.search = null;
-      if (compareViewParam) updates.compareView = null;
-      if (compareFilterParam) updates.compareFilter = null;
-      if (compareSortParam) updates.compareSort = null;
-      if (compareDirectionParam) updates.compareDirection = null;
-    }
-
-    if (uiMode === "simple") {
-      if (tabParam) updates.tab = null;
-      if (compareViewParam) updates.compareView = null;
-      if (compareFilterParam) updates.compareFilter = null;
-      if (compareSortParam) updates.compareSort = null;
-      if (compareDirectionParam) updates.compareDirection = null;
-      if (referenceParam) updates.reference = null;
-    }
-
-    if (analysisMode === "measure-only") {
-      if (compareViewParam === "board") updates.compareView = null;
-      if (compareFilterParam) updates.compareFilter = null;
-      if (compareSortParam === "gain") updates.compareSort = null;
-    }
-
-    if (drawerIsPreset && !targetingEnabled) {
-      updates.drawer = null;
-    }
-
-    if (drawerIsHistory && !historyEnabled) {
-      updates.drawer = null;
-    }
-
-    if (drawerIsInspector) {
-      // Screen and tab are URL state, known on the first commit.
-      const routeDisallows = workspaceScreen === "home" || activeWorkspaceTab !== "queue";
-      // These two read `selectedJob`, which is null until the live-session
-      // restore lands. Closing the drawer on that empty first commit is the same
-      // race the ?job pruning above guards: reloading with the inspector open
-      // would always close it a few hundred ms before the row came back.
-      const selectionDisallows = restoreSettled && (showInlineInspector || !selectedJob);
-      if (routeDisallows || selectionDisallows) {
-        updates.drawer = null;
-      }
-    }
-
-    if (Object.keys(updates).length) {
-      updateWorkspaceRoute(updates);
-    }
-  }, [
-    activeWorkspaceTab,
-    analysisMode,
-    compareDirectionParam,
-    compareFilterParam,
-    compareSortParam,
-    compareViewParam,
-    detailParam,
+  const routeNormalizationOptions = useMemo(() => ({
+    completedJobIds: new Set(completedJobs.map((job) => job.id)),
     historyEnabled,
-    queueFilterParam,
-    queueSortParam,
-    referenceParam,
+    jobIds: new Set(jobs.map((job) => job.id)),
+    resolvedSelectedJobId,
     restoreSettled,
-    searchQuery,
-    selectedJobId,
+    selectedJobAvailable: selectedJob != null,
+    showInlineInspector,
+  }), [
+    completedJobs,
+    historyEnabled,
+    jobs,
+    resolvedSelectedJobId,
+    restoreSettled,
     selectedJob,
     showInlineInspector,
-    tabParam,
-    targetingEnabled,
-    uiMode,
-    updateWorkspaceRoute,
-    workspaceDrawer,
-    workspaceScreen,
   ]);
+  useNormalizeWorkspaceRoute(workspaceRoute, routeNormalizationOptions);
 
-  const openPicker = useCallback(() => {
-    inputRef.current?.click();
-  }, []);
-
-  // Desktop shortcuts: "/" focuses the queue search (when visible), Ctrl/Cmd+O
-  // opens the file picker instead of the browser's own open dialog.
-  const openPickerRef = useRef(openPicker);
-  useEffect(() => {
-    openPickerRef.current = openPicker;
-  }, [openPicker]);
-
-  useEffect(() => {
-    const handleShortcuts = (event: globalThis.KeyboardEvent) => {
-      // Global shortcuts must not fire while a modal (drawer/dialog) is open,
-      // once another handler has already acted on the event, or when the key
-      // originated inside a dialog - otherwise "/" could focus the queue search
-      // behind an open drawer and break the modal interaction model (UX-017).
-      if (event.defaultPrevented || isModalStackOpen()) {
-        return;
-      }
-
-      const target = event.target instanceof HTMLElement ? event.target : null;
-      if (target?.closest('[role="dialog"], [role="alertdialog"], [aria-modal="true"]')) {
-        return;
-      }
-      const inEditable = !!target?.closest("input, textarea, select, [contenteditable='true']");
-
-      if ((event.ctrlKey || event.metaKey) && !event.shiftKey && !event.altKey && event.key.toLowerCase() === "o") {
-        event.preventDefault();
-        openPickerRef.current();
-        return;
-      }
-
-      if (event.key === "/" && !inEditable && !event.ctrlKey && !event.metaKey && !event.altKey) {
-        const search = document.getElementById("queue-search");
-        if (search instanceof HTMLInputElement) {
-          event.preventDefault();
-          search.focus();
-          search.select();
-        }
-      }
-    };
-
-    window.addEventListener("keydown", handleShortcuts);
-    return () => window.removeEventListener("keydown", handleShortcuts);
-  }, []);
-  const openSessionWorkspace = () => {
+  const openSessionWorkspace = useCallback(() => {
     updateWorkspaceRoute({ screen: "session", tab: "queue" }, { history: "push" });
-  };
-
-  const resetQueueView = useCallback(() => {
-    setQueueSearchDraft("");
-    updateWorkspaceRoute({ search: null, filter: null, sort: null });
   }, [updateWorkspaceRoute]);
+  const handleFilesAdded = useCallback(() => {
+    updateWorkspaceRoute(
+      { screen: "session", tab: "queue", drawer: null },
+      { history: "push" },
+    );
+  }, [updateWorkspaceRoute]);
+  const {
+    handleFiles,
+    handleSessionFile,
+    inputRef,
+    isDragging,
+    openPicker,
+    openSessionPicker,
+    sessionInputRef,
+  } = useFileIntake({
+    enqueueFiles,
+    importSession,
+    onFilesAdded: handleFilesAdded,
+    pushUiNotice,
+  });
 
   // Rendered above the inspector (inline or drawer) whenever the explicitly
   // selected job still exists but the active queue filter/search hides it
@@ -1485,107 +550,6 @@ export function TruePeakWorkbench() {
         </div>
       </div>
     ) : null;
-
-  const handleFiles = (files: FileList | null) => {
-    if (!files?.length) return;
-
-    const added = enqueueFiles(files);
-    if (added > 0) {
-      updateWorkspaceRoute({ screen: "session", tab: "queue", drawer: null }, { history: "push" });
-    }
-    if (inputRef.current) inputRef.current.value = "";
-  };
-
-  // Drag-and-drop is owned here, on the always-mounted workbench, so dropping
-  // a file works on every screen. (It used to live in the home stage only;
-  // dropping onto the session screen made the browser navigate to the file
-  // and silently destroyed the in-memory session.)
-  const handleDropTransfer = useCallback((dataTransfer: DataTransfer) => {
-    // Called synchronously from the drop event: collectDroppedFiles snapshots
-    // the transfer's items before yielding, then walks folders asynchronously.
-    void collectDroppedFiles(dataTransfer).then(({ files, truncated }) => {
-      if (truncated) {
-        pushUiNotice(`That drop was larger than ${numberFormatter.format(MAX_DROPPED_FILES)} files, so only the first ${numberFormatter.format(MAX_DROPPED_FILES)} were considered.`);
-      }
-
-      if (!files.length) return;
-      const added = enqueueFiles(files);
-      if (added > 0) {
-        updateWorkspaceRoute({ screen: "session", tab: "queue", drawer: null }, { history: "push" });
-      }
-    });
-  }, [enqueueFiles, pushUiNotice, updateWorkspaceRoute]);
-  const dropTransferRef = useRef(handleDropTransfer);
-  useEffect(() => {
-    dropTransferRef.current = handleDropTransfer;
-  }, [handleDropTransfer]);
-
-  useEffect(() => {
-    const hasFiles = (event: DragEvent) => !!event.dataTransfer?.types?.includes("Files");
-    // dragenter/dragleave fire for every child crossing; a depth counter keeps
-    // the highlight stable until the pointer truly leaves the window.
-    let depth = 0;
-
-    const handleDragEnter = (event: DragEvent) => {
-      if (!hasFiles(event)) return;
-      event.preventDefault();
-      depth += 1;
-      setIsDragging(true);
-    };
-    const handleDragOver = (event: DragEvent) => {
-      if (hasFiles(event)) {
-        event.preventDefault();
-      }
-    };
-    const handleDragLeave = (event: DragEvent) => {
-      if (!hasFiles(event)) return;
-      depth = Math.max(0, depth - 1);
-      if (depth === 0) {
-        setIsDragging(false);
-      }
-    };
-    const handleDrop = (event: DragEvent) => {
-      if (!hasFiles(event)) return;
-      event.preventDefault();
-      depth = 0;
-      setIsDragging(false);
-      if (event.dataTransfer) {
-        dropTransferRef.current(event.dataTransfer);
-      }
-    };
-    const reset = () => {
-      depth = 0;
-      setIsDragging(false);
-    };
-
-    window.addEventListener("dragenter", handleDragEnter);
-    window.addEventListener("dragover", handleDragOver);
-    window.addEventListener("dragleave", handleDragLeave);
-    window.addEventListener("drop", handleDrop);
-    window.addEventListener("dragend", reset);
-    return () => {
-      window.removeEventListener("dragenter", handleDragEnter);
-      window.removeEventListener("dragover", handleDragOver);
-      window.removeEventListener("dragleave", handleDragLeave);
-      window.removeEventListener("drop", handleDrop);
-      window.removeEventListener("dragend", reset);
-    };
-  }, []);
-
-  const openSessionPicker = () => {
-    sessionInputRef.current?.click();
-  };
-
-  const handleSessionFile = async (files: FileList | null) => {
-    const file = files?.[0];
-    if (sessionInputRef.current) sessionInputRef.current.value = "";
-    if (!file) return;
-
-    const added = await importSession(file);
-    if (added > 0) {
-      updateWorkspaceRoute({ screen: "session", tab: "queue", drawer: null }, { history: "push" });
-    }
-  };
 
   const retrySingleJob = useCallback((jobId: string) => {
     retryJob(jobId);
@@ -1626,7 +590,7 @@ export function TruePeakWorkbench() {
     }
 
     updateWorkspaceRoute(updates, { history: "push" });
-  }, [detailTab, useInlineInspector, updateWorkspaceRoute]);
+  }, [detailTab, setQueueSearchDraft, sortedQueueJobsRef, useInlineInspector, updateWorkspaceRoute]);
 
   const chooseJob = useCallback((jobId: string) => {
     // Only the advanced inline layout needs the programmatic scroll/focus to the
@@ -1747,81 +711,133 @@ export function TruePeakWorkbench() {
     }
   }, [queueFocusTick]);
 
-  const requestRemoveJob = useCallback((jobId: string) => {
-    setConfirmDialogState({ type: "remove-job", jobId });
-  }, []);
+  const {
+    closeConfirmDialog,
+    confirmDialogCopy,
+    confirmDialogState,
+    requestClearFinished,
+    requestClearHistory,
+    requestClearSession,
+    requestClosePresetDrawer,
+    requestRemoveJob,
+    runConfirmedAction,
+  } = useConfirmDialog({
+    clearFinished,
+    clearRecentSessions,
+    clearSession,
+    handleCancelDraft,
+    pushUiNotice,
+    removeJob,
+    setWorkspaceDrawer,
+    workspaceDrawer,
+  });
 
-  const requestClearFinished = () => {
-    setConfirmDialogState({ type: "clear-finished" });
-  };
-
-  const requestClearSession = () => {
-    setConfirmDialogState({ type: "clear-session" });
-  };
-
-  const requestClearHistory = () => {
-    setConfirmDialogState({ type: "clear-history" });
-  };
-
-  const runConfirmedAction = () => {
-    if (!confirmDialogState) {
-      return;
-    }
-
-    switch (confirmDialogState.type) {
-      case "remove-job":
-        removeJob(confirmDialogState.jobId);
-        pushUiNotice("File removed from this session.");
-        break;
-      case "clear-finished":
-        clearFinished();
-        pushUiNotice("Finished files removed from the queue.");
-        break;
-      case "clear-session":
-        clearSession();
-        pushUiNotice("Session cleared.");
-        break;
-      case "clear-history": {
-        const cleared = clearRecentSessions();
-        if (cleared && workspaceDrawer === "history") {
-          setWorkspaceDrawer("none");
-        }
-        pushUiNotice("Saved history cleared.");
-        break;
-      }
-    }
-  };
-
-  const confirmDialogCopy =
-    confirmDialogState?.type === "remove-job"
-      ? {
-          title: "Remove this file?",
-          description:
-            "This removes the file and its result from the current session. You can add it again any time.",
-          confirmLabel: "Remove file",
-        }
-      : confirmDialogState?.type === "clear-finished"
-        ? {
-            title: "Clear finished files?",
-            description:
-              "Completed, failed, and canceled items will be removed from the current queue. Active work keeps running.",
-            confirmLabel: "Clear finished",
-          }
-        : confirmDialogState?.type === "clear-session"
-          ? {
-              title: "Clear the current session?",
-              description:
-                "This removes every queued and completed file from the current session view. Saved history stays untouched.",
-              confirmLabel: "Clear session",
-            }
-          : confirmDialogState?.type === "clear-history"
-            ? {
-                title: "Clear saved history?",
-                description:
-                  "This removes the local summary cards stored in this browser. It does not affect the current queue.",
-                confirmLabel: "Clear history",
-              }
-            : null;
+  const goHome = useCallback(() => setWorkspaceScreen("home"), [setWorkspaceScreen]);
+  const openCompare = useCallback(() => setWorkspaceTab("compare"), [setWorkspaceTab]);
+  const openHistory = useCallback(() => setWorkspaceDrawer("history"), [setWorkspaceDrawer]);
+  const openPresetLibrary = useCallback(() => setWorkspaceDrawer("presets"), [setWorkspaceDrawer]);
+  const commandContextValue = useMemo<WorkspaceCommandContextValue>(() => ({
+    cancelActiveJobs,
+    cancelJob,
+    clearSession,
+    currentModeLabel,
+    currentTarget: targetingEnabled ? activeTarget : null,
+    compatibilityDecoderAllowed,
+    connectionSavingStatus,
+    decodeLabel: formatDecodePreferenceLabel(decodePreference),
+    decodePreference,
+    exportCsv,
+    exportJson,
+    exportMarkdown,
+    exportSession,
+    goHome,
+    historyEnabled,
+    isDragging,
+    openCompare,
+    openHistory,
+    openPicker,
+    openPresetLibrary,
+    openSessionPicker,
+    parallelPreference,
+    requestClearFinished,
+    requestClearSession,
+    retryJob: retrySingleJob,
+    route: { analysisMode, detailTab, uiMode },
+    setAnalysisMode,
+    setCompatibilityDecoderAllowed: setCompatibilityDecoderOptIn,
+    setDecodePreference,
+    setDetailTab,
+    setParallelPreference,
+    setUiMode,
+    toggleHistory: toggleHistoryEnabled,
+    toggleTheme,
+  }), [
+    activeTarget,
+    analysisMode,
+    cancelActiveJobs,
+    cancelJob,
+    clearSession,
+    currentModeLabel,
+    compatibilityDecoderAllowed,
+    connectionSavingStatus,
+    decodePreference,
+    detailTab,
+    exportCsv,
+    exportJson,
+    exportMarkdown,
+    exportSession,
+    goHome,
+    historyEnabled,
+    isDragging,
+    openCompare,
+    openHistory,
+    openPicker,
+    openPresetLibrary,
+    openSessionPicker,
+    parallelPreference,
+    requestClearFinished,
+    requestClearSession,
+    retrySingleJob,
+    setAnalysisMode,
+    setDecodePreference,
+    setDetailTab,
+    setParallelPreference,
+    setUiMode,
+    targetingEnabled,
+    toggleHistoryEnabled,
+    toggleTheme,
+    uiMode,
+  ]);
+  const sessionContextValue = useMemo<WorkspaceSessionContextValue>(() => ({
+    batchProgress,
+    completedJobs,
+    jobs,
+    parallelLimit,
+    queueCounts,
+    selectedJob,
+    sessionStats,
+  }), [
+    batchProgress,
+    completedJobs,
+    jobs,
+    parallelLimit,
+    queueCounts,
+    selectedJob,
+    sessionStats,
+  ]);
+  const inspectorPanel = selectedJob ? (
+    <InspectorPanel
+      headingId={advancedInlineInspector ? "selected-file-details-heading" : undefined}
+      headingRef={advancedInlineInspector ? advancedInspectorHeadingRef : undefined}
+      headingTabIndex={advancedInlineInspector ? -1 : undefined}
+    />
+  ) : null;
+  const inspectorSlot = selectedJob ? (
+    <>
+      {selectionHiddenNotice}
+      {inspectorPanel}
+    </>
+  ) : null;
 
   const sessionOverviewCards = (
     <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
@@ -1833,11 +849,19 @@ export function TruePeakWorkbench() {
   );
 
   return (
-    <>
+    <WorkspaceCommandProvider value={commandContextValue}>
+      <WorkspaceSessionProvider value={sessionContextValue}>
+      <>
+      <ThemeSynchronizer />
       <a href="#truepeak-main" className="sr-only focus:not-sr-only focus:fixed focus:left-4 focus:top-4 focus:z-[60] focus:rounded-full focus:bg-[var(--surface-1)] focus:px-4 focus:py-2 focus:text-sm focus:font-semibold focus:text-[var(--ink)] focus:shadow-[var(--shadow-elevated)]">
         Skip to main content
       </a>
-      <main id="truepeak-main" className="tp-min-h-viewport mx-auto flex w-full max-w-[1760px] flex-col gap-6 px-4 py-6 sm:px-6 xl:px-8 2xl:px-10">
+      <main
+        ref={mainRef}
+        id="truepeak-main"
+        data-hydrated="false"
+        className="tp-min-h-viewport mx-auto flex w-full max-w-[1760px] flex-col gap-6 px-4 py-6 sm:px-6 xl:px-8 2xl:px-10"
+      >
       {/* Hidden polite region announcing batch completions and failures. Kept a
           direct-child live region on purpose: the modal inert-walk in
           use-modal-focus.ts exempts sibling live regions element-by-element, so
@@ -1876,7 +900,7 @@ export function TruePeakWorkbench() {
               </p>
             </div>
             <div className="flex flex-wrap items-center gap-2">
-              <ThemeToggle theme={theme} onToggle={toggleTheme} />
+              <ThemeToggle onToggle={toggleTheme} />
               <Button type="button" size="sm" variant="secondary" onClick={openSessionPicker}>
                 <FolderOpen className="h-4 w-4" />
                 Open Session
@@ -1896,27 +920,12 @@ export function TruePeakWorkbench() {
           <WorkspaceNotices
             persistentWarning={persistentWarning}
             transientNotice={transientNotice}
-            canRetrySettings={canRetrySettings}
-            onRetrySettings={retrySettingsPersistence}
+            persistentAction={persistentAction}
           />
 
           <HomeStage
-            uiMode={uiMode}
-            analysisMode={analysisMode}
-            decodePreference={decodePreference}
-            parallelPreference={parallelPreference}
-            resolvedParallelLimit={parallelLimit}
-            currentTarget={targetingEnabled ? activeTarget : null}
-            currentModeLabel={currentModeLabel}
             supportedFormats={SUPPORTED_FORMATS}
             decodeOptions={DECODE_PREFERENCES}
-            isDragging={isDragging}
-            onOpenPicker={openPicker}
-            onSetUiMode={setUiMode}
-            onSetAnalysisMode={setAnalysisMode}
-            onSetDecodePreference={setDecodePreference}
-            onSetParallelPreference={setParallelPreference}
-            onOpenPresetLibrary={() => setWorkspaceDrawer("presets")}
           />
 
           {showHomeSupportSection ? (
@@ -2008,52 +1017,16 @@ export function TruePeakWorkbench() {
               </div>
             </div>
           ) : null}
-          <StudioToolbar
-            currentModeLabel={currentModeLabel}
-            uiMode={uiMode}
-            decodeLabel={formatDecodePreferenceLabel(decodePreference)}
-            historyEnabled={historyEnabled}
-            completedCount={completedJobs.length}
-            activeCount={queueCounts.active}
-            finishedCount={finishedCount}
-            jobsCount={jobs.length}
-            parallelLimit={parallelLimit}
-            batchProgress={batchProgress}
-            themeControl={<ThemeToggle theme={theme} onToggle={toggleTheme} />}
-            onGoHome={() => setWorkspaceScreen("home")}
-            onOpenPicker={openPicker}
-            onExportCsv={exportCsv}
-            onExportJson={exportJson}
-            onExportMarkdown={exportMarkdown}
-            onExportSession={exportSession}
-            onOpenSession={openSessionPicker}
-            onToggleHistory={toggleHistoryEnabled}
-            onOpenHistory={() => setWorkspaceDrawer("history")}
-            onClearFinished={requestClearFinished}
-            onCancelActive={cancelActiveJobs}
-            onClearSession={requestClearSession}
-          />
+          <StudioToolbar />
 
           <WorkspaceNotices
             persistentWarning={persistentWarning}
             transientNotice={transientNotice}
-            canRetrySettings={canRetrySettings}
-            onRetrySettings={retrySettingsPersistence}
+            persistentAction={persistentAction}
           />
 
           <WorkspaceSummaryRail
-            analysisMode={analysisMode}
-            currentTarget={targetingEnabled ? activeTarget : null}
             variant={uiMode === "advanced" ? "compact" : "default"}
-            queueCount={jobs.length}
-            completedCount={completedJobs.length}
-            issueCount={queueCounts.issues}
-            averageLufs={queueAverage}
-            hottestTruePeak={hottestTruePeak}
-            complianceCounts={targetingEnabled ? complianceCounts : undefined}
-            onOpenPresetLibrary={() => setWorkspaceDrawer("presets")}
-            onOpenCompare={() => setWorkspaceTab("compare")}
-            canOpenCompare={uiMode === "advanced" && completedJobs.length > 1}
           />
 
           {uiMode === "advanced" ? (
@@ -2077,7 +1050,7 @@ export function TruePeakWorkbench() {
                       role="tab"
                       id={`workspace-tab-${tab.id}`}
                       aria-selected={selected}
-                      aria-controls={`workspace-panel-${tab.id}`}
+                      aria-controls={selected ? `workspace-panel-${tab.id}` : undefined}
                       tabIndex={selected ? 0 : -1}
                       onClick={() => setWorkspaceTab(tab.id)}
                       onKeyDown={(event) => handleWorkspaceTabKeyDown(event, index)}
@@ -2152,13 +1125,13 @@ export function TruePeakWorkbench() {
                         name="queue-search"
                         type="search"
                         value={queueSearchDraft}
-                        onChange={(event) => setSearchQuery(event.target.value)}
+                        onChange={(event) => setQueueSearchDraft(event.target.value)}
                         aria-label="Search files in the current session"
                         aria-keyshortcuts="/"
                         autoComplete="off"
                         spellCheck={false}
                         placeholder="Search by file, status, preset, decoder, or layout…"
-                        className={cn("w-full rounded-full border border-[var(--control-line)] bg-[var(--surface-1)] pl-11 pr-4 text-sm text-[var(--ink)] outline-none transition-[border-color,background-color] duration-200 ease-out focus:border-[var(--accent)]", uiMode === "advanced" ? "h-10" : "h-11")}
+                        className={cn("w-full rounded-full border border-[var(--control-line)] bg-[var(--surface-1)] pl-11 pr-4 text-sm text-[var(--ink)] outline-none transition-[border-color,background-color] duration-200 ease-out focus:border-[var(--accent)] focus-visible:ring-2 focus-visible:ring-[var(--accent)]", uiMode === "advanced" ? "h-10" : "h-11")}
                       />
                     </div>
                     <div className="flex flex-col gap-3 xl:items-end">
@@ -2199,7 +1172,18 @@ export function TruePeakWorkbench() {
                     </div>
                   </div>
 
-                  <div ref={queueRegionRef} className={cn("space-y-4", uiMode === "advanced" ? "mt-4" : "mt-5")} onKeyDown={handleQueueKeyDown}>
+                  <p className={cn("text-xs leading-5 text-[var(--muted)]", uiMode === "advanced" ? "mt-4" : "mt-5")}>
+                    Keyboard: arrows move, Enter opens, / searches.
+                  </p>
+
+                  <div
+                    ref={queueRegionRef}
+                    role="region"
+                    aria-label="File queue"
+                    aria-keyshortcuts="ArrowUp ArrowDown Home End Enter"
+                    className="mt-2 space-y-4"
+                    onKeyDown={handleQueueKeyDown}
+                  >
                     {sortedQueueJobs.length ? (
                       uiMode === "simple" ? (
                         <SimpleResultsTable
@@ -2241,17 +1225,7 @@ export function TruePeakWorkbench() {
 
                 {uiMode === "simple" && showInlineInspector && selectedJob ? (
                   <div className="min-w-0">
-                    {selectionHiddenNotice}
-                    <InspectorPanel
-                      job={selectedJob}
-                      analysisMode={analysisMode}
-                      detailTab={detailTab}
-                      completedCount={completedJobs.length}
-                      onDetailTabChange={setDetailTab}
-                      onOpenCompare={undefined}
-                      onRetryJob={retrySingleJob}
-                      onCancelJob={cancelJob}
-                    />
+                    {inspectorSlot}
                   </div>
                 ) : null}
 
@@ -2267,20 +1241,7 @@ export function TruePeakWorkbench() {
                     // bar's height on every Inspect click.
                     className="min-w-0 focus:outline-none"
                   >
-                  {selectionHiddenNotice}
-                  <InspectorPanel
-                    job={selectedJob}
-                    analysisMode={analysisMode}
-                    detailTab={detailTab}
-                    headingId="selected-file-details-heading"
-                    headingRef={advancedInspectorHeadingRef}
-                    headingTabIndex={-1}
-                    completedCount={completedJobs.length}
-                    onDetailTabChange={setDetailTab}
-                    onOpenCompare={() => setWorkspaceTab("compare")}
-                    onRetryJob={retrySingleJob}
-                    onCancelJob={cancelJob}
-                  />
+                  {inspectorSlot}
                   </section>
                 ) : null}
               </div>
@@ -2295,7 +1256,7 @@ export function TruePeakWorkbench() {
               className="min-w-0"
             >
               <CompareStudio
-                completedJobs={completedJobs}
+                sessionStats={sessionStats}
                 currentTarget={analysisMode === "targeted" ? activeTarget : null}
                 analysisMode={analysisMode}
                 selectedJobId={selectedJob?.id ?? null}
@@ -2322,7 +1283,7 @@ export function TruePeakWorkbench() {
               className="min-w-0"
             >
               <SessionInsightsPanel
-                completedJobs={completedJobs}
+                sessionStats={sessionStats}
                 currentTarget={analysisMode === "targeted" ? activeTarget : null}
                 analysisMode={analysisMode}
                 historyEnabled={historyEnabled}
@@ -2342,14 +1303,23 @@ export function TruePeakWorkbench() {
           title={confirmDialogCopy.title}
           description={confirmDialogCopy.description}
           confirmLabel={confirmDialogCopy.confirmLabel}
-          onClose={() => setConfirmDialogState(null)}
+          onClose={closeConfirmDialog}
           onConfirm={runConfirmedAction}
         />
       ) : null}
 
       <PresetLibraryDrawer
         open={workspaceDrawer === "presets" && targetingEnabled}
-        onClose={() => setWorkspaceDrawer("none")}
+        onClose={() => {
+          // Escape, backdrop click, and the Close button all route through
+          // here (browser Back does not - see WP-17 notes). A dirty draft
+          // asks first instead of silently discarding it (UX-09).
+          if (draftIsDirty) {
+            requestClosePresetDrawer();
+            return;
+          }
+          setWorkspaceDrawer("none");
+        }}
         activeTarget={activeTarget}
         draftTarget={draftPreviewTarget}
         fieldErrors={draftResolution.errors}
@@ -2391,41 +1361,14 @@ export function TruePeakWorkbench() {
         mobileMode="sheet"
         desktopClassName="lg:w-[min(760px,96vw)]"
       >
-        {selectedJob ? (
-          <>
-          {selectionHiddenNotice}
-          <InspectorPanel
-            job={selectedJob}
-            analysisMode={analysisMode}
-            detailTab={detailTab}
-            completedCount={completedJobs.length}
-            onDetailTabChange={setDetailTab}
-            onOpenCompare={uiMode === "advanced" ? () => setWorkspaceTab("compare") : undefined}
-            onRetryJob={retrySingleJob}
-            onCancelJob={cancelJob}
-          />
-          </>
-        ) : null}
+        {inspectorSlot}
       </DrawerPanel>
       </main>
-    </>
+      </>
+      </WorkspaceSessionProvider>
+    </WorkspaceCommandProvider>
   );
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 

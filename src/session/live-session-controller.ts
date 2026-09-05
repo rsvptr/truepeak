@@ -12,7 +12,7 @@ import type {
   LiveSessionStore,
   LiveSessionStoreProblem,
   LiveSessionStoreProblemStatus,
-} from "@/audio/live-session-store";
+} from "@/session/live-session-store";
 
 export type LiveSessionControllerOperation = "read" | "write" | "delete" | "clear";
 

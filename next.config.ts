@@ -11,8 +11,8 @@ const isDev = process.env.NODE_ENV !== "production";
 const contentSecurityPolicy = [
   "default-src 'self'",
   isDev
-    ? "script-src 'self' 'unsafe-inline' 'unsafe-eval' 'wasm-unsafe-eval' blob:"
-    : "script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval' blob:",
+    ? "script-src 'self' 'unsafe-inline' 'unsafe-eval' 'wasm-unsafe-eval'"
+    : "script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval'",
   "style-src 'self' 'unsafe-inline'",
   "img-src 'self' data: blob:",
   "font-src 'self' data:",
@@ -32,20 +32,34 @@ const securityHeaders = [
   { key: "X-Content-Type-Options", value: "nosniff" },
   { key: "X-Frame-Options", value: "DENY" },
   { key: "Referrer-Policy", value: "strict-origin-when-cross-origin" },
+  // COOP only: COEP is deliberately omitted because nothing in this app uses
+  // SharedArrayBuffer.
   { key: "Cross-Origin-Opener-Policy", value: "same-origin" },
   {
     key: "Permissions-Policy",
     value: "camera=(), microphone=(), geolocation=(), payment=(), usb=(), screen-wake-lock=(self)",
   },
+  // Vercel adds its own HSTS header for hosted deployments; this covers
+  // self-hosting (next start) where nothing else sets it.
+  { key: "Strict-Transport-Security", value: "max-age=63072000; includeSubDomains" },
 ];
 
 const nextConfig: NextConfig = {
+  poweredByHeader: false,
   images: {
     unoptimized: true,
   },
-  turbopack: {},
   async headers() {
     return [
+      {
+        source: "/vendor/ffmpeg/:path*",
+        headers: [
+          {
+            key: "Cache-Control",
+            value: "public, max-age=31536000, immutable",
+          },
+        ],
+      },
       {
         source: "/(.*)",
         headers: securityHeaders,

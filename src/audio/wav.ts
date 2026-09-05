@@ -1,4 +1,10 @@
 import { deriveChannelLayout } from "@/audio/channel-layout";
+import {
+  iterateContainerChunks,
+  readAscii,
+  readSafeUint64,
+  type BeforePcmAllocation,
+} from "@/audio/container-chunks";
 import type { DecodedAudioAsset, SourceFormat } from "@/types/audio";
 
 const WAVE_FORMAT_PCM = 0x0001;
@@ -13,14 +19,6 @@ interface ChunkInfo {
   size: number;
 }
 
-function readAscii(view: DataView, offset: number, length: number) {
-  let out = "";
-  for (let index = 0; index < length; index += 1) {
-    out += String.fromCharCode(view.getUint8(offset + index));
-  }
-  return out;
-}
-
 function readGuid(view: DataView, offset: number) {
   const a = view.getUint32(offset, true).toString(16).padStart(8, "0");
   const b = view.getUint16(offset + 4, true).toString(16).padStart(4, "0");
@@ -32,12 +30,6 @@ function readGuid(view: DataView, offset: number) {
     view.getUint8(offset + 10 + i).toString(16).padStart(2, "0"),
   ).join("");
   return `${a}-${b}-${c}-${d}-${e}`;
-}
-
-function readUint64LE(view: DataView, offset: number) {
-  const low = view.getUint32(offset, true);
-  const high = view.getUint32(offset + 4, true);
-  return high * 2 ** 32 + low;
 }
 
 function decodePcmToPlanar(
@@ -104,8 +96,13 @@ export function parseWavBuffer(
   buffer: ArrayBuffer,
   fileName: string,
   mimeType: string,
+  beforePcmAllocation?: BeforePcmAllocation,
 ): DecodedAudioAsset {
   const view = new DataView(buffer);
+  if (view.byteLength < 12) {
+    throw new Error("WAV file header is truncated.");
+  }
+
   const container = readAscii(view, 0, 4);
   const sourceFormat: SourceFormat = container === "RF64" ? "rf64" : "wav";
 
@@ -113,39 +110,39 @@ export function parseWavBuffer(
     throw new Error("Not a RIFF/RF64 wave file.");
   }
 
-  if (view.byteLength < 12) {
-    throw new Error("WAV file header is truncated.");
-  }
-
   if (readAscii(view, 8, 4) !== "WAVE") {
     throw new Error("Missing WAVE signature.");
   }
 
   const warnings: string[] = [];
-  // Track only the chunks the parser actually reads. Recording every chunk in
-  // a map let a hostile file made of millions of tiny chunks balloon memory
-  // before any audio was parsed; unknown chunk IDs are now just skipped over.
-  const chunks = new Map<string, ChunkInfo>();
-  let offset = 12;
+  let fmt: ChunkInfo | null = null;
+  let data: ChunkInfo | null = null;
   let dataSizeFromDs64: number | null = null;
   let ds64Resolved = false;
+  let ds64Seen = false;
 
-  while (offset + 8 <= view.byteLength) {
-    const id = readAscii(view, offset, 4);
-    const chunkSize = view.getUint32(offset + 4, true);
-    const dataOffset = offset + 8;
-
-    if (id === "ds64") {
+  for (const chunk of iterateContainerChunks(view, {
+    startOffset: 12,
+    totalBytes: view.byteLength,
+    littleEndian: true,
+    resolveSize: (id, declaredSize) =>
+      id === "data" && sourceFormat === "rf64" && declaredSize === 0xffffffff
+        ? dataSizeFromDs64
+        : declaredSize,
+  })) {
+    if (chunk.id === "ds64" && !ds64Seen) {
+      ds64Seen = true;
       // ds64 must carry a readable 64-bit dataSize field (riffSize + dataSize
       // + sampleCount + tableLength = 28 bytes minimum); bound the read to
       // the actual buffer so a truncated ds64 can't be misread as valid.
-      const ds64Readable = chunkSize >= 28 && dataOffset + 16 <= view.byteLength;
+      const ds64Readable =
+        chunk.declaredSize >= 28 && chunk.dataOffset + 28 <= view.byteLength;
       if (sourceFormat === "rf64" && !ds64Readable) {
         throw new Error("RF64 ds64 chunk is truncated or malformed.");
       }
       if (ds64Readable) {
-        const resolvedDataSize = readUint64LE(view, dataOffset + 8);
-        const resolvedValid = Number.isSafeInteger(resolvedDataSize) && resolvedDataSize >= 0;
+        const resolvedDataSize = readSafeUint64(view, chunk.dataOffset + 8, true);
+        const resolvedValid = resolvedDataSize != null && resolvedDataSize >= 0;
         if (sourceFormat === "rf64" && !resolvedValid) {
           throw new Error("RF64 ds64 chunk declares an invalid or unresolved data size.");
         }
@@ -160,33 +157,25 @@ export function parseWavBuffer(
     // 0xFFFFFFFF sentinel data sizes rather than clamping them to whatever
     // bytes happen to remain in the buffer (that previously turned trailing
     // chunk headers/padding into fabricated audio frames).
-    if (id === "data" && sourceFormat === "rf64" && !ds64Resolved) {
+    if (chunk.id === "data" && sourceFormat === "rf64" && !ds64Resolved) {
       throw new Error(
         "RF64 file is missing the required ds64 chunk, or it does not precede the data chunk.",
       );
     }
 
-    const size =
-      chunkSize === 0xffffffff && id === "data" && dataSizeFromDs64 != null
-        ? dataSizeFromDs64
-        : chunkSize;
-
-    if (id === "fmt " || id === "data" || id === "ds64") {
-      chunks.set(id, { offset: dataOffset, size });
+    if (chunk.id === "fmt " && fmt == null && chunk.size != null) {
+      fmt = { offset: chunk.dataOffset, size: chunk.size };
+    } else if (chunk.id === "data" && data == null && chunk.size != null) {
+      data = { offset: chunk.dataOffset, size: chunk.size };
     }
 
-    // Spec-conforming files carry one fmt and one data chunk (and ds64, when
-    // present, precedes data), so once both are known nothing later can
-    // legitimately change the result — stop scanning attacker-padded tails.
-    if (chunks.has("fmt ") && chunks.has("data")) {
+    // First occurrence wins on both sides of the preflight/parser boundary.
+    // Stop as soon as both chunks are known, including when data precedes fmt.
+    if (fmt && data) {
       break;
     }
-
-    offset = dataOffset + chunkSize + (chunkSize % 2);
   }
 
-  const fmt = chunks.get("fmt ");
-  const data = chunks.get("data");
   if (!fmt || !data) {
     throw new Error("Wave file is missing fmt or data chunks.");
   }
@@ -224,6 +213,20 @@ export function parseWavBuffer(
   if (![WAVE_FORMAT_PCM, WAVE_FORMAT_IEEE_FLOAT].includes(formatTag)) {
     throw new Error(`Unsupported wave format tag: 0x${formatTag.toString(16)}`);
   }
+  const bytesPerSample = bitsPerSample / 8;
+  if (!Number.isInteger(bytesPerSample)) {
+    throw new Error(`Unsupported PCM depth: ${bitsPerSample}-bit`);
+  }
+  if (
+    (formatTag === WAVE_FORMAT_PCM && ![8, 16, 24, 32].includes(bitsPerSample)) ||
+    (formatTag === WAVE_FORMAT_IEEE_FLOAT && ![32, 64].includes(bitsPerSample))
+  ) {
+    throw new Error(
+      formatTag === WAVE_FORMAT_IEEE_FLOAT
+        ? `Unsupported IEEE float depth: ${bitsPerSample}-bit`
+        : `Unsupported PCM depth: ${bitsPerSample}-bit`,
+    );
+  }
 
   // M-10: for RF64 the ds64-resolved (or explicit) data size is authoritative. If it
   // claims more bytes than the file physically holds, the file is corrupt or hostile
@@ -239,19 +242,27 @@ export function parseWavBuffer(
     );
   }
 
+  const decodedByteLength = Math.min(data.size, availableDataBytes);
+  const frameStride = bytesPerSample * channelCount;
+  const decodedFrameCount = Math.floor(decodedByteLength / frameStride);
+  if (!Number.isSafeInteger(decodedFrameCount) || decodedFrameCount <= 0) {
+    throw new Error("Wave file does not contain decoded audio frames.");
+  }
+  beforePcmAllocation?.({
+    channelCount,
+    bitDepth: bitsPerSample,
+    frameCount: decodedFrameCount,
+  });
+
   const decoded = decodePcmToPlanar(
     view,
     data.offset,
-    Math.min(data.size, availableDataBytes),
+    decodedByteLength,
     channelCount,
     bitsPerSample,
     formatTag,
     true,
   );
-  if (decoded.frameCount <= 0) {
-    throw new Error("Wave file does not contain decoded audio frames.");
-  }
-
   // "wave" so a plain 16-byte `fmt ` chunk (no dwChannelMask) is laid out the
   // way WAVE interleaves, matching what the mask path resolves for the same file
   // when the mask is present.

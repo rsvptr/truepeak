@@ -1,32 +1,59 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { getComplianceSummary } from "@/audio/compliance";
 import {
-  decodeAudioFileInBrowser,
-  isBrowserDecodeDrainTimeout,
-  shouldPreferBrowserDecoder,
-} from "@/audio/browser-decode";
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from "react";
+import { JobStore } from "@/analysis/job-store";
+import {
+  subscribeLiveSessionPersistence,
+  subscribePendingAnalysisCount,
+  subscribeRecentSessionHistory,
+} from "@/analysis/job-store-subscribers";
+import {
+  AnalysisScheduler,
+  MAX_LANE_FAILURE_STREAK,
+  recordLaneTransportFault,
+  subscribeLaneAdmission,
+} from "@/analysis/analysis-scheduler";
+import { LaneReservations } from "@/analysis/lane-reservations";
+import {
+  ANALYSIS_PROGRESS_BASE,
+  runAnalysisJob,
+} from "@/analysis/run-analysis-job";
+import type {
+  AnalyzerSettings,
+  DecodedWorkerResult,
+  JobResourcePlan,
+  LaneLease,
+  WorkerLane,
+} from "@/analysis/scheduler-types";
+import { getComplianceSummary } from "@/audio/compliance";
+import { shouldPreferBrowserDecoder } from "@/audio/browser-decode";
 import {
   DecodeResourceError,
   assertDecodedFootprint,
   assertSourceWithinBudget,
   checkedResourceByteSum,
-  classifyReservationContention,
   conservativeDecodePeakBytes,
   declaredDecodeCorroboratedByFileSize,
   decodePeakResidentBytes,
   decodeFailureDetails,
-  growDecodePeakReservation,
+  decodeFailureSummary,
   inspectAudioContainer,
-  planLaneAdmission,
+  planProbedDecodeFootprint,
   resolveAdaptiveDecodeBudget,
   resolveDecodeBudget,
   validatePlanarChannels,
   type DecodeBudget,
+  type DecodeFailureCode,
+  type DecodeProbeMetadata,
 } from "@/audio/decode-budget";
 import {
-  browserDecodeWindowCapacity,
   createCountingSemaphore,
   type CountingSemaphore,
 } from "@/audio/decode-window";
@@ -45,20 +72,26 @@ import {
 } from "@/audio/session-file";
 import {
   indexedDbLiveSessionStore,
-} from "@/audio/live-session-store";
+} from "@/session/live-session-store";
 import {
   createLiveSessionController,
   type LiveSessionControllerResult,
-} from "@/audio/live-session-controller";
+} from "@/session/live-session-controller";
 import {
   clearPersistedRecentSessions,
   loadRecentSessions,
   persistRecentSessions,
-} from "@/audio/persistence";
+} from "@/session/persistence";
 import { DEFAULT_TARGET_PRESET } from "@/audio/presets";
 import { mergeImportedJobs, reconcileSessionJobs } from "@/audio/session-reconciliation";
 import { retargetAnalysisResult } from "@/audio/targeting";
-import { getCompletedAnalysisJobs, isActiveJob, isIssueJob } from "@/lib/session-selectors";
+import { buildRecoveryNotice, composeJobError } from "@/lib/job-ui";
+import {
+  ANALYSIS_PAUSED_LABEL,
+  getCompletedAnalysisJobs,
+  isActiveJob,
+  isIssueJob,
+} from "@/lib/session-selectors";
 import { downloadTextFile, makeId } from "@/lib/utils";
 import { fileIdentityKey } from "@/lib/file-identity";
 import type { ParallelLanesPreference } from "@/lib/workspace-preferences";
@@ -86,65 +119,28 @@ interface PendingResolver<T> {
   workerEpoch: number;
 }
 
-interface DecodedWorkerResult {
-  asset: DecodedAudioTransfer;
-  usage: DecodeResourceUsage;
-}
-
-interface DecodeReservation {
-  readonly plannedPeakBytes: number;
-  peakBytes: number;
-  exclusive: boolean;
-  released: boolean;
-}
-
-interface LaneLease {
-  readonly laneId: number;
-  readonly generation: number;
+interface ProbeLease {
   readonly jobId: string;
-  readonly runToken: number;
-  readonly reservation: DecodeReservation;
-  readonly browserAbortController: AbortController;
+  readonly generation: number;
+  readonly planGeneration: number;
+  readonly file: File;
 }
 
-type JobResourcePlan =
-  | { kind: "preparing" }
-  | { kind: "known"; decodedBytes: number; trustedNative: boolean }
-  | { kind: "unknown" }
-  | { kind: "rejected"; error: string }
-  // A job that hit reservation contention mid-run and was flipped back to
-  // "queued". It carries the exact reservation and exclusivity it must be
-  // re-admitted under, and the single decode route it must run on re-admission
-  // (no fallback chain), so fillLanes bypasses the preflight admission model
-  // and runJob honors the pinned route. `escalations` caps runJob-time requeues
-  // so a job can never loop forever; `decodedBytes` is carried from a prior
-  // known plan for labels only and does not drive admission.
-  | {
-      kind: "escalated";
-      reservationPeakBytes: number;
-      exclusive: boolean;
-      route: "browser-only" | "compatibility-only";
-      decodedBytes: number | null;
-      escalations: number;
-    };
+interface ProbePendingResolver {
+  resolve: (metadata: DecodeProbeMetadata) => void;
+  reject: (reason?: unknown) => void;
+  lease: ProbeLease;
+  workerEpoch: number;
+  timeoutId: number;
+}
 
-// A lane is an independent decoder+analyzer worker pair that owns at most one
-// job at a time. Multiple lanes let the queue process files in parallel while
-// keeping the original per-job semantics: canceling or removing an active job
-// terminates only its own lane's workers, never a neighbour's.
-interface WorkerLane {
-  id: number;
-  decoder: Worker | null;
-  analyzer: Worker | null;
+interface ProbeWorkerState {
+  worker: Worker | null;
   workerEpoch: number;
   leaseGeneration: number;
-  lease: LaneLease | null;
-  retireAfterRelease: boolean;
-  // Consecutive worker failures without a single successful message. Guards
-  // against an unbounded terminate/respawn loop when worker scripts cannot
-  // load at all (stale deploy, offline revisit).
-  failureStreak: number;
+  lease: ProbeLease | null;
 }
+
 
 class WorkerTransportError extends Error {
   constructor(message: string) {
@@ -153,11 +149,10 @@ class WorkerTransportError extends Error {
   }
 }
 
-// After this many consecutive worker failures the lane retires and the worker
-// circuit remains open until the user explicitly queues or retries work.
-const MAX_LANE_FAILURE_STREAK = 3;
+const WORKER_CIRCUIT_MESSAGE =
+  "Analysis is paused because the browser could not keep its local workers running. Retry analysis. If it fails again, reload the page.";
 
-// One shape for a cancelled row, applied both to jobsRef (synchronously) and
+// One shape for a cancelled row, applied both to job store (synchronously) and
 // through setJobs, so the two can never describe the row differently.
 function markJobCanceled(job: AnalysisJob): AnalysisJob {
   return {
@@ -169,9 +164,15 @@ function markJobCanceled(job: AnalysisJob): AnalysisJob {
   };
 }
 
-// Where analysis begins on the job's overall progress bar (read+decode owns
-// everything before it). Analyzer worker fractions are mapped above this.
-const ANALYSIS_PROGRESS_BASE = 0.86;
+const PROGRESS_COMMIT_INTERVAL_MS = 100;
+
+interface PendingProgressUpdate {
+  jobId: string;
+  runToken: number;
+  status: AnalysisJob["status"];
+  progressPercent: number;
+  progressLabel: string;
+}
 
 // Tear idle lanes down after this long with nothing active. Workers (and any
 // lazily loaded ffmpeg.wasm heaps inside them) are not free to keep around,
@@ -179,6 +180,45 @@ const ANALYSIS_PROGRESS_BASE = 0.86;
 const IDLE_LANE_TEARDOWN_MS = 45_000;
 
 const SESSION_IMPORT_TIMEOUT_MS = 45_000;
+const PROBE_RESPONSE_TIMEOUT_MS = 18_000;
+const PENDING_ANALYSIS_COUNT_KEY = "truepeak-pending-analysis-count-v1";
+
+function readPendingAnalysisCount() {
+  try {
+    const count = Number.parseInt(window.localStorage.getItem(PENDING_ANALYSIS_COUNT_KEY) ?? "0", 10);
+    return Number.isSafeInteger(count) && count > 0 && count <= MAX_SESSION_JOBS
+      ? count
+      : 0;
+  } catch {
+    return 0;
+  }
+}
+
+function writePendingAnalysisCount(count: number) {
+  try {
+    if (count > 0) {
+      window.localStorage.setItem(PENDING_ANALYSIS_COUNT_KEY, String(count));
+    } else {
+      window.localStorage.removeItem(PENDING_ANALYSIS_COUNT_KEY);
+    }
+  } catch {
+    // This counter only explains work lost after a mobile tab discard. The
+    // completed-result recovery path remains authoritative when storage fails.
+  }
+}
+
+function countPendingAnalysisJobs(jobs: readonly AnalysisJob[]) {
+  return jobs.reduce(
+    (count, job) =>
+      job.status === "queued" ||
+      job.status === "reading" ||
+      job.status === "decoding" ||
+      job.status === "analyzing"
+        ? count + 1
+        : count,
+    0,
+  );
+}
 
 function importSessionInWorker(file: File) {
   return new Promise<Extract<SessionImportWorkerResponse, { type: "result" }>>(
@@ -312,13 +352,13 @@ export function resolveLaneLimit(preference: ParallelLanesPreference = "auto") {
 // is dominated by one file's PCM, so a multi-lane batch of very large masters
 // can't multiply that peak and take the tab down. Constrained devices use a
 // much lower bar — a 100 MB decode is already a big slice of a phone's budget.
-function resolveHeavyFileBytes() {
+export function resolveHeavyFileBytes() {
   const memory = deviceMemoryGb();
   const constrained = memory != null ? memory <= 4 : isCoarsePointerDevice();
   return (constrained ? 96 : 256) * 1024 * 1024;
 }
 
-function resolveAggregatePeakBytes(budget: DecodeBudget) {
+export function resolveAggregatePeakBytes(budget: DecodeBudget) {
   const memory = deviceMemoryGb();
   const canHoldTwoPeakRoutes =
     memory != null ? memory >= 8 : !isCoarsePointerDevice();
@@ -331,8 +371,18 @@ function resolveAggregatePeakBytes(budget: DecodeBudget) {
     : singleRoutePeak;
 }
 
-function canTryAlternateDecoder(error: unknown) {
-  return decodeFailureDetails(error).retryable;
+export function resolveBrowserFirstRoute(
+  preference: DecodePreference,
+  fileName: string,
+  mimeType: string,
+  knownFootprint: boolean,
+  trustedNative: boolean,
+) {
+  return (
+    (!knownFootprint || !trustedNative) &&
+    preference !== "compatibility-first" &&
+    shouldPreferBrowserDecoder(fileName, mimeType)
+  );
 }
 
 function workerFailure(reason: string) {
@@ -343,30 +393,33 @@ function cancellationFailure(reason: string) {
   return new DecodeResourceError("cancelled", reason);
 }
 
-function allowRecoveryWritesByDefault() {
-  return true;
-}
-
 export interface UseTruePeakAnalyzerOptions {
+  allowCompatibilityDecoder?: boolean;
   analysisMode?: AnalysisMode;
   analysisBlocked?: boolean;
   decodePreference?: DecodePreference;
   persistHistory?: boolean;
   parallelPreference?: ParallelLanesPreference;
   restoreReady?: boolean;
-  recoveryWriteAllowed?: () => boolean;
-  recoveryWriteRevision?: number;
+  recoveryWritesAllowed?: boolean;
 }
 
-interface AnalyzerSettings {
-  analysisBlocked: boolean;
-  analysisMode: AnalysisMode;
-  decodePreference: DecodePreference;
-  target: TargetPreset | null;
-}
 
-function normalizeDecodeFailure(message: string, decodePreference: DecodePreference) {
+export function normalizeDecodeFailure(
+  message: string,
+  decodePreference: DecodePreference,
+  failureCode?: DecodeFailureCode,
+  budget?: DecodeBudget,
+) {
   const lower = message.toLowerCase();
+
+  if (lower.includes("data saver") && lower.includes("compatibility decoder")) {
+    return message;
+  }
+
+  if (failureCode && failureCode !== "decode-failed") {
+    return decodeFailureSummary(failureCode, budget);
+  }
 
   if (
     lower.includes("decode failed") ||
@@ -397,6 +450,10 @@ function normalizeDecodeFailure(message: string, decodePreference: DecodePrefere
     return "TruePeak decoded this file but the audio data was empty or corrupt, so it couldn't be analyzed. Try re-exporting it or converting it to WAV or AIFF.";
   }
 
+  if (failureCode) {
+    return decodeFailureSummary(failureCode, budget);
+  }
+
   return message;
 }
 
@@ -418,7 +475,7 @@ const SUPPORTED_AUDIO_EXTENSIONS = new Set([
 // The file picker enforces `accept`, but drag-and-drop does not, so any dropped
 // file (a folder, a .txt, an image) would otherwise become a job that only fails
 // later at decode time. Filter intake centrally so both paths behave the same.
-function isSupportedAudioFile(file: File) {
+export function isSupportedAudioFile(file: File) {
   if (file.type.toLowerCase().startsWith("audio/")) {
     return true;
   }
@@ -427,7 +484,7 @@ function isSupportedAudioFile(file: File) {
   return SUPPORTED_AUDIO_EXTENSIONS.has(extension);
 }
 
-function completedHistoryFingerprint(jobs: AnalysisJob[]) {
+export function completedHistoryFingerprint(jobs: AnalysisJob[]) {
   return jobs
     .filter((job) => job.result)
     .map((job) => {
@@ -509,17 +566,23 @@ export function useTruePeakAnalyzer(
 ) {
   const analysisMode = options.analysisMode ?? "targeted";
   const analysisBlocked = options.analysisBlocked ?? false;
+  const allowCompatibilityDecoder = options.allowCompatibilityDecoder ?? true;
   const decodePreference = options.decodePreference ?? "auto";
   const persistHistory = options.persistHistory ?? false;
   const parallelPreference = options.parallelPreference ?? "auto";
   const restoreReady = options.restoreReady ?? true;
-  const recoveryWriteAllowed =
-    options.recoveryWriteAllowed ?? allowRecoveryWritesByDefault;
-  const recoveryWriteRevision = options.recoveryWriteRevision ?? 0;
-  const [jobs, setJobs] = useState<AnalysisJob[]>([]);
+  const recoveryWritesAllowed = options.recoveryWritesAllowed ?? true;
+  const [jobStore] = useState(() => new JobStore());
+  const jobs = useSyncExternalStore(
+    jobStore.subscribe,
+    jobStore.getSnapshot,
+    jobStore.getSnapshot,
+  );
+  const setJobs = jobStore.set;
   const [recentSessions, setRecentSessions] = useState<RecentSessionEntry[]>([]);
   const [notice, setNotice] = useState<string | null>(null);
   const [persistenceIssue, setPersistenceIssue] = useState<string | null>(null);
+  const [workerCircuitIssue, setWorkerCircuitIssue] = useState<string | null>(null);
   const [liveSessionController] = useState(() =>
     createLiveSessionController(indexedDbLiveSessionStore),
   );
@@ -530,7 +593,8 @@ export function useTruePeakAnalyzer(
   const filesRef = useRef(new Map<string, File>());
   const fileSignaturesRef = useRef(new Map<string, string>());
   const jobRunTokensRef = useRef(new Map<string, number>());
-  const jobsRef = useRef<AnalysisJob[]>([]);
+  const pendingProgressRef = useRef(new Map<string, PendingProgressUpdate>());
+  const progressCommitTimerRef = useRef<number | null>(null);
   const workspaceOpenRef = useRef(true);
   const lanesRef = useRef<WorkerLane[]>([]);
   const laneSequenceRef = useRef(0);
@@ -540,24 +604,26 @@ export function useTruePeakAnalyzer(
   const aggregatePeakBytesRef = useRef(
     conservativeDecodePeakBytes(resolveDecodeBudget()),
   );
-  // Bounds how many untrusted browser decodeAudioData allocations run at once
-  // so their combined transient footprint stays inside the aggregate cap, even
-  // when their steady byte reservations are individually small. Orthogonal to
-  // the reservation model: reservations bound RETAINED memory, this bounds the
-  // concurrent TRANSIENT decode allocation. Seeded from the conservative
-  // default tier (capacity 1); the budget effect below re-resolves it to the
-  // device's real capacity (2 on the capable large tier) via setCapacity,
-  // exactly as it re-resolves the aggregate cap.
+  // Browser decodes keep a FIFO window so queued work cannot stampede into
+  // decodeAudioData. Every browser-eligible source now has a probed footprint,
+  // so aggregate byte reservations provide the memory bound and this window
+  // follows the configured lane count. It starts at one for the server/client
+  // initial render and is resized after device settings resolve.
   const browserDecodeWindowRef = useRef<CountingSemaphore>(
-    createCountingSemaphore(
-      browserDecodeWindowCapacity(
-        conservativeDecodePeakBytes(resolveDecodeBudget()),
-        resolveDecodeBudget(),
-      ),
-    ),
+    createCountingSemaphore(1),
   );
   const reservedPeakBytesRef = useRef(0);
   const resourcePlansRef = useRef(new Map<string, JobResourcePlan>());
+  const resourcePlanGenerationRef = useRef(new Map<string, number>());
+  const probeWorkerRef = useRef<ProbeWorkerState>({
+    worker: null,
+    workerEpoch: 0,
+    leaseGeneration: 0,
+    lease: null,
+  });
+  const probePendingRef = useRef(new Map<string, ProbePendingResolver>());
+  const probeQueueTailRef = useRef<Promise<void>>(Promise.resolve());
+  const probeIdleTeardownRef = useRef<number | null>(null);
   // How many preflights are in flight right now. Maintained alongside the
   // "preparing" entries in resourcePlansRef so fillLanes can read the pool size
   // in O(1) instead of scanning the whole map once per unplanned job.
@@ -595,8 +661,11 @@ export function useTruePeakAnalyzer(
     ) => void
   >(() => undefined);
   const workerCircuitOpenRef = useRef(false);
+  const workerCircuitRetryJobsRef = useRef(new Set<string>());
+  const pendingAnalysisCountRef = useRef<number | null>(null);
   const fillLanesRef = useRef<() => void>(() => undefined);
   const settingsRef = useRef<AnalyzerSettings>({
+    allowCompatibilityDecoder,
     analysisBlocked,
     analysisMode,
     decodePreference,
@@ -609,6 +678,7 @@ export function useTruePeakAnalyzer(
   // reads the ref, so within a commit readers always see the fresh snapshot.
   useEffect(() => {
     settingsRef.current = {
+      allowCompatibilityDecoder,
       analysisBlocked,
       analysisMode,
       decodePreference,
@@ -656,16 +726,90 @@ export function useTruePeakAnalyzer(
 
   const updateJob = useCallback(
     (jobId: string, updater: (job: AnalysisJob) => AnalysisJob) => {
+      pendingProgressRef.current.delete(jobId);
       setJobs((current) => {
-        const next: AnalysisJob[] = current.map((job) =>
-          job.id === jobId ? updater(job) : job,
-        );
-        jobsRef.current = next;
+        let changed = false;
+        const next: AnalysisJob[] = current.map((job) => {
+          if (job.id !== jobId) {
+            return job;
+          }
+
+          const updated = updater(job);
+          if (updated !== job) {
+            changed = true;
+          }
+          return updated;
+        });
+
+        if (!changed) {
+          return current;
+        }
         return next;
       });
     },
-    [],
+    [setJobs],
   );
+
+  const openWorkerCircuit = useCallback((jobId?: string) => {
+    pendingProgressRef.current.clear();
+    workerCircuitOpenRef.current = true;
+    if (jobId) {
+      workerCircuitRetryJobsRef.current.add(jobId);
+    }
+    setWorkerCircuitIssue(WORKER_CIRCUIT_MESSAGE);
+
+    const pauseQueued = (current: AnalysisJob[]) => {
+      let changed = false;
+      const next = current.map((job) => {
+        if (
+          job.status !== "queued" ||
+          job.progressLabel === ANALYSIS_PAUSED_LABEL
+        ) {
+          return job;
+        }
+
+        changed = true;
+        return { ...job, progressLabel: ANALYSIS_PAUSED_LABEL };
+      });
+
+      if (!changed) {
+        return current;
+      }
+      return next;
+    };
+    setJobs(pauseQueued);
+  }, [setJobs]);
+
+  const resumeWorkerCircuit = useCallback(() => {
+    pendingProgressRef.current.clear();
+    workerCircuitOpenRef.current = false;
+    workerCircuitRetryJobsRef.current.clear();
+    setWorkerCircuitIssue(null);
+
+    const resumeQueued = (current: AnalysisJob[]) => {
+      let changed = false;
+      const next = current.map((job) => {
+        if (
+          job.status !== "queued" ||
+          job.progressLabel !== ANALYSIS_PAUSED_LABEL
+        ) {
+          return job;
+        }
+
+        changed = true;
+        return { ...job, progressLabel: "Queued" };
+      });
+
+      if (!changed) {
+        return current;
+      }
+      return next;
+    };
+    setJobs(resumeQueued);
+    // Resuming clears the circuit flag and the paused label without changing any
+    // row's status, so the admission signature does not move. Scan explicitly.
+    fillLanesRef.current();
+  }, [setJobs]);
 
   const beginJobRun = useCallback((jobId: string) => {
     const nextToken = (jobRunTokensRef.current.get(jobId) ?? 0) + 1;
@@ -685,8 +829,8 @@ export function useTruePeakAnalyzer(
       return false;
     }
 
-    return jobsRef.current.some((job) => job.id === jobId && isActiveJob(job));
-  }, []);
+    return jobStore.getSnapshot().some((job) => job.id === jobId && isActiveJob(job));
+  }, [jobStore]);
 
   const updateJobIfRunCurrent = useCallback(
     (jobId: string, runToken: number, updater: (job: AnalysisJob) => AnalysisJob) => {
@@ -694,6 +838,9 @@ export function useTruePeakAnalyzer(
         return;
       }
 
+      // Explicit checkpoints supersede any older progress sample still
+      // waiting for the next coalescing interval.
+      pendingProgressRef.current.delete(jobId);
       setJobs((current) => {
         if (jobRunTokensRef.current.get(jobId) !== runToken) {
           return current;
@@ -712,44 +859,121 @@ export function useTruePeakAnalyzer(
         if (!updated) {
           return current;
         }
-
-        jobsRef.current = next;
         return next;
       });
     },
-    [],
+    [setJobs],
   );
 
   const dropJobResources = useCallback((jobId: string) => {
+    pendingProgressRef.current.delete(jobId);
     filesRef.current.delete(jobId);
     fileSignaturesRef.current.delete(jobId);
     jobRunTokensRef.current.delete(jobId);
     resourcePlansRef.current.delete(jobId);
   }, []);
 
-  // Progress events arrive from up to laneLimit workers at once. This returns
-  // the value to display, or null to skip the update entirely:
-  // - clamps to never move backward within a run (each decode fallback path
-  //   restarts its own 0..1 scale, which used to yank the bar from 78% to 42%
-  //   or 46% to 3%; a retry resets progress to 0 *before* the next run starts,
-  //   so the clamp can't pin a re-run at its old value), and
-  // - skips updates that wouldn't visibly change the row, so render churn
-  //   stays flat as parallelism grows.
-  const nextProgressValue = useCallback(
-    (jobId: string, status: AnalysisJob["status"], progress: number, label: string) => {
-      const job = jobsRef.current.find((candidate) => candidate.id === jobId);
-      if (!job) {
-        return null;
+  const flushPendingProgress = useCallback(() => {
+    progressCommitTimerRef.current = null;
+    const pending = pendingProgressRef.current;
+    if (!pending.size) {
+      return;
+    }
+    pendingProgressRef.current = new Map();
+
+    setJobs((current) => {
+      let changed = false;
+      const next = current.map((job) => {
+        const update = pending.get(job.id);
+        if (
+          !update ||
+          jobRunTokensRef.current.get(job.id) !== update.runToken ||
+          !isActiveJob(job) ||
+          job.status !== update.status
+        ) {
+          return job;
+        }
+
+        const progressPercent = Math.max(
+          job.progressPercent,
+          update.progressPercent,
+        );
+        if (
+          job.progressLabel === update.progressLabel &&
+          Math.abs(job.progressPercent - progressPercent) < 0.01
+        ) {
+          return job;
+        }
+
+        changed = true;
+        return {
+          ...job,
+          progressPercent,
+          progressLabel: update.progressLabel,
+        };
+      });
+
+      if (!changed) {
+        return current;
+      }
+      return next;
+    });
+  }, [setJobs]);
+
+  // Workers can emit dozens of progress messages per file across several
+  // lanes. Keep only the latest sample for each job and commit the whole batch
+  // at most once per interval. Status transitions still use the immediate
+  // updater above.
+  const queueJobProgress = useCallback(
+    (
+      jobId: string,
+      runToken: number,
+      status: AnalysisJob["status"],
+      progress: number,
+      label: string,
+    ) => {
+      if (
+        !workspaceOpenRef.current ||
+        jobRunTokensRef.current.get(jobId) !== runToken
+      ) {
+        return;
       }
 
-      const clamped = Math.max(job.progressPercent, progress);
-      const visibleChange =
-        job.status !== status ||
-        job.progressLabel !== label ||
-        Math.abs(job.progressPercent - clamped) >= 0.01;
-      return visibleChange ? clamped : null;
+      const job = jobStore.getSnapshot().find((candidate) => candidate.id === jobId);
+      if (!job || !isActiveJob(job) || job.status !== status) {
+        return;
+      }
+
+      const queued = pendingProgressRef.current.get(jobId);
+      const progressPercent = Math.max(
+        job.progressPercent,
+        queued?.progressPercent ?? 0,
+        progress,
+      );
+      const currentLabel = queued?.progressLabel ?? job.progressLabel;
+      const currentProgress = queued?.progressPercent ?? job.progressPercent;
+      if (
+        currentLabel === label &&
+        Math.abs(currentProgress - progressPercent) < 0.01
+      ) {
+        return;
+      }
+
+      pendingProgressRef.current.set(jobId, {
+        jobId,
+        runToken,
+        status,
+        progressPercent,
+        progressLabel: label,
+      });
+      if (progressCommitTimerRef.current == null) {
+        progressCommitTimerRef.current = window.setTimeout(
+          flushPendingProgress,
+          PROGRESS_COMMIT_INTERVAL_MS,
+        );
+      }
     },
-    [],
+    [flushPendingProgress, jobStore],
   );
 
   const terminateLaneWorkers = useCallback((lane: WorkerLane) => {
@@ -844,25 +1068,12 @@ export function useTruePeakAnalyzer(
       }
 
       if (message.type === "progress") {
-        const displayProgress = nextProgressValue(
+        queueJobProgress(
           message.jobId,
+          pending.lease.runToken,
           "decoding",
           message.progress,
           message.label,
-        );
-        if (displayProgress == null) {
-          return;
-        }
-
-        updateJobIfRunCurrent(
-          message.jobId,
-          pending.lease.runToken,
-          (job) => ({
-            ...job,
-            status: "decoding",
-            progressPercent: Math.max(job.progressPercent, displayProgress),
-            progressLabel: message.label,
-          }),
         );
         return;
       }
@@ -870,6 +1081,10 @@ export function useTruePeakAnalyzer(
       decoderPendingRef.current.delete(message.jobId);
       if (message.type === "decoded") {
         pending.resolve({ asset: message.asset, usage: message.usage });
+        return;
+      }
+
+      if (message.type !== "error") {
         return;
       }
 
@@ -923,25 +1138,12 @@ export function useTruePeakAnalyzer(
           ANALYSIS_PROGRESS_BASE +
             message.progress * (0.99 - ANALYSIS_PROGRESS_BASE),
         );
-        const displayProgress = nextProgressValue(
+        queueJobProgress(
           message.jobId,
+          pending.lease.runToken,
           "analyzing",
           mapped,
           message.label,
-        );
-        if (displayProgress == null) {
-          return;
-        }
-
-        updateJobIfRunCurrent(
-          message.jobId,
-          pending.lease.runToken,
-          (job) => ({
-            ...job,
-            status: "analyzing",
-            progressPercent: Math.max(job.progressPercent, displayProgress),
-            progressLabel: message.label,
-          }),
         );
         return;
       }
@@ -958,7 +1160,7 @@ export function useTruePeakAnalyzer(
     lane.decoder = decoderWorker;
     lane.analyzer = analyzerWorker;
     return null;
-  }, [nextProgressValue, updateJobIfRunCurrent]);
+  }, [queueJobProgress]);
 
   const workerFault = useCallback(
     (lane: WorkerLane, workerEpoch: number, reason: string) => {
@@ -967,21 +1169,17 @@ export function useTruePeakAnalyzer(
       }
 
       terminateLaneWorkers(lane);
-      lane.failureStreak += 1;
+      const circuitOpened = recordLaneTransportFault(lane);
       rejectLanePending(lane, workerFailure(reason));
 
-      if (lane.failureStreak >= MAX_LANE_FAILURE_STREAK) {
-        lane.retireAfterRelease = true;
-        workerCircuitOpenRef.current = true;
+      if (circuitOpened) {
+        openWorkerCircuit(lane.lease?.jobId);
         if (!lane.lease) {
           const index = lanesRef.current.indexOf(lane);
           if (index >= 0) {
             lanesRef.current.splice(index, 1);
           }
         }
-        pushNotice(
-          "The analysis workers keep failing to start. Reload the page and try again.",
-        );
         return;
       }
 
@@ -990,20 +1188,17 @@ export function useTruePeakAnalyzer(
         lane.failureStreak += 1;
         if (lane.failureStreak >= MAX_LANE_FAILURE_STREAK) {
           lane.retireAfterRelease = true;
-          workerCircuitOpenRef.current = true;
+          openWorkerCircuit(lane.lease?.jobId);
           if (!lane.lease) {
             const index = lanesRef.current.indexOf(lane);
             if (index >= 0) {
               lanesRef.current.splice(index, 1);
             }
           }
-          pushNotice(
-            "The analysis workers keep failing to start. Reload the page and try again.",
-          );
         }
       }
     },
-    [attachLaneWorkers, pushNotice, rejectLanePending, terminateLaneWorkers],
+    [attachLaneWorkers, openWorkerCircuit, rejectLanePending, terminateLaneWorkers],
   );
 
   useEffect(() => {
@@ -1062,7 +1257,7 @@ export function useTruePeakAnalyzer(
   const scheduleIdleLaneTeardown = useCallback(() => {
     if (
       idleTeardownRef.current != null ||
-      jobsRef.current.some(isActiveJob) ||
+      jobStore.getSnapshot().some(isActiveJob) ||
       !lanesRef.current.length
     ) {
       return;
@@ -1070,12 +1265,28 @@ export function useTruePeakAnalyzer(
 
     idleTeardownRef.current = window.setTimeout(() => {
       idleTeardownRef.current = null;
-      if (jobsRef.current.some(isActiveJob)) {
+      if (jobStore.getSnapshot().some(isActiveJob)) {
         return;
       }
       [...lanesRef.current].forEach(disposeIdleLane);
     }, IDLE_LANE_TEARDOWN_MS);
-  }, [disposeIdleLane]);
+  }, [disposeIdleLane, jobStore]);
+
+  // The reservation and lane bookkeeping shared by admission and release. It
+  // holds no state of its own (the cells above stay the single source of
+  // truth), so re-creating it is harmless.
+  const reservations = useMemo(
+    () => new LaneReservations({
+      lanes: lanesRef,
+      laneByJob: laneByJobRef,
+      heavyJobActive: heavyJobActiveRef,
+      reservedPeakBytes: reservedPeakBytesRef,
+      aggregatePeakBytes: aggregatePeakBytesRef,
+      terminateLaneWorkers,
+      scheduleIdleLaneTeardown,
+    }),
+    [scheduleIdleLaneTeardown, terminateLaneWorkers],
+  );
 
   // Re-resolve the lane budget when the user preference changes (and once on
   // mount, where navigator/matchMedia first become available).
@@ -1094,15 +1305,10 @@ export function useTruePeakAnalyzer(
     aggregatePeakBytesRef.current = resolveAggregatePeakBytes(
       decodeBudgetRef.current,
     );
-    // Keep the browser-decode window sized to the same aggregate/budget that
-    // was just re-resolved: capacity = floor(aggregate / browserPeak), >= 1.
-    // Adjusting in place preserves any slots currently held or waited on.
-    browserDecodeWindowRef.current.setCapacity(
-      browserDecodeWindowCapacity(
-        aggregatePeakBytesRef.current,
-        decodeBudgetRef.current,
-      ),
-    );
+    // Every browser-bound job now has a checked probe reservation, so admitted
+    // byte totals provide the memory bound and the FIFO window can use every
+    // configured lane. Adjusting in place preserves held and waiting slots.
+    browserDecodeWindowRef.current.setCapacity(limit);
     setParallelLimit(limit);
     // Shrink immediately if the new budget is lower; busy lanes finish their
     // current file first (no new work lands on them past the limit).
@@ -1132,8 +1338,11 @@ export function useTruePeakAnalyzer(
     const lanes = lanesRef.current;
     const decoderPending = decoderPendingRef.current;
     const analyzerPending = analyzerPendingRef.current;
+    const probeState = probeWorkerRef.current;
+    const probePending = probePendingRef.current;
     const laneByJob = laneByJobRef.current;
     const jobRunTokens = jobRunTokensRef.current;
+    const resourcePlanGenerations = resourcePlanGenerationRef.current;
 
     return () => {
       workspaceOpenRef.current = false;
@@ -1150,12 +1359,31 @@ export function useTruePeakAnalyzer(
       analyzerPending.forEach(({ reject }) => reject(new Error("Workspace closed.")));
       decoderPending.clear();
       analyzerPending.clear();
+      probeState.workerEpoch += 1;
+      probeState.worker?.terminate();
+      probeState.worker = null;
+      probeState.lease = null;
+      probePending.forEach((pending) => {
+        window.clearTimeout(pending.timeoutId);
+        pending.reject(new Error("Workspace closed."));
+      });
+      probePending.clear();
+      resourcePlanGenerations.clear();
+      if (probeIdleTeardownRef.current != null) {
+        window.clearTimeout(probeIdleTeardownRef.current);
+        probeIdleTeardownRef.current = null;
+      }
       laneByJob.clear();
       heavyJobActiveRef.current = null;
       reservedPeakBytesRef.current = 0;
       if (noticeTimeoutRef.current) {
         window.clearTimeout(noticeTimeoutRef.current);
       }
+      if (progressCommitTimerRef.current != null) {
+        window.clearTimeout(progressCommitTimerRef.current);
+        progressCommitTimerRef.current = null;
+      }
+      pendingProgressRef.current.clear();
     };
   }, []);
 
@@ -1177,6 +1405,7 @@ export function useTruePeakAnalyzer(
     didRestoreRef.current = true;
     let cancelled = false;
     const generation = restoreGenerationRef.current;
+    const interruptedFileCount = readPendingAnalysisCount();
 
     const persistenceToken = persistenceGenerationRef.current;
     void liveSessionController.read(persistenceToken).then((controllerResult) => {
@@ -1188,7 +1417,6 @@ export function useTruePeakAnalyzer(
       if (failure) {
         persistenceFailureEpochRef.current += 1;
         setPersistenceIssue(failure);
-        pushNotice(failure);
         return;
       }
 
@@ -1204,10 +1432,14 @@ export function useTruePeakAnalyzer(
       setPersistenceIssue(null);
       const loadedJobs = outcome.jobs;
       if (!loadedJobs.length) {
-        if (outcome.invalidRecordCount > 0) {
-          pushNotice(
-            `${outcome.invalidRecordCount} saved recovery record${outcome.invalidRecordCount === 1 ? " was" : "s were"} invalid and could not be restored. The stored records were left untouched.`,
-          );
+        const recoveryNotice = buildRecoveryNotice({
+          restoredCount: 0,
+          invalidRecordCount: outcome.invalidRecordCount,
+          overflowRecordCount: outcome.overflowRecordCount,
+          interruptedFileCount,
+        });
+        if (recoveryNotice) {
+          pushNotice(recoveryNotice);
         }
         return;
       }
@@ -1219,45 +1451,44 @@ export function useTruePeakAnalyzer(
       const settings = settingsRef.current;
       const restoredJobs = reconcileSessionJobs(loadedJobs, settings);
 
-      // Mark as already persisted so the autosave diff below doesn't rewrite
-      // every record straight back.
-      restoredJobs.forEach((job) => {
+      // Recovery shares the same authoritative session-cap plan as file and
+      // portable-session intake. The JobStore snapshot/set pair is synchronous,
+      // so this merge cannot append past MAX_SESSION_JOBS between calculation
+      // and publication.
+      const existingJobs = jobStore.getSnapshot();
+      const existingIds = new Set(existingJobs.map((job) => job.id));
+      const fresh = restoredJobs.filter((job) => !existingIds.has(job.id));
+      const intakePlan = planSessionIntake(existingJobs.length, fresh.length);
+      const acceptedJobs = fresh.slice(0, intakePlan.accepted);
+      if (!acceptedJobs.length) {
+        const recoveryNotice = buildRecoveryNotice({
+          restoredCount: 0,
+          invalidRecordCount: outcome.invalidRecordCount,
+          overflowRecordCount: outcome.overflowRecordCount + intakePlan.turnedAway,
+          interruptedFileCount,
+        });
+        if (recoveryNotice) {
+          pushNotice(recoveryNotice);
+        }
+        return;
+      }
+
+      // Mark only admitted rows as already persisted so the live-session
+      // subscriber does not write every restored record straight back.
+      acceptedJobs.forEach((job) => {
         if (job.result) {
           persistedResultsRef.current.set(job.id, job.result.analyzedAt);
         }
       });
+      setJobs([...existingJobs, ...acceptedJobs]);
 
-      // Count against the latest committed state, not inside the updater:
-      // React runs updaters lazily, so a variable mutated in there is not
-      // readable right after the setJobs call.
-      const existingIds = new Set(jobsRef.current.map((job) => job.id));
-      const fresh = restoredJobs.filter((job) => !existingIds.has(job.id));
-      if (!fresh.length) {
-        return;
-      }
-
-      setJobs((current) => {
-        const currentIds = new Set(current.map((job) => job.id));
-        const toAdd = fresh.filter((job) => !currentIds.has(job.id));
-        if (!toAdd.length) {
-          return current;
-        }
-
-        const next = [...current, ...toAdd];
-        jobsRef.current = next;
-        return next;
+      const recoveryNotice = buildRecoveryNotice({
+        restoredCount: acceptedJobs.length,
+        invalidRecordCount: outcome.invalidRecordCount,
+        overflowRecordCount: outcome.overflowRecordCount + intakePlan.turnedAway,
+        interruptedFileCount,
       });
-
-      const recoveryNotes = [
-        `Restored ${fresh.length} result${fresh.length === 1 ? "" : "s"} from your last session.`,
-        outcome.invalidRecordCount
-          ? `${outcome.invalidRecordCount} invalid stored record${outcome.invalidRecordCount === 1 ? " was" : "s were"} left untouched.`
-          : null,
-        outcome.overflowRecordCount
-          ? `${outcome.overflowRecordCount} additional stored result${outcome.overflowRecordCount === 1 ? " remains" : "s remain"} outside the current restore limit.`
-          : null,
-      ].filter((part): part is string => part != null);
-      pushNotice(recoveryNotes.join(" "));
+      pushNotice(recoveryNotice);
     }).catch((error: unknown) => {
       if (cancelled || generation !== restoreGenerationRef.current) {
         return;
@@ -1266,7 +1497,6 @@ export function useTruePeakAnalyzer(
       const message = `TruePeak could not restore the previous session. ${error instanceof Error ? error.message : "Recovery storage failed unexpectedly."}`;
       persistenceFailureEpochRef.current += 1;
       setPersistenceIssue(message);
-      pushNotice(message);
     }).finally(() => {
       // Settled means "the restore has had its chance", success or not. Callers
       // that prune URL state against the job list have to wait for this: on the
@@ -1286,132 +1516,30 @@ export function useTruePeakAnalyzer(
     return () => {
       cancelled = true;
     };
-  }, [liveSessionController, pushNotice, restoreReady]);
+  }, [jobStore, liveSessionController, pushNotice, restoreReady, setJobs]);
 
-  // Autosave: mirror completed results into the live-session store, and drop
-  // records for jobs that left the queue. Diffing against what's already
-  // persisted keeps this a no-op on progress ticks.
-  useEffect(() => {
-    const allowSaves = recoveryWriteAllowed();
-    const currentById = new Map<string, AnalysisJob>();
-    jobs.forEach((job) => {
-      if (job.result) {
-        currentById.set(job.id, job);
-      }
-    });
+  useEffect(() => subscribePendingAnalysisCount(
+    jobStore,
+    pendingAnalysisCountRef,
+    countPendingAnalysisJobs,
+    writePendingAnalysisCount,
+  ), [jobStore]);
 
-    const toSave: AnalysisJob[] = [];
-    currentById.forEach((job, jobId) => {
-      if (persistedResultsRef.current.get(jobId) !== job.result!.analyzedAt) {
-        toSave.push(job);
-      }
-    });
+  // Recovery persistence observes the synchronous job store directly. It
+  // diffs completed results and removed ids, so progress-only updates remain
+  // no-ops without making the React hook subscribe through an effect on jobs.
+  useEffect(() => subscribeLiveSessionPersistence(jobStore, {
+    allowSaves: recoveryWritesAllowed,
+    controller: liveSessionController,
+    persistedResults: persistedResultsRef,
+    persistenceGeneration: persistenceGenerationRef,
+    persistenceFailureEpoch: persistenceFailureEpochRef,
+    describeFailure: persistenceFailureMessage,
+    setIssue: setPersistenceIssue,
+  }), [jobStore, liveSessionController, recoveryWritesAllowed]);
 
-    const toDelete: string[] = [];
-    persistedResultsRef.current.forEach((_, jobId) => {
-      if (!currentById.has(jobId)) {
-        toDelete.push(jobId);
-      }
-    });
-
-    if (!toSave.length && !toDelete.length) {
-      return;
-    }
-
-    // Mark optimistically so concurrent effect runs don't double-write. The
-    // controller owns autonomous bounded retries; failed final outcomes roll
-    // these marks back and surface a persistent issue instead of waiting for
-    // an unrelated jobs update to happen to retry.
-    const persistenceToken = persistenceGenerationRef.current;
-    const persistenceIssueEpoch = persistenceFailureEpochRef.current;
-    if (allowSaves && toSave.length) {
-      toSave.forEach((job) =>
-        persistedResultsRef.current.set(job.id, job.result!.analyzedAt),
-      );
-      void liveSessionController.write(toSave, persistenceToken).then((controllerResult) => {
-        const failure = persistenceFailureMessage(controllerResult, "save");
-        if (!failure) {
-          if (
-            controllerResult.outcome.status !== "superseded" &&
-            persistenceFailureEpochRef.current === persistenceIssueEpoch
-          ) {
-            setPersistenceIssue(null);
-          }
-          return;
-        }
-
-        persistenceFailureEpochRef.current += 1;
-        setPersistenceIssue(failure);
-        pushNotice(failure);
-        toSave.forEach((job) => {
-          if (persistedResultsRef.current.get(job.id) === job.result!.analyzedAt) {
-            persistedResultsRef.current.delete(job.id);
-          }
-        });
-      }).catch((error: unknown) => {
-        const message = `TruePeak could not save the recovery copy. ${error instanceof Error ? error.message : "Recovery storage failed unexpectedly."}`;
-        persistenceFailureEpochRef.current += 1;
-        setPersistenceIssue(message);
-        pushNotice(message);
-        toSave.forEach((job) => {
-          if (persistedResultsRef.current.get(job.id) === job.result!.analyzedAt) {
-            persistedResultsRef.current.delete(job.id);
-          }
-        });
-      });
-    }
-
-    if (toDelete.length) {
-      const previousMarks = new Map(
-        toDelete.map((jobId) => [jobId, persistedResultsRef.current.get(jobId)]),
-      );
-      toDelete.forEach((jobId) => persistedResultsRef.current.delete(jobId));
-      void liveSessionController.delete(toDelete, persistenceToken).then((controllerResult) => {
-        const failure = persistenceFailureMessage(controllerResult, "delete");
-        if (!failure) {
-          if (
-            controllerResult.outcome.status !== "superseded" &&
-            persistenceFailureEpochRef.current === persistenceIssueEpoch
-          ) {
-            setPersistenceIssue(null);
-          }
-          return;
-        }
-
-        persistenceFailureEpochRef.current += 1;
-        setPersistenceIssue(failure);
-        pushNotice(failure);
-        previousMarks.forEach((analyzedAt, jobId) => {
-          if (analyzedAt != null && !persistedResultsRef.current.has(jobId)) {
-            persistedResultsRef.current.set(jobId, analyzedAt);
-          }
-        });
-      }).catch((error: unknown) => {
-        const message = `TruePeak could not update the recovery copy. ${error instanceof Error ? error.message : "Recovery storage failed unexpectedly."}`;
-        persistenceFailureEpochRef.current += 1;
-        setPersistenceIssue(message);
-        pushNotice(message);
-        previousMarks.forEach((analyzedAt, jobId) => {
-          if (analyzedAt != null && !persistedResultsRef.current.has(jobId)) {
-            persistedResultsRef.current.set(jobId, analyzedAt);
-          }
-        });
-      });
-    }
-  }, [
-    jobs,
-    liveSessionController,
-    pushNotice,
-    recoveryWriteAllowed,
-    recoveryWriteRevision,
-  ]);
-
-  useEffect(() => {
-    jobsRef.current = jobs;
-  }, [jobs]);
-
-  // Losing the tab mid-batch silently discards every queued and in-flight
-  // result, so ask the browser to confirm while work is running.
+  // Desktop browsers can ask before leaving. Mobile browsers usually cannot,
+  // so pagehide also records the latest pending count for the restore notice.
   useEffect(() => {
     if (typeof window === "undefined" || !hasActiveJobs) {
       return;
@@ -1421,10 +1549,17 @@ export function useTruePeakAnalyzer(
       event.preventDefault();
       event.returnValue = "";
     };
+    const handlePageHide = () => {
+      writePendingAnalysisCount(countPendingAnalysisJobs(jobStore.getSnapshot()));
+    };
 
     window.addEventListener("beforeunload", handleBeforeUnload);
-    return () => window.removeEventListener("beforeunload", handleBeforeUnload);
-  }, [hasActiveJobs]);
+    window.addEventListener("pagehide", handlePageHide);
+    return () => {
+      window.removeEventListener("beforeunload", handleBeforeUnload);
+      window.removeEventListener("pagehide", handlePageHide);
+    };
+  }, [hasActiveJobs, jobStore]);
 
   // Keep the screen awake while a batch runs. On phones the screen sleeping
   // throttles or discards the tab, which silently loses the whole queue. The
@@ -1473,34 +1608,13 @@ export function useTruePeakAnalyzer(
     };
   }, [hasActiveJobs]);
 
-  useEffect(() => {
-    if (!persistHistory) {
-      historyFingerprintRef.current = "";
-      return;
-    }
-
-    // Keyed on the referentially-stable completedJobs (Finding [15]) rather than
-    // `jobs`, so this effect — and the O(completed-jobs) fingerprint rebuild
-    // below — no longer runs on every progress tick, only when the completed set
-    // actually changes (a new result, a removal, or a retarget). The fingerprint
-    // still gates the write, so a reference change carrying identical persisted
-    // content stays a no-op. completedHistoryFingerprint and persistRecentSessions
-    // both filter to results internally, so completedJobs is equivalent to `jobs`
-    // here and persistence behavior is unchanged. (Finding [17].)
-    const fingerprint = completedHistoryFingerprint(completedJobs);
-    if (!fingerprint) {
-      historyFingerprintRef.current = "";
-      return;
-    }
-
-    if (fingerprint === historyFingerprintRef.current) {
-      return;
-    }
-
-    historyFingerprintRef.current = fingerprint;
-    persistRecentSessions(completedJobs);
-    setRecentSessions(loadRecentSessions());
-  }, [completedJobs, persistHistory]);
+  useEffect(() => subscribeRecentSessionHistory(jobStore, {
+    enabled: persistHistory,
+    fingerprint: historyFingerprintRef,
+    buildFingerprint: completedHistoryFingerprint,
+    persist: persistRecentSessions,
+    refresh: () => setRecentSessions(loadRecentSessions()),
+  }), [jobStore, persistHistory]);
 
   useEffect(() => {
     if (analysisBlocked) {
@@ -1510,13 +1624,237 @@ export function useTruePeakAnalyzer(
     const nextTarget = analysisMode === "targeted" ? target ?? DEFAULT_TARGET_PRESET : null;
 
     setJobs((current) => {
-      const next: AnalysisJob[] = current.map((job) =>
-        job.result ? { ...job, result: retargetAnalysisResult(job.result, nextTarget) } : job,
-      );
-      jobsRef.current = next;
+      let changed = false;
+      const next: AnalysisJob[] = current.map((job) => {
+        if (!job.result) {
+          return job;
+        }
+
+        changed = true;
+        return { ...job, result: retargetAnalysisResult(job.result, nextTarget) };
+      });
+
+      if (!changed) {
+        return current;
+      }
       return next;
     });
-  }, [analysisBlocked, analysisMode, target]);
+  }, [analysisBlocked, analysisMode, setJobs, target]);
+
+  const terminateProbeWorker = useCallback((reason: unknown) => {
+    const state = probeWorkerRef.current;
+    const worker = state.worker;
+    const lease = state.lease;
+    state.workerEpoch += 1;
+    state.worker = null;
+    state.lease = null;
+    worker?.terminate();
+
+    if (!lease) {
+      return;
+    }
+    const pending = probePendingRef.current.get(lease.jobId);
+    if (pending?.lease !== lease) {
+      return;
+    }
+    window.clearTimeout(pending.timeoutId);
+    probePendingRef.current.delete(lease.jobId);
+    pending.reject(reason);
+  }, []);
+
+  const ensureProbeWorker = useCallback(() => {
+    const state = probeWorkerRef.current;
+    if (state.worker) {
+      return state.worker;
+    }
+
+    let worker: Worker;
+    try {
+      worker = new Worker(
+        new URL("../workers/decoder.worker.ts", import.meta.url),
+        { type: "module" },
+      );
+    } catch (error) {
+      throw workerFailure(
+        error instanceof Error
+          ? `Metadata worker could not start: ${error.message}`
+          : "Metadata worker could not start.",
+      );
+    }
+
+    const workerEpoch = state.workerEpoch + 1;
+    state.workerEpoch = workerEpoch;
+    state.worker = worker;
+    worker.onerror = (event) => {
+      event.preventDefault();
+      if (
+        probeWorkerRef.current.worker === worker &&
+        probeWorkerRef.current.workerEpoch === workerEpoch
+      ) {
+        terminateProbeWorker(workerFailure(describeWorkerFailure("Metadata", event)));
+      }
+    };
+    worker.onmessageerror = (event) => {
+      if (
+        probeWorkerRef.current.worker === worker &&
+        probeWorkerRef.current.workerEpoch === workerEpoch
+      ) {
+        terminateProbeWorker(workerFailure(describeWorkerFailure("Metadata", event)));
+      }
+    };
+    worker.onmessage = (event: MessageEvent<DecoderResponse>) => {
+      const current = probeWorkerRef.current;
+      if (current.worker !== worker || current.workerEpoch !== workerEpoch) {
+        return;
+      }
+
+      const message = event.data;
+      const pending = probePendingRef.current.get(message.jobId);
+      if (
+        !pending ||
+        pending.workerEpoch !== workerEpoch ||
+        pending.lease !== current.lease
+      ) {
+        return;
+      }
+      const probeStillCurrent =
+        filesRef.current.get(message.jobId) === pending.lease.file &&
+        resourcePlansRef.current.get(message.jobId)?.kind === "preparing" &&
+        resourcePlanGenerationRef.current.get(message.jobId) ===
+          pending.lease.planGeneration &&
+        jobStore.getSnapshot().some(
+          (job) => job.id === message.jobId && job.status === "queued",
+        );
+      if (!probeStillCurrent) {
+        terminateProbeWorker(
+          cancellationFailure("Metadata inspection is no longer current."),
+        );
+        return;
+      }
+      if (message.type === "progress") {
+        return;
+      }
+      if (
+        message.type !== "probed" &&
+        !(message.type === "error" && message.phase === "probe")
+      ) {
+        return;
+      }
+
+      window.clearTimeout(pending.timeoutId);
+      probePendingRef.current.delete(message.jobId);
+      current.lease = null;
+      if (message.type === "probed") {
+        pending.resolve(message.metadata);
+        return;
+      }
+      if (message.type === "error" && message.phase === "probe") {
+        pending.reject(
+          new DecodeResourceError(message.code, message.error, message.retryable),
+        );
+      }
+    };
+    return worker;
+  }, [jobStore, terminateProbeWorker]);
+
+  const probeCompressedSource = useCallback(
+    (jobId: string, file: File, planGeneration: number) => {
+      const runProbe = async () => {
+        if (probeIdleTeardownRef.current != null) {
+          window.clearTimeout(probeIdleTeardownRef.current);
+          probeIdleTeardownRef.current = null;
+        }
+        if (
+          !workspaceOpenRef.current ||
+          filesRef.current.get(jobId) !== file ||
+          resourcePlansRef.current.get(jobId)?.kind !== "preparing" ||
+          resourcePlanGenerationRef.current.get(jobId) !== planGeneration ||
+          !jobStore.getSnapshot().some((job) => job.id === jobId && job.status === "queued")
+        ) {
+          throw cancellationFailure("Metadata inspection is no longer current.");
+        }
+
+        const worker = ensureProbeWorker();
+        const state = probeWorkerRef.current;
+        if (state.lease) {
+          throw workerFailure("The metadata worker is already processing another file.");
+        }
+        state.leaseGeneration += 1;
+        const lease: ProbeLease = Object.freeze({
+          jobId,
+          generation: state.leaseGeneration,
+          planGeneration,
+          file,
+        });
+        state.lease = lease;
+
+        return new Promise<DecodeProbeMetadata>((resolve, reject) => {
+          const timeoutId = window.setTimeout(() => {
+            if (
+              probeWorkerRef.current.lease === lease &&
+              probePendingRef.current.get(jobId)?.lease === lease
+            ) {
+              terminateProbeWorker(
+                new DecodeResourceError(
+                  "time-limit-exceeded",
+                  "Audio metadata inspection did not answer in time.",
+                  true,
+                ),
+              );
+            }
+          }, PROBE_RESPONSE_TIMEOUT_MS);
+          const pending: ProbePendingResolver = {
+            resolve,
+            reject,
+            lease,
+            workerEpoch: state.workerEpoch,
+            timeoutId,
+          };
+          probePendingRef.current.set(jobId, pending);
+          try {
+            worker.postMessage({
+              type: "probe",
+              jobId,
+              fileName: file.name,
+              mimeType: file.type || "application/octet-stream",
+              file,
+              budget: decodeBudgetRef.current,
+              allowCompatibilityDecoder: settingsRef.current.allowCompatibilityDecoder,
+            } satisfies DecoderRequest);
+          } catch (error) {
+            terminateProbeWorker(
+              workerFailure(
+                error instanceof Error
+                  ? `Metadata worker post failed: ${error.message}`
+                  : "Metadata worker post failed.",
+              ),
+            );
+          }
+        });
+      };
+
+      const operation = probeQueueTailRef.current
+        .catch(() => undefined)
+        .then(runProbe);
+      probeQueueTailRef.current = operation.then(
+        () => undefined,
+        () => undefined,
+      );
+      const scheduleTeardown = () => {
+        if (workspaceOpenRef.current && probeIdleTeardownRef.current == null) {
+          probeIdleTeardownRef.current = window.setTimeout(() => {
+            probeIdleTeardownRef.current = null;
+            if (probeWorkerRef.current.lease == null) {
+              terminateProbeWorker(new Error("Metadata worker became idle."));
+            }
+          }, IDLE_LANE_TEARDOWN_MS);
+        }
+      };
+      void operation.then(scheduleTeardown, scheduleTeardown);
+      return operation;
+    },
+    [ensureProbeWorker, jobStore, terminateProbeWorker],
+  );
 
   const prepareResourcePlan = useCallback(
     async (jobId: string, file: File) => {
@@ -1524,22 +1862,18 @@ export function useTruePeakAnalyzer(
         return;
       }
 
+      const planGeneration = (resourcePlanGenerationRef.current.get(jobId) ?? 0) + 1;
+      resourcePlanGenerationRef.current.set(jobId, planGeneration);
       resourcePlansRef.current.set(jobId, { kind: "preparing" });
       preparingPlanCountRef.current += 1;
       try {
         const budget = decodeBudgetRef.current;
         assertSourceWithinBudget(file.size, budget);
 
-        // FLAC STREAMINFO, WAV fmt/data headers, and AIFF COMM/SSND all live
-        // near the start, so a bounded header slice is enough. For uncompressed
-        // WAV/AIFF the inspector bounds the declared payload against the real
-        // file size; FLAC is compressed, so its declared length is corroborated
-        // against the file size below before it is trusted for concurrency.
-        // Truly opaque sources (MP3, AAC and friends) stay unknown and reserve
-        // the conservative per-job peak instead. A header that still lies about
-        // its footprint is caught after decode, where the actual buffers exceed
-        // the planned reservation and the job falls back to the conservative
-        // exclusive posture.
+        // Container PCM and FLAC metadata is available from a bounded header
+        // slice. Sources without trusted geometry are sent through the shared,
+        // serialized metadata worker: it sniffs common compressed headers and
+        // invokes ffprobe only when the sniff cannot establish a duration.
         const preflightBytes =
           file.size <= 16 * 1024 * 1024
             ? file.size
@@ -1553,53 +1887,107 @@ export function useTruePeakAnalyzer(
             budget,
             "Container preflight",
           ).decodedBytes;
-          // FLAC is the only compressed container admitted on the strength of
-          // its declared footprint, and the browser codec decodes every frame
-          // present regardless of the STREAMINFO sample count. An under-declared
-          // header would hand admission a peak reservation far below the real
-          // decode, so several such files could decode at once and breach the
-          // aggregate peak cap before the post-decode footprint check fires
-          // (WAV/AIFF cannot: their declared payload is already bounded by the
-          // real file size and the decoder reads exactly that uncompressed
-          // chunk). When a FLAC footprint is too small to account for the file's
-          // bytes, treat the source as opaque (conservative, and exclusive when
-          // large) rather than trusting the declared length for concurrency.
           const footprintTrusted =
             metadata.container !== "flac" ||
             declaredDecodeCorroboratedByFileSize(decodedBytes, file.size);
-          plan = footprintTrusted
+          if (footprintTrusted) {
+            plan = {
+              kind: "known",
+              decodedBytes,
+              trustedNative: metadata.nativeDecodeSafe,
+              sourceMetadata: {
+                sampleRate: metadata.sampleRate,
+                channelCount: metadata.channelCount,
+                frameCount: metadata.frameCount,
+                durationSeconds: metadata.durationSeconds,
+                codecName: metadata.container,
+                bitDepth: metadata.bitDepth,
+                label: metadata.container === "flac"
+                  ? "FLAC STREAMINFO"
+                  : `${metadata.container.toUpperCase()} header`,
+                frameCountExact: true,
+              },
+            };
+          } else {
+            let probedMetadata: DecodeProbeMetadata | null = null;
+            try {
+              probedMetadata = await probeCompressedSource(jobId, file, planGeneration);
+            } catch {
+              // Probe failures keep the conservative plan and are not surfaced.
+            }
+            const probedPlan = planProbedDecodeFootprint(probedMetadata, budget);
+            plan = probedPlan.kind === "known"
+              ? {
+                  kind: "known",
+                  decodedBytes: probedPlan.decodedBytes,
+                  trustedNative: false,
+                  sourceMetadata: {
+                    ...probedPlan.metadata,
+                    label: probedPlan.metadata.codecName
+                      ? `${probedPlan.metadata.codecName} probe`
+                      : "Source probe",
+                    frameCountExact: false,
+                  },
+                }
+              : { kind: "unknown" };
+          }
+        } else {
+          let probedMetadata: DecodeProbeMetadata | null = null;
+          try {
+            probedMetadata = await probeCompressedSource(jobId, file, planGeneration);
+          } catch {
+            // A timed-out, rejected or crashed probe preserves old behavior by
+            // falling back to the conservative plan. It never fails the row.
+          }
+          const probedPlan = planProbedDecodeFootprint(probedMetadata, budget);
+          plan = probedPlan.kind === "known"
             ? {
                 kind: "known",
-                decodedBytes,
-                trustedNative: metadata.nativeDecodeSafe,
+                decodedBytes: probedPlan.decodedBytes,
+                trustedNative: false,
+                sourceMetadata: {
+                  ...probedPlan.metadata,
+                  label: probedPlan.metadata.codecName
+                    ? `${probedPlan.metadata.codecName} probe`
+                    : "Source probe",
+                  frameCountExact: false,
+                },
               }
             : { kind: "unknown" };
-        } else {
-          plan = { kind: "unknown" };
         }
 
         if (
           filesRef.current.get(jobId) === file &&
-          resourcePlansRef.current.get(jobId)?.kind === "preparing"
+          resourcePlansRef.current.get(jobId)?.kind === "preparing" &&
+          resourcePlanGenerationRef.current.get(jobId) === planGeneration &&
+          jobStore.getSnapshot().some((job) => job.id === jobId && job.status === "queued")
         ) {
           resourcePlansRef.current.set(jobId, plan);
         }
       } catch (error) {
         if (
           filesRef.current.get(jobId) === file &&
-          resourcePlansRef.current.get(jobId)?.kind === "preparing"
+          resourcePlansRef.current.get(jobId)?.kind === "preparing" &&
+          resourcePlanGenerationRef.current.get(jobId) === planGeneration &&
+          jobStore.getSnapshot().some((job) => job.id === jobId && job.status === "queued")
         ) {
           const details = decodeFailureDetails(error);
+          const summary = normalizeDecodeFailure(
+            details.message,
+            settingsRef.current.decodePreference,
+            details.code,
+            decodeBudgetRef.current,
+          );
           resourcePlansRef.current.set(jobId, {
             kind: "rejected",
-            error: details.message,
+            error: composeJobError(summary, details.message),
           });
           updateJob(jobId, (job) =>
             job.status === "queued"
               ? {
                   ...job,
                   status: "failed",
-                  error: details.message,
+                  error: composeJobError(summary, details.message),
                   progressPercent: 1,
                   progressLabel: "Resource limit",
                   finishedAtMs: Date.now(),
@@ -1612,7 +2000,7 @@ export function useTruePeakAnalyzer(
         fillLanesRef.current();
       }
     },
-    [updateJob],
+    [jobStore, probeCompressedSource, updateJob],
   );
 
   const ensureLaneWorkers = useCallback(
@@ -1635,88 +2023,11 @@ export function useTruePeakAnalyzer(
       lane.failureStreak += 1;
       if (lane.failureStreak >= MAX_LANE_FAILURE_STREAK) {
         lane.retireAfterRelease = true;
-        workerCircuitOpenRef.current = true;
-        pushNotice(
-          "The analysis workers keep failing to start. Reload the page and try again.",
-        );
+        openWorkerCircuit(lane.lease?.jobId);
       }
       throw attachError;
     },
-    [attachLaneWorkers, pushNotice, terminateLaneWorkers],
-  );
-
-  const growLeasePeakReservation = useCallback(
-    (
-      lane: WorkerLane,
-      lease: LaneLease,
-      requiredPeakBytes: number,
-      requireExclusive: boolean,
-    ) => {
-      if (lane.lease !== lease) {
-        throw cancellationFailure("The decode lease is no longer current.");
-      }
-      if (
-        requireExclusive &&
-        lanesRef.current.some(
-          (candidate) =>
-            candidate !== lane && candidate.lease !== null,
-        )
-      ) {
-        // Contention, not an over-budget condition: another lease is still
-        // active, so the exclusive reservation cannot be taken yet. This state
-        // clears as the batch drains, so it is retryable — runJob catches it and
-        // requeues the job instead of failing it.
-        throw new DecodeResourceError(
-          "decoder-busy",
-          "Waiting for the current batch to finish so this file can reserve exclusive decode memory.",
-          true,
-        );
-      }
-
-      const reservation = lease.reservation;
-      let nextTotal: number;
-      try {
-        nextTotal = growDecodePeakReservation(
-          reservedPeakBytesRef.current,
-          reservation.peakBytes,
-          requiredPeakBytes,
-          aggregatePeakBytesRef.current,
-        );
-      } catch (error) {
-        // Separate a momentarily full aggregate (transient: this reservation
-        // would fit an otherwise-empty batch, so wait and retry) from a route
-        // that can never fit the aggregate at all (permanent over-budget). Only
-        // the former becomes a retryable requeue.
-        if (
-          error instanceof DecodeResourceError &&
-          error.code === "decoded-budget-exceeded" &&
-          classifyReservationContention(
-            requiredPeakBytes,
-            aggregatePeakBytesRef.current,
-          ) === "retryable"
-        ) {
-          throw new DecodeResourceError(
-            "decoder-busy",
-            "Waiting for decode memory to free up before this file can continue.",
-            true,
-          );
-        }
-        throw error;
-      }
-
-      // All validation happens above. Mutate the aggregate and its lease as one
-      // synchronous step so no route can begin between the capacity check and
-      // ownership update.
-      reservedPeakBytesRef.current = nextTotal;
-      if (requiredPeakBytes > reservation.peakBytes) {
-        reservation.peakBytes = requiredPeakBytes;
-      }
-      if (requireExclusive && !reservation.exclusive) {
-        reservation.exclusive = true;
-        heavyJobActiveRef.current = lease.jobId;
-      }
-    },
-    [],
+    [attachLaneWorkers, openWorkerCircuit, terminateLaneWorkers],
   );
 
   const validateDecodedAssetForLease = useCallback(
@@ -1753,6 +2064,7 @@ export function useTruePeakAnalyzer(
               "compatibility-worker",
               footprint.decodedBytes,
               workerUsage.outputBytes,
+              workerUsage.sourceBytes,
             )
           : decodePeakResidentBytes(
               "native-worker",
@@ -1769,7 +2081,7 @@ export function useTruePeakAnalyzer(
         actualPeakBytes > lease.reservation.plannedPeakBytes;
       const conservativeRoute =
         (browserRoute || workerUsage?.outputBytes != null) && exceededPlan;
-      growLeasePeakReservation(
+      reservations.growLeasePeakReservation(
         lane,
         lease,
         conservativeRoute
@@ -1781,7 +2093,7 @@ export function useTruePeakAnalyzer(
         conservativeRoute,
       );
     },
-    [growLeasePeakReservation],
+    [reservations],
   );
 
   const decodeInWorker = useCallback(
@@ -1821,6 +2133,7 @@ export function useTruePeakAnalyzer(
               mimeType,
               file,
               budget: decodeBudgetRef.current,
+              allowCompatibilityDecoder: settingsRef.current.allowCompatibilityDecoder,
             } satisfies DecoderRequest,
           );
         } catch (error) {
@@ -1908,797 +2221,120 @@ export function useTruePeakAnalyzer(
         }
 
         tick += 1;
-        updateJobIfRunCurrent(jobId, runToken, (job) => ({
-          ...job,
-          status: "decoding",
-          // Never below the job's current progress: in the fallback path the
-          // job arrives here already at 78%, and the old min() clamp dragged
-          // it back to 42%.
-          progressPercent: Math.max(job.progressPercent, Math.min(0.42, 0.18 + tick * 0.02)),
-          progressLabel: "Still decoding locally - large files can take a moment",
-        }));
+        queueJobProgress(
+          jobId,
+          runToken,
+          "decoding",
+          Math.min(0.42, 0.18 + tick * 0.02),
+          "Still decoding locally - large files can take a moment",
+        );
       }, 4500);
     },
-    [isJobRunCurrent, updateJobIfRunCurrent],
-  );
-
-  const releaseLane = useCallback(
-    (lane: WorkerLane, lease: LaneLease, terminalSuccess: boolean) => {
-      // A stale finally block must never release a newer job that has since
-      // acquired this lane. Object identity plus generation makes that check
-      // explicit instead of relying on a mutable jobId string.
-      if (lane.lease !== lease || lane.leaseGeneration !== lease.generation) {
-        return;
-      }
-
-      if (!lease.reservation.released) {
-        lease.reservation.released = true;
-        reservedPeakBytesRef.current = Math.max(
-          0,
-          reservedPeakBytesRef.current - lease.reservation.peakBytes,
-        );
-      }
-      if (laneByJobRef.current.get(lease.jobId) === lane) {
-        laneByJobRef.current.delete(lease.jobId);
-      }
-      if (heavyJobActiveRef.current === lease.jobId) {
-        heavyJobActiveRef.current = null;
-      }
-      lane.lease = null;
-
-      // Progress is not proof that the worker pair is healthy. Only a complete
-      // decode+analysis result resets the consecutive transport-failure streak.
-      if (terminalSuccess) {
-        lane.failureStreak = 0;
-      }
-
-      if (lane.retireAfterRelease) {
-        terminateLaneWorkers(lane);
-        const index = lanesRef.current.indexOf(lane);
-        if (index >= 0) {
-          lanesRef.current.splice(index, 1);
-        }
-      }
-      // A canceled browser decode can outlive the first idle timer because its
-      // lease correctly remains busy while decodeAudioData drains. Re-arm the
-      // timer now that this lane is genuinely idle.
-      scheduleIdleLaneTeardown();
-    },
-    [scheduleIdleLaneTeardown, terminateLaneWorkers],
+    [isJobRunCurrent, queueJobProgress],
   );
 
   const runJob = useCallback(
-    async (
+    (
       lane: WorkerLane,
       lease: LaneLease,
       currentTarget: TargetPreset | null,
       currentAnalysisMode: AnalysisMode,
       currentDecodePreference: DecodePreference,
-    ) => {
-      const { jobId, runToken } = lease;
-      const file = filesRef.current.get(jobId);
-      if (!file) {
-        updateJobIfRunCurrent(jobId, runToken, (job) => ({
-          ...job,
-          status: "failed",
-          error: "Original file handle was not available for retry.",
-          progressLabel: "Missing file",
-          progressPercent: 1,
-          finishedAtMs: Date.now(),
-        }));
-        releaseLane(lane, lease, false);
-        fillLanesRef.current();
-        return;
-      }
-
-      let browserDecodeHeartbeat: number | null = null;
-      let terminalSuccess = false;
-      const leaseIsCurrent = () =>
-        lane.lease === lease && isJobRunCurrent(jobId, runToken);
-
-      const stopBrowserDecodeHeartbeat = () => {
-        if (browserDecodeHeartbeat != null) {
-          window.clearInterval(browserDecodeHeartbeat);
-          browserDecodeHeartbeat = null;
-        }
-      };
-
-      // Defence in depth, not the fix for the stale-admission race: fillLanes
-      // mints this lease's run token immediately before calling runJob, so on
-      // every current path the gate passes. What actually stops a cancelled job
-      // being admitted is cancelJob/cancelActiveJobs writing the cancel into
-      // jobsRef synchronously. This gate is what keeps that guarantee cheap to
-      // hold: any future caller that hands runJob a lease built from a stale
-      // view releases here instead of reading and fully decoding the file, and
-      // every other leaseIsCurrent check sits past the decode.
-      if (!leaseIsCurrent()) {
-        releaseLane(lane, lease, false);
-        fillLanesRef.current();
-        return;
-      }
-
-      try {
-        updateJobIfRunCurrent(jobId, runToken, (job) => ({
-          ...job,
-          status: "reading",
-          progressPercent: 0.02,
-          progressLabel: "Reading local file",
-          startedAtMs: Date.now(),
-          finishedAtMs: undefined,
-        }));
-
-        const mimeType = file.type || "application/octet-stream";
-        let decoded: DecodedAudioTransfer;
-        let workerUsage: DecodeResourceUsage | undefined;
-        let decodedByBrowser = false;
-        const browserFirst =
-          currentDecodePreference === "browser-first" ||
-          (currentDecodePreference === "auto" &&
-            shouldPreferBrowserDecoder(file.name, mimeType));
-
-        // A job that was requeued after reservation contention carries a pinned
-        // single route it must run this time, plus the reservation it was
-        // re-admitted under. Non-escalated plans keep the usual
-        // browser-first/native ordering and fallback chains.
-        const activePlan = resourcePlansRef.current.get(jobId);
-        const escalatedRoute =
-          activePlan?.kind === "escalated" ? activePlan.route : null;
-
-        // Flip a contended job back to "queued" so the scheduler re-admits it
-        // once the batch frees the memory it needs, recording the reservation,
-        // exclusivity and route the retry must use. Returns "failed" only when
-        // the requeue cap trips (belt-and-braces: an escalated re-admission
-        // already holds its reservation before runJob starts, so a second
-        // same-or-lower requeue should be unreachable).
-        const requeueForContention = (
-          reservationPeakBytes: number,
-          exclusive: boolean,
-          route: "browser-only" | "compatibility-only",
-        ): "requeued" | "failed" | "stale" => {
-          // Guard the plan mutation on run-currency itself rather than trusting
-          // that no caller ever awaits between its last leaseIsCurrent check and
-          // this call. If a concurrent cancel/remove/retry has invalidated the
-          // run token or handed the lane to a newer job, a stale requeue must
-          // not resurrect a resource plan for a job that has moved on (retryJob
-          // and removeJob delete the plan; overwriting it here would leak an
-          // escalated plan or clobber a fresh preflight).
-          if (!isJobRunCurrent(jobId, runToken) || lane.lease !== lease) {
-            return "stale";
-          }
-
-          const priorPlan = resourcePlansRef.current.get(jobId);
-          const priorEscalations =
-            priorPlan?.kind === "escalated" ? priorPlan.escalations : 0;
-          const carriedDecodedBytes =
-            priorPlan?.kind === "known"
-              ? priorPlan.decodedBytes
-              : priorPlan?.kind === "escalated"
-                ? priorPlan.decodedBytes
-                : null;
-
-          if (
-            priorPlan?.kind === "escalated" &&
-            reservationPeakBytes <= priorPlan.reservationPeakBytes &&
-            (!exclusive || priorPlan.exclusive)
-          ) {
-            updateJobIfRunCurrent(jobId, runToken, (job) => ({
-              ...job,
-              status: "failed",
-              error:
-                "TruePeak could not reserve enough memory to analyze this file alongside the rest of the batch. Remove some files or retry once the batch finishes.",
-              progressLabel: "Failed",
-              progressPercent: 1,
-              finishedAtMs: Date.now(),
-            }));
-            return "failed";
-          }
-
-          resourcePlansRef.current.set(jobId, {
-            kind: "escalated",
-            reservationPeakBytes,
-            exclusive,
-            route,
-            decodedBytes: carriedDecodedBytes,
-            escalations: priorEscalations + 1,
-          });
-          updateJobIfRunCurrent(jobId, runToken, (job) => ({
-            ...job,
-            status: "queued",
-            progressPercent: 0,
-            progressLabel: "Waiting for memory reservation",
-            error: undefined,
-            startedAtMs: undefined,
-            finishedAtMs: undefined,
-          }));
-          return "requeued";
-        };
-
-        // Grow the lease reservation for a fallback/true-up route. Returns true
-        // when runJob must stop: transient contention requeued the job, or the
-        // requeue cap failed it. A retryable decoder-busy is handled HERE and
-        // never propagates into the decode fallback chains, so it can never be
-        // swallowed by canTryAlternateDecoder. Any other error propagates
-        // unchanged (a stale lease is caught by the outer leaseIsCurrent gate).
-        const escalateReservationOrBail = (
-          reservationPeakBytes: number,
-          exclusive: boolean,
-          route: "browser-only" | "compatibility-only",
-        ): boolean => {
-          try {
-            growLeasePeakReservation(lane, lease, reservationPeakBytes, exclusive);
-            return false;
-          } catch (error) {
-            if (
-              error instanceof DecodeResourceError &&
-              error.code === "decoder-busy"
-            ) {
-              requeueForContention(reservationPeakBytes, exclusive, route);
-              return true;
-            }
-            throw error;
-          }
-        };
-
-        // Every browser decode holds a window slot for the duration of the
-        // decode call, so at most `capacity` untrusted decodeAudioData
-        // allocations run at once (capacity x browser peak <= aggregate cap by
-        // construction). This is orthogonal to the byte reservations: those
-        // bound retained memory, this bounds the concurrent transient decode
-        // allocation, which an under-declared header could otherwise slip past
-        // admission. The lease's abort signal is passed so a cancel/remove
-        // while waiting leaves the FIFO queue WITHOUT leaking a slot or a
-        // waiter. The slot is released in a finally AFTER the decode promise
-        // settles: like waitForBrowserDecodeDrain, the un-abortable browser
-        // decode may still be draining, and its transient memory is only surely
-        // freed once the wrapper resolves or rejects. Unlike a reservation
-        // contention this wait never requeues and cannot deadlock: a slot is
-        // ALWAYS freed eventually because the browser decode either settles or,
-        // if its promise never settles, is abandoned by the bounded post-abort
-        // drain grace in waitForBrowserDecodeDrain (a terminal
-        // BrowserDecodeDrainTimeoutError). On that rare zombie path the slot is
-        // still freed by the finally and the lane is retired below so the
-        // still-draining decode never overlaps a future job.
-        const browserDecodeWindow = browserDecodeWindowRef.current;
-        const decodeInBrowserWindow = async (
-          primaryError: string | undefined,
-          decodingLabel: string,
-          decodingProgress: number,
-        ): Promise<DecodedAudioTransfer> => {
-          // Surface the waiting label only while the window is actually full so
-          // an uncontended decode does not flash it. The check and the acquire
-          // run with no await between them, so this branch matches what acquire
-          // then does (grab immediately vs. queue).
-          if (browserDecodeWindow.available <= 0) {
-            updateJobIfRunCurrent(jobId, runToken, (job) => ({
-              ...job,
-              status: "decoding",
-              progressLabel: "Waiting for a browser decode slot",
-            }));
-          }
-          const releaseSlot = await browserDecodeWindow.acquire(
-            lease.browserAbortController.signal,
-          );
-          try {
-            // Each browser decode/fallback restarts its own 0..1 scale, so the
-            // decode checkpoint is set directly (as before the window wrap), not
-            // clamped to a possibly-higher value left by a failed prior route.
-            updateJobIfRunCurrent(jobId, runToken, (job) => ({
-              ...job,
-              status: "decoding",
-              progressPercent: decodingProgress,
-              progressLabel: decodingLabel,
-            }));
-            browserDecodeHeartbeat = startBrowserDecodeHeartbeat(jobId, runToken);
-            return await decodeAudioFileInBrowser(file, primaryError, undefined, {
-              signal: lease.browserAbortController.signal,
-              budget: decodeBudgetRef.current,
-            });
-          } catch (error) {
-            // A browser decode whose post-abort drain grace expired may still be
-            // running on the main thread (decodeAudioData is unabortable). Retire
-            // this lane so no future job shares it — or the transient memory the
-            // zombie decode may still hold. Marked here, not in the outer catch,
-            // because a user cancel takes an early-return path that skips the
-            // outer catch; the slot is freed by the finally below in every case.
-            // (Finding [3].)
-            if (isBrowserDecodeDrainTimeout(error)) {
-              lane.retireAfterRelease = true;
-            }
-            throw error;
-          } finally {
-            releaseSlot();
-          }
-        };
-
-        if (escalatedRoute === "browser-only") {
-          // Re-admitted under an escalated plan: run only the browser decoder,
-          // under the reservation this run already holds. No fallback.
-          decoded = await decodeInBrowserWindow(
-            undefined,
-            "Decoding locally",
-            0.16,
-          );
-          decodedByBrowser = true;
-        } else if (escalatedRoute === "compatibility-only") {
-          // Re-admitted under an escalated plan: run only the compatibility
-          // decoder, under the reservation this run already holds. No fallback.
-          updateJobIfRunCurrent(jobId, runToken, (job) => ({
-            ...job,
-            status: "decoding",
-            progressPercent: 0.16,
-            progressLabel: "Decoding with the compatibility decoder",
-          }));
-          const workerResult = await decodeInWorker(lane, lease, file, mimeType);
-          decoded = workerResult.asset;
-          workerUsage = workerResult.usage;
-          decodedByBrowser = false;
-        } else if (browserFirst) {
-          // Admission already reserved the browser-route peak for this job (2x
-          // decoded bytes for a known footprint, the conservative peak for an
-          // unknown one), so the browser decode proceeds under that reservation
-          // directly. The window slot (acquired inside decodeInBrowserWindow)
-          // is held only for the browser decode and released before the compat
-          // fallback below, so a failed browser attempt never keeps a slot from
-          // the compatibility route. Post-decode validateDecodedAssetForLease
-          // trues up the actual peak and escalates only if the decode exceeded
-          // its plan.
-          try {
-            decoded = await decodeInBrowserWindow(
-              undefined,
-              currentDecodePreference === "browser-first"
-                ? "Using browser decoder preference"
-                : "Trying browser decoder first",
-              0.16,
-            );
-            decodedByBrowser = true;
-          } catch (browserError) {
-            stopBrowserDecodeHeartbeat();
-            if (!leaseIsCurrent()) {
-              return;
-            }
-            if (!canTryAlternateDecoder(browserError)) {
-              throw browserError;
-            }
-
-            const browserMessage =
-              browserError instanceof Error
-                ? browserError.message
-                : "The browser decoder could not read this file.";
-
-            // FFmpeg working memory is not modeled per file, so the
-            // compatibility route needs the conservative per-job reservation
-            // (but NOT exclusivity — the aggregate cap decides how many
-            // conservative routes coexist). Grow it BEFORE decoding and OUTSIDE
-            // the compat try/catch below, so a retryable contention requeues the
-            // job rather than being swallowed into another decode attempt.
-            if (
-              escalateReservationOrBail(
-                conservativeDecodePeakBytes(decodeBudgetRef.current),
-                false,
-                "compatibility-only",
-              )
-            ) {
-              return;
-            }
-
-            updateJobIfRunCurrent(jobId, runToken, (job) => ({
-              ...job,
-              status: "decoding",
-              progressPercent: 0.46,
-              progressLabel: "Escalating to compatibility decoder",
-            }));
-
-            try {
-              const workerResult = await decodeInWorker(
-                lane,
-                lease,
-                file,
-                mimeType,
-              );
-              decoded = workerResult.asset;
-              workerUsage = workerResult.usage;
-              decodedByBrowser = false;
-            } catch (workerError) {
-              if (!canTryAlternateDecoder(workerError)) {
-                throw workerError;
-              }
-              const workerMessage =
-                workerError instanceof Error
-                  ? workerError.message
-                  : "The compatibility decoder could not read this file.";
-              throw new Error(
-                `Browser decode failed: ${browserMessage}. Compatibility decode failed: ${workerMessage}`,
-              );
-            }
-          }
-        } else {
-          try {
-            const workerResult = await decodeInWorker(
-              lane,
-              lease,
-              file,
-              mimeType,
-            );
-            decoded = workerResult.asset;
-            workerUsage = workerResult.usage;
-          } catch (decodeError) {
-            if (!leaseIsCurrent()) {
-              return;
-            }
-            if (!canTryAlternateDecoder(decodeError)) {
-              throw decodeError;
-            }
-
-            // The native route had a smaller checked reservation. Grow it to the
-            // conservative peak (NON-exclusive — native decode failing means the
-            // header may not be trustworthy, but the aggregate cap still governs
-            // how many conservative routes coexist) before the browser fallback
-            // allocates AudioBuffer + planar PCM. Post-decode validation still
-            // catches actual exceedance. Done OUTSIDE the browser try/catch below
-            // so a retryable contention requeues instead of chaining into
-            // another decode attempt.
-            if (
-              escalateReservationOrBail(
-                conservativeDecodePeakBytes(decodeBudgetRef.current),
-                false,
-                "browser-only",
-              )
-            ) {
-              return;
-            }
-
-            const primaryMessage =
-              decodeError instanceof Error
-                ? decodeError.message
-                : "The primary decoder could not read this file.";
-
-            try {
-              decoded = await decodeInBrowserWindow(
-                primaryMessage,
-                "Trying browser decoder fallback",
-                0.78,
-              );
-              decodedByBrowser = true;
-            } catch (fallbackError) {
-              stopBrowserDecodeHeartbeat();
-              if (!leaseIsCurrent()) {
-                return;
-              }
-              if (!canTryAlternateDecoder(fallbackError)) {
-                throw fallbackError;
-              }
-
-              const fallbackMessage =
-                fallbackError instanceof Error
-                  ? fallbackError.message
-                  : "The browser decoder could not read this file.";
-              throw new Error(
-                `Primary decode failed: ${primaryMessage}. Browser fallback failed: ${fallbackMessage}`,
-              );
-            }
-          }
-        }
-        stopBrowserDecodeHeartbeat();
-        if (!leaseIsCurrent()) {
-          return;
-        }
-        try {
-          validateDecodedAssetForLease(
-            lane,
-            lease,
-            decoded,
-            workerUsage,
-            decodedByBrowser,
-          );
-        } catch (error) {
-          // A header that lied about its footprint makes the decode exceed its
-          // plan; validateDecodedAssetForLease escalates to the conservative
-          // exclusive posture. If that escalation hits contention, requeue the
-          // job pinned to the route that just decoded so it re-runs alone once
-          // the batch drains (the decoded buffers are discarded and re-decoded).
-          // Genuine budget violations are not decoder-busy and propagate to the
-          // failure handler unchanged.
-          if (
-            error instanceof DecodeResourceError &&
-            error.code === "decoder-busy"
-          ) {
-            requeueForContention(
-              conservativeDecodePeakBytes(decodeBudgetRef.current),
-              true,
-              decodedByBrowser ? "browser-only" : "compatibility-only",
-            );
-            return;
-          }
-          throw error;
-        }
-
-        updateJobIfRunCurrent(jobId, runToken, (job) => ({
-          ...job,
-          status: "analyzing",
-          progressPercent: ANALYSIS_PROGRESS_BASE,
-          progressLabel:
-            currentAnalysisMode === "measure-only"
-              ? "Measuring loudness, peaks, and dynamics"
-              : "Analyzing loudness history",
-        }));
-        const targetForJob =
-          currentAnalysisMode === "targeted"
-            ? currentTarget ?? DEFAULT_TARGET_PRESET
-            : null;
-        const result = await analyzeInWorker(
-          lane,
-          lease,
-          decoded,
-          targetForJob,
-        );
-        if (!leaseIsCurrent()) {
-          return;
-        }
-
-        // The target or analysis mode may have changed while this file was still
-        // decoding/analyzing. Reconcile the freshly computed result to the current
-        // settings so a job that finishes after a target switch doesn't keep a stale
-        // target. (The retarget effect only re-maps already-completed jobs, so without
-        // this a mid-flight job would slip through with the old target applied.)
-        const latestSettings = settingsRef.current;
-        const reconciledResult =
-          result == null
-            ? result
-            : retargetAnalysisResult(
-                result,
-                latestSettings.analysisMode === "targeted"
-                  ? latestSettings.target ?? DEFAULT_TARGET_PRESET
-                  : null,
-              );
-        updateJobIfRunCurrent(jobId, runToken, (job) => ({
-          ...job,
-          status: "complete",
-          progressPercent: 1,
-          progressLabel: "Complete",
-          result: reconciledResult,
-          error: undefined,
-          finishedAtMs: Date.now(),
-        }));
-        terminalSuccess = true;
-      } catch (error) {
-        stopBrowserDecodeHeartbeat();
-        if (!leaseIsCurrent()) {
-          return;
-        }
-
-        const rawMessage = error instanceof Error ? error.message : "The job failed.";
-        const message = normalizeDecodeFailure(rawMessage, currentDecodePreference);
-        const canceled = isCancellationReason(message);
-        updateJobIfRunCurrent(jobId, runToken, (job) => ({
-          ...job,
-          status: canceled ? "canceled" : "failed",
-          error: canceled ? undefined : message,
-          progressLabel: canceled ? "Canceled" : "Failed",
-          progressPercent: 1,
-          finishedAtMs: Date.now(),
-        }));
-      } finally {
-        stopBrowserDecodeHeartbeat();
-        releaseLane(lane, lease, terminalSuccess);
-        // The freed lane can pick up the next queued file right away.
-        fillLanesRef.current();
-      }
-    },
+    ) => runAnalysisJob(
+      {
+        files: filesRef,
+        resourcePlans: resourcePlansRef,
+        decodeBudget: decodeBudgetRef,
+        heavyFileBytes: heavyFileBytesRef,
+        browserDecodeWindow: browserDecodeWindowRef,
+        settings: settingsRef,
+        updateJobIfRunCurrent,
+        isJobRunCurrent,
+        releaseLane: reservations.releaseLane,
+        fillLanes: () => fillLanesRef.current(),
+        startBrowserDecodeHeartbeat,
+        growLeasePeakReservation: reservations.growLeasePeakReservation,
+        decodeInWorker,
+        analyzeInWorker,
+        validateDecodedAssetForLease,
+        resolveBrowserFirstRoute,
+        normalizeDecodeFailure,
+        isWorkerTransportError: (error) => error instanceof WorkerTransportError,
+        isCancellationReason,
+      },
+      lane,
+      lease,
+      currentTarget,
+      currentAnalysisMode,
+      currentDecodePreference,
+    ),
     [
       analyzeInWorker,
       decodeInWorker,
       isJobRunCurrent,
-      growLeasePeakReservation,
-      releaseLane,
+      reservations,
       startBrowserDecodeHeartbeat,
       updateJobIfRunCurrent,
       validateDecodedAssetForLease,
     ],
   );
-
   // Hand queued jobs to free lanes. A checked preflight reserves decoded PCM,
   // not compressed source bytes. Sources whose footprint cannot be established
   // safely run alone, as do very large files, so an optimistic estimate can
   // never multiply across lanes.
-  const fillLanes = useCallback(() => {
-    if (
-      !workspaceOpenRef.current ||
-      settingsRef.current.analysisBlocked ||
-      heavyJobActiveRef.current ||
-      workerCircuitOpenRef.current
-    ) {
-      return;
-    }
+  const scheduler = useMemo(
+    () => new AnalysisScheduler({
+      jobStore,
+      workspaceOpen: workspaceOpenRef,
+      settings: settingsRef,
+      workerCircuitOpen: workerCircuitOpenRef,
+      lanes: lanesRef,
+      laneLimit: laneLimitRef,
+      laneSequence: laneSequenceRef,
+      files: filesRef,
+      resourcePlans: resourcePlansRef,
+      preparingPlanCount: preparingPlanCountRef,
+      heavyFileBytes: heavyFileBytesRef,
+      decodeBudget: decodeBudgetRef,
+      reservations,
+      transport: {
+        attach: attachLaneWorkers,
+        dispose: disposeIdleLane,
+        run: runJob,
+      },
+      prepareResourcePlan,
+      updateJob,
+      beginJobRun,
+      resolveBrowserFirstRoute,
+    }),
+    [
+      attachLaneWorkers,
+      beginJobRun,
+      disposeIdleLane,
+      jobStore,
+      prepareResourcePlan,
+      reservations,
+      runJob,
+      updateJob,
+    ],
+  );
+  const fillLanes = scheduler.fillLanes;
 
-    // Enforce a lowered lane budget mid-batch. The preference effect can only
-    // dispose lanes that are idle at that moment; lanes that were busy then
-    // must be culled here as they free up, otherwise the queue keeps running
-    // at the old concurrency until it drains.
-    while (lanesRef.current.length > laneLimitRef.current) {
-      const idle = lanesRef.current.find((lane) => lane.lease === null);
-      if (!idle) {
-        break;
-      }
-
-      disposeIdleLane(idle);
-    }
-
-    const acquireLane = (): WorkerLane | null => {
-      const idle = lanesRef.current.find(
-        (lane) => lane.lease === null && !lane.retireAfterRelease,
-      );
-      if (idle) {
-        return idle;
-      }
-
-      if (lanesRef.current.length >= laneLimitRef.current) {
-        return null;
-      }
-
-      const lane: WorkerLane = {
-        id: laneSequenceRef.current++,
-        decoder: null,
-        analyzer: null,
-        workerEpoch: 0,
-        leaseGeneration: 0,
-        lease: null,
-        retireAfterRelease: false,
-        failureStreak: 0,
-      };
-      const attachError = attachLaneWorkers(lane);
-      if (attachError) {
-        lane.failureStreak = 1;
-      }
-      lanesRef.current.push(lane);
-      return lane;
-    };
-
-    for (const job of jobsRef.current) {
-      if (job.status !== "queued" || laneByJobRef.current.has(job.id)) {
-        continue;
-      }
-
-      const file = filesRef.current.get(job.id);
-      if (!file) {
-        updateJob(job.id, (current) => ({
-          ...current,
-          status: "failed",
-          error: "Original file handle is not available.",
-          progressPercent: 1,
-          progressLabel: "Missing file",
-          finishedAtMs: Date.now(),
-        }));
-        continue;
-      }
-
-      const plan = resourcePlansRef.current.get(job.id);
-      if (!plan || plan.kind === "preparing") {
-        // Preflights are quick (a header slice read), so keep a small pool of
-        // them in flight and keep scanning: a job whose plan is still pending
-        // must not strand idle lanes for already-planned jobs behind it. Each
-        // finished preflight re-runs fillLanes, so pending jobs are retried
-        // promptly and in queue order.
-        if (!plan) {
-          // Counted incrementally rather than derived by materialising and
-          // filtering the whole plan map. The count is loop-invariant except
-          // where this very loop starts a preflight, so deriving it paid
-          // O(|plans|) per unplanned job and made a single queue scan O(n^2).
-          if (preparingPlanCountRef.current < 4) {
-            void prepareResourcePlan(job.id, file);
-          }
-        }
-        continue;
-      }
-      if (plan.kind === "rejected") {
-        continue;
-      }
-
-      const settings = settingsRef.current;
-      const mimeType = file.type || "application/octet-stream";
-      // A job requeued after reservation contention carries the exact
-      // reservation and exclusivity it must be re-admitted under; use those
-      // directly and bypass the preflight admission model. Everything else
-      // plans admission from its known/unknown footprint as usual.
-      let reservationPeakBytes: number;
-      let exclusive: boolean;
-      if (plan.kind === "escalated") {
-        reservationPeakBytes = plan.reservationPeakBytes;
-        exclusive = plan.exclusive;
-      } else {
-        const browserFirst =
-          settings.decodePreference === "browser-first" ||
-          (settings.decodePreference === "auto" &&
-            shouldPreferBrowserDecoder(file.name, mimeType));
-        const admission = planLaneAdmission({
-          fileSizeBytes: file.size,
-          heavyFileBytes: heavyFileBytesRef.current,
-          browserFirst,
-          plan,
-          budget: decodeBudgetRef.current,
-        });
-        reservationPeakBytes = admission.reservationPeakBytes;
-        exclusive = admission.exclusive;
-      }
-
-      if (
-        exclusive &&
-        lanesRef.current.some((lane) => lane.lease !== null)
-      ) {
-        // Heavy files (and requeued exclusive escalations) drain the batch and
-        // run alone. Stopping the scan here is deliberate: admitting later jobs
-        // past a waiting exclusive job would starve it, because lanes might
-        // never all be idle at once again.
-        break;
-      }
-
-      let nextReservedPeakBytes: number;
-      try {
-        nextReservedPeakBytes = growDecodePeakReservation(
-          reservedPeakBytesRef.current,
-          0,
-          reservationPeakBytes,
-          aggregatePeakBytesRef.current,
-        );
-      } catch {
-        // Aggregate capacity is exhausted. Stop rather than skip ahead so the
-        // oldest waiting job gets first claim on capacity as running jobs
-        // release their reservations.
-        break;
-      }
-
-      const lane = acquireLane();
-      if (!lane) {
-        break;
-      }
-
-      const runToken = beginJobRun(job.id);
-      lane.leaseGeneration += 1;
-      const lease: LaneLease = Object.freeze({
-        laneId: lane.id,
-        generation: lane.leaseGeneration,
-        jobId: job.id,
-        runToken,
-        reservation: {
-          plannedPeakBytes: reservationPeakBytes,
-          peakBytes: reservationPeakBytes,
-          exclusive,
-          released: false,
-        },
-        browserAbortController: new AbortController(),
-      });
-      lane.lease = lease;
-      reservedPeakBytesRef.current = nextReservedPeakBytes;
-      laneByJobRef.current.set(job.id, lane);
-      if (exclusive) {
-        heavyJobActiveRef.current = job.id;
-      }
-      void runJob(
-        lane,
-        lease,
-        settings.target,
-        settings.analysisMode,
-        settings.decodePreference,
-      );
-      if (exclusive) {
-        break;
-      }
-    }
-  }, [
-    attachLaneWorkers,
-    beginJobRun,
-    disposeIdleLane,
-    prepareResourcePlan,
-    runJob,
-    updateJob,
-  ]);
 
   useEffect(() => {
     fillLanesRef.current = fillLanes;
   }, [fillLanes]);
 
-  useEffect(() => {
-    fillLanes();
-  }, [analysisBlocked, fillLanes, jobs]);
+  // The admission scan reads only each row's id and status, so the coalesced
+  // progress commits that dominate a run cannot admit anything new. Rescan when
+  // the admission signature moves instead of on every commit; the paths that
+  // free capacity without moving it (lane release, circuit resume, a lane-limit
+  // change, cancel, removal, a finished preflight) call fillLanes directly, and
+  // analysisBlocked stays a dependency so unblocking re-subscribes and scans.
+  useEffect(
+    () => subscribeLaneAdmission(jobStore, fillLanes),
+    [analysisBlocked, fillLanes, jobStore],
+  );
 
   const enqueueFiles = useCallback((input: FileList | File[]) => {
     const allFiles = Array.from(input);
@@ -2707,7 +2343,7 @@ export function useTruePeakAnalyzer(
     // runaway selection, a dropped drive, or a sequence of adds can never push
     // the session past MAX_SESSION_JOBS and freeze the tab. Overflow is reported
     // in the notice below, never silently dropped.
-    const intakePlan = planSessionIntake(jobsRef.current.length, allFiles.length);
+    const intakePlan = planSessionIntake(jobStore.getSnapshot().length, allFiles.length);
     const files = allFiles.slice(0, intakePlan.accepted);
     const skippedOverCap = intakePlan.turnedAway;
     const knownSignatures = new Set(fileSignaturesRef.current.values());
@@ -2760,10 +2396,9 @@ export function useTruePeakAnalyzer(
     if (nextJobs.length) {
       // A new explicit queue action is the retry boundary for a worker-start
       // circuit breaker; background renders never reopen it on their own.
-      workerCircuitOpenRef.current = false;
+      resumeWorkerCircuit();
       setJobs((current) => {
         const merged = [...nextJobs, ...current];
-        jobsRef.current = merged;
         return merged;
       });
     }
@@ -2799,34 +2434,28 @@ export function useTruePeakAnalyzer(
 
     // Callers use this to decide whether to navigate to the session screen.
     return nextJobs.length;
-  }, [pushNotice]);
+  }, [jobStore, pushNotice, resumeWorkerCircuit, setJobs]);
 
   const cancelJob = useCallback((jobId: string) => {
     invalidateJobRun(jobId);
 
-    // Mirror the cancel into jobsRef before anything reads it again. React
-    // applies state updaters lazily, so interruptLane's rejection microtasks
-    // (which run releaseLane -> fillLanes) and the fillLanes call below both
-    // observe jobsRef.current in this same tick. With only the setJobs write
-    // they still saw the row as "queued" and admitted it to a lane, minting a
-    // fresh run token that superseded the invalidateJobRun above and decoding a
-    // file the user had just cancelled.
-    jobsRef.current = jobsRef.current.map((job) =>
+    // JobStore updates synchronously, so rejection microtasks and fillLanes
+    // observe the cancellation before either can re-admit this job.
+    setJobs((current) => current.map((job) =>
       job.id === jobId ? markJobCanceled(job) : job,
-    );
+    ));
 
     const lane = laneByJobRef.current.get(jobId);
     if (lane) {
       interruptLane(lane, "Job canceled.");
     }
 
-    updateJob(jobId, markJobCanceled);
     fillLanesRef.current();
-  }, [interruptLane, invalidateJobRun, updateJob]);
+  }, [interruptLane, invalidateJobRun, setJobs]);
 
   const cancelActiveJobs = useCallback(() => {
     const activeIds = new Set(
-      jobsRef.current.filter(isActiveJob).map((job) => job.id),
+      jobStore.getSnapshot().filter(isActiveJob).map((job) => job.id),
     );
 
     if (!activeIds.size) {
@@ -2835,13 +2464,11 @@ export function useTruePeakAnalyzer(
 
     activeIds.forEach(invalidateJobRun);
 
-    // Same ordering requirement as cancelJob: jobsRef has to show the cancels
-    // before interruptLane runs, because each rejection queues a runJob finally
-    // block that calls releaseLane -> fillLanes, and those microtasks drain
-    // before the setJobs below is ever applied.
-    jobsRef.current = jobsRef.current.map((job) =>
+    // Same ordering requirement as cancelJob: publish every cancellation
+    // before interrupting lanes so rejection microtasks cannot re-admit them.
+    setJobs((current) => current.map((job) =>
       activeIds.has(job.id) ? markJobCanceled(job) : job,
-    );
+    ));
 
     lanesRef.current.forEach((lane) => {
       if (lane.lease !== null && activeIds.has(lane.lease.jobId)) {
@@ -2849,17 +2476,10 @@ export function useTruePeakAnalyzer(
       }
     });
 
-    setJobs((current) => {
-      const next: AnalysisJob[] = current.map((job) =>
-        activeIds.has(job.id) ? markJobCanceled(job) : job,
-      );
-      jobsRef.current = next;
-      return next;
-    });
     pushNotice(
-      `Canceled ${activeIds.size} active job${activeIds.size === 1 ? "" : "s"}.`,
+      `Canceled ${activeIds.size} active file${activeIds.size === 1 ? "" : "s"}.`,
     );
-  }, [interruptLane, invalidateJobRun, pushNotice]);
+  }, [interruptLane, invalidateJobRun, jobStore, pushNotice, setJobs]);
 
   const retryJob = useCallback((jobId: string) => {
     if (!filesRef.current.has(jobId)) {
@@ -2868,7 +2488,7 @@ export function useTruePeakAnalyzer(
 
     invalidateJobRun(jobId);
     resourcePlansRef.current.delete(jobId);
-    workerCircuitOpenRef.current = false;
+    resumeWorkerCircuit();
     updateJob(jobId, (job) => ({
       ...job,
       status: "queued",
@@ -2879,11 +2499,11 @@ export function useTruePeakAnalyzer(
       startedAtMs: undefined,
       finishedAtMs: undefined,
     }));
-  }, [invalidateJobRun, updateJob]);
+  }, [invalidateJobRun, resumeWorkerCircuit, updateJob]);
 
   const retryIssues = useCallback(() => {
     const retryIds = new Set(
-      jobsRef.current
+      jobStore.getSnapshot()
         .filter((job) => isIssueJob(job) && filesRef.current.has(job.id))
         .map((job) => job.id),
     );
@@ -2893,7 +2513,7 @@ export function useTruePeakAnalyzer(
       resourcePlansRef.current.delete(jobId);
     });
     if (retryIds.size) {
-      workerCircuitOpenRef.current = false;
+      resumeWorkerCircuit();
     }
     setJobs((current) => {
       const next: AnalysisJob[] = current.map((job) => {
@@ -2912,14 +2532,43 @@ export function useTruePeakAnalyzer(
 
         return job;
       });
-      jobsRef.current = next;
       return next;
     });
 
     if (retryIds.size) {
-      pushNotice(`Re-queued ${retryIds.size} issue job${retryIds.size === 1 ? "" : "s"}.`);
+      pushNotice(`Re-queued ${retryIds.size} file${retryIds.size === 1 ? "" : "s"} with issues.`);
     }
-  }, [invalidateJobRun, pushNotice]);
+  }, [invalidateJobRun, jobStore, pushNotice, resumeWorkerCircuit, setJobs]);
+
+  const retryAnalysis = useCallback(() => {
+    const retryIds = new Set(workerCircuitRetryJobsRef.current);
+    retryIds.forEach((jobId) => {
+      invalidateJobRun(jobId);
+      resourcePlansRef.current.delete(jobId);
+    });
+    resumeWorkerCircuit();
+
+    if (retryIds.size) {
+      const retryWorkerFailures = (current: AnalysisJob[]) =>
+        current.map((job) =>
+          retryIds.has(job.id) && job.status === "failed" && filesRef.current.has(job.id)
+            ? {
+                ...job,
+                status: "queued" as const,
+                progressPercent: 0,
+                progressLabel: "Queued",
+                error: undefined,
+                result: undefined,
+                startedAtMs: undefined,
+                finishedAtMs: undefined,
+              }
+            : job,
+        );
+      setJobs(retryWorkerFailures);
+    }
+
+    fillLanesRef.current();
+  }, [invalidateJobRun, resumeWorkerCircuit, setJobs]);
 
   const removeJob = useCallback((jobId: string) => {
     invalidateJobRun(jobId);
@@ -2931,11 +2580,10 @@ export function useTruePeakAnalyzer(
     dropJobResources(jobId);
     setJobs((current) => {
       const next = current.filter((job) => job.id !== jobId);
-      jobsRef.current = next;
       return next;
     });
     fillLanesRef.current();
-  }, [dropJobResources, interruptLane, invalidateJobRun]);
+  }, [dropJobResources, interruptLane, invalidateJobRun, setJobs]);
 
   const clearFinished = useCallback(() => {
     setJobs((current) => {
@@ -2946,11 +2594,10 @@ export function useTruePeakAnalyzer(
       );
       finishedIds.forEach(dropJobResources);
       const keep = current.filter((job) => !finishedIds.has(job.id));
-      jobsRef.current = keep;
       return keep;
     });
-    pushNotice("Cleared finished jobs from the queue.");
-  }, [dropJobResources, pushNotice]);
+    pushNotice("Cleared finished files from the queue.");
+  }, [dropJobResources, pushNotice, setJobs]);
 
   const clearSession = useCallback(() => {
     restoreGenerationRef.current += 1;
@@ -2970,9 +2617,14 @@ export function useTruePeakAnalyzer(
     filesRef.current.clear();
     fileSignaturesRef.current.clear();
     resourcePlansRef.current.clear();
+    resourcePlanGenerationRef.current.clear();
     persistedResultsRef.current.clear();
+    workerCircuitOpenRef.current = false;
+    workerCircuitRetryJobsRef.current.clear();
+    pendingAnalysisCountRef.current = 0;
+    writePendingAnalysisCount(0);
+    setWorkerCircuitIssue(null);
     setJobs(() => {
-      jobsRef.current = [];
       return [];
     });
     void clearPromise.then((controllerResult) => {
@@ -2981,7 +2633,6 @@ export function useTruePeakAnalyzer(
         persistenceFailureEpochRef.current += 1;
         const message = `The visible session was cleared, but its browser recovery copy may remain. ${failure}`;
         setPersistenceIssue(message);
-        pushNotice(message);
         return;
       }
 
@@ -2993,9 +2644,8 @@ export function useTruePeakAnalyzer(
       persistenceFailureEpochRef.current += 1;
       const message = `The visible session was cleared, but its browser recovery copy could not be deleted. ${error instanceof Error ? error.message : "Recovery storage failed unexpectedly."}`;
       setPersistenceIssue(message);
-      pushNotice(message);
     });
-  }, [interruptLane, liveSessionController, pushNotice]);
+  }, [interruptLane, liveSessionController, pushNotice, setJobs]);
 
   const clearRecentSessions = useCallback(() => {
     if (clearPersistedRecentSessions()) {
@@ -3014,41 +2664,41 @@ export function useTruePeakAnalyzer(
     try {
       downloadTextFile(
         getExportFileName("csv"),
-        buildCsvExport(jobsRef.current),
+        buildCsvExport(jobStore.getSnapshot()),
         "text/csv;charset=utf-8",
       );
     } catch {
       pushNotice("The browser blocked the CSV download. Try again or use another export format.");
     }
-  }, [pushNotice]);
+  }, [jobStore, pushNotice]);
   const exportJson = useCallback(() => {
     try {
       downloadTextFile(
         getExportFileName("json"),
-        buildJsonExport(jobsRef.current),
+        buildJsonExport(jobStore.getSnapshot()),
         "application/json;charset=utf-8",
       );
     } catch {
       pushNotice("The browser blocked the JSON download. Try again or use another export format.");
     }
-  }, [pushNotice]);
+  }, [jobStore, pushNotice]);
   const exportMarkdown = useCallback(() => {
     try {
       downloadTextFile(
         getExportFileName("markdown"),
-        buildMarkdownExport(jobsRef.current),
+        buildMarkdownExport(jobStore.getSnapshot()),
         "text/markdown;charset=utf-8",
       );
     } catch {
       pushNotice("The browser blocked the Markdown report download. Try again or use another export format.");
     }
-  }, [pushNotice]);
+  }, [jobStore, pushNotice]);
 
   const exportSession = useCallback(() => {
     try {
       downloadTextFile(
         getSessionFileName(),
-        buildSessionFile(jobsRef.current),
+        buildSessionFile(jobStore.getSnapshot()),
         "application/json;charset=utf-8",
       );
     } catch (error) {
@@ -3058,7 +2708,7 @@ export function useTruePeakAnalyzer(
           : "The browser blocked the session download. Try again.",
       );
     }
-  }, [pushNotice]);
+  }, [jobStore, pushNotice]);
 
   const importSession = useCallback(
     async (file: File) => {
@@ -3093,7 +2743,7 @@ export function useTruePeakAnalyzer(
       // full session past the limit the way file intake cannot.
       const reconciledJobs = reconcileSessionJobs(importedJobs, settingsRef.current);
       const { added, skippedDuplicates, skippedOverCap } = mergeImportedJobs(
-        jobsRef.current,
+        jobStore.getSnapshot(),
         reconciledJobs,
       );
 
@@ -3115,7 +2765,6 @@ export function useTruePeakAnalyzer(
         }
 
         const next = [...toAdd, ...current];
-        jobsRef.current = next;
         return next;
       });
 
@@ -3133,8 +2782,9 @@ export function useTruePeakAnalyzer(
       );
       return added;
     },
-    [pushNotice],
+    [jobStore, pushNotice, setJobs],
   );
+
 
   return {
     jobs,
@@ -3143,12 +2793,14 @@ export function useTruePeakAnalyzer(
     recentSessions,
     notice,
     persistenceIssue,
+    workerCircuitIssue,
     parallelLimit,
     enqueueFiles,
     cancelJob,
     cancelActiveJobs,
     retryJob,
     retryIssues,
+    retryAnalysis,
     removeJob,
     clearFinished,
     clearSession,

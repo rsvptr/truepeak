@@ -4,7 +4,7 @@
 // depth, pages per directory, callback wait, and total elapsed time.
 
 export const MAX_DROPPED_FILES = 2000;
-export const TRUEPEAK_RELATIVE_PATH_PROPERTY = "truepeakRelativePath" as const;
+const TRUEPEAK_RELATIVE_PATH_PROPERTY = "truepeakRelativePath" as const;
 
 const MAX_DROPPED_ENTRIES = 8000;
 const MAX_DIRECTORY_DEPTH = 12;
@@ -20,7 +20,7 @@ export interface DropTraversalBudget {
   deadlineMs: number;
 }
 
-export const DEFAULT_DROP_TRAVERSAL_BUDGET: Readonly<DropTraversalBudget> = Object.freeze({
+const DEFAULT_DROP_TRAVERSAL_BUDGET: Readonly<DropTraversalBudget> = Object.freeze({
   maxFiles: MAX_DROPPED_FILES,
   maxEntries: MAX_DROPPED_ENTRIES,
   maxDepth: MAX_DIRECTORY_DEPTH,

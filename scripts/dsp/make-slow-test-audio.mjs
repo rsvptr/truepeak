@@ -12,6 +12,10 @@ const sampleRate = 48000;
 const seconds = 120;
 const frames = sampleRate * seconds;
 
+/**
+ * @param {string} filePath
+ * @param {number} freq
+ */
 function writeWav(filePath, freq) {
   const dataBytes = frames * 2 * 4;
   const buf = Buffer.alloc(44 + dataBytes);

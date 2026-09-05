@@ -54,7 +54,7 @@ export function ConfirmDialog({
     >
       <div
         aria-hidden="true"
-        className="tp-fade-in absolute inset-0 bg-black/62 backdrop-blur-sm"
+        className="tp-fade-in absolute inset-0 touch-none overscroll-contain bg-black/62 backdrop-blur-sm"
         onClick={onClose}
       />
       <div

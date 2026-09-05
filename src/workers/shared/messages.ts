@@ -1,7 +1,20 @@
 import type { AnalysisResult, DecodedAudioTransfer, TargetPreset } from "@/types/audio";
-import type { DecodeBudget, DecodeFailureCode } from "@/audio/decode-budget";
+import type {
+  DecodeBudget,
+  DecodeFailureCode,
+  DecodeProbeMetadata,
+} from "@/audio/decode-budget";
 
 export type DecoderRequest =
+  | {
+      type: "probe";
+      jobId: string;
+      fileName: string;
+      mimeType: string;
+      file: File;
+      budget?: DecodeBudget;
+      allowCompatibilityDecoder?: boolean;
+    }
   | {
       type: "decode";
       jobId: string;
@@ -13,6 +26,7 @@ export type DecoderRequest =
       // Optional for compatibility with older callers. The worker always
       // resolves a bounded default and clamps supplied values to hard ceilings.
       budget?: DecodeBudget;
+      allowCompatibilityDecoder?: boolean;
     }
   | {
       type: "cancel";
@@ -36,6 +50,11 @@ export type DecoderResponse =
       label: string;
     }
   | {
+      type: "probed";
+      jobId: string;
+      metadata: DecodeProbeMetadata;
+    }
+  | {
       type: "decoded";
       jobId: string;
       asset: DecodedAudioTransfer;
@@ -47,6 +66,7 @@ export type DecoderResponse =
       error: string;
       code: DecodeFailureCode;
       retryable: boolean;
+      phase?: "probe" | "decode";
     };
 
 export type AnalyzerRequest = {

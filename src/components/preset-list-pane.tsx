@@ -79,10 +79,27 @@ function PresetRow({
       <span className="min-w-0 flex-1">
         <span className="block text-sm font-semibold text-[var(--ink)]">{label}</span>
         {sourceLabel ? (
-          <span className="mt-0.5 block text-xs leading-5 text-[var(--muted)]">{sourceLabel}</span>
+          <span
+            className={cn(
+              "mt-0.5 block text-xs leading-5",
+              // The selected row's accent-soft background drops muted text
+              // below 4.5:1 in light theme, so it needs the stronger token
+              // here (UX-10).
+              selected ? "text-[var(--ink)]" : "text-[var(--muted)]",
+            )}
+          >
+            {sourceLabel}
+          </span>
         ) : null}
         {blurb ? (
-          <span className="mt-0.5 block text-xs leading-5 text-[var(--muted)]">{blurb}</span>
+          <span
+            className={cn(
+              "mt-0.5 block text-xs leading-5",
+              selected ? "text-[var(--ink)]" : "text-[var(--muted)]",
+            )}
+          >
+            {blurb}
+          </span>
         ) : null}
         {stats ? (
           <span className="mt-1.5 block text-sm tabular-nums text-[var(--ink)]">{stats}</span>

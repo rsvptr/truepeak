@@ -1,4 +1,10 @@
 import { deriveChannelLayout } from "@/audio/channel-layout";
+import {
+  iterateContainerChunks,
+  readAscii,
+  readExtendedFloat80,
+  type BeforePcmAllocation,
+} from "@/audio/container-chunks";
 import type { DecodedAudioAsset } from "@/types/audio";
 
 const SUPPORTED_AIFC_COMPRESSION_TYPES = new Set([
@@ -14,29 +20,6 @@ const SUPPORTED_AIFC_COMPRESSION_TYPES = new Set([
 // FVER timestamp for AIFF-C Version 1 (the only defined AIFC version), per the
 // Apple AIFF-C specification. AIFC files must carry an FVER chunk declaring it.
 const AIFC_VERSION_1 = 0xa2805140;
-
-function readAscii(view: DataView, offset: number, length: number) {
-  let out = "";
-  for (let index = 0; index < length; index += 1) {
-    out += String.fromCharCode(view.getUint8(offset + index));
-  }
-  return out;
-}
-
-function readExtendedFloat80(view: DataView, offset: number) {
-  const exponent = view.getUint16(offset, false);
-  const hiMantissa = view.getUint32(offset + 2, false);
-  const loMantissa = view.getUint32(offset + 6, false);
-
-  if (exponent === 0 && hiMantissa === 0 && loMantissa === 0) {
-    return 0;
-  }
-
-  const sign = exponent & 0x8000 ? -1 : 1;
-  const unbiasedExponent = (exponent & 0x7fff) - 16383;
-  const mantissa = hiMantissa * 2 ** -31 + loMantissa * 2 ** -63;
-  return sign * mantissa * 2 ** unbiasedExponent;
-}
 
 function decodeAiffPcm(
   view: DataView,
@@ -102,15 +85,16 @@ export function parseAiffBuffer(
   buffer: ArrayBuffer,
   fileName: string,
   mimeType: string,
+  beforePcmAllocation?: BeforePcmAllocation,
 ): DecodedAudioAsset {
   const view = new DataView(buffer);
 
-  if (readAscii(view, 0, 4) !== "FORM") {
-    throw new Error("Not an AIFF/AIFC file.");
-  }
-
   if (view.byteLength < 12) {
     throw new Error("AIFF file header is truncated.");
+  }
+
+  if (readAscii(view, 0, 4) !== "FORM") {
+    throw new Error("Not an AIFF/AIFC file.");
   }
 
   const formType = readAscii(view, 8, 4);
@@ -118,8 +102,6 @@ export function parseAiffBuffer(
     throw new Error("Unsupported FORM type.");
   }
 
-  let offset = 12;
-  let chunksVisited = 0;
   let commOffset = 0;
   let commSize = 0;
   let ssndOffset = 0;
@@ -127,59 +109,33 @@ export function parseAiffBuffer(
   let fverOffset = 0;
   let fverSize = 0;
 
-  // Bound the chunk walk exactly the way inspectAiff (decode-budget.ts) already
-  // caps its sibling pre-flight scan. A legitimate AIFF/AIFC carries COMM, SSND,
-  // and (for AIFC) its mandatory FVER within the first handful of chunks, so
-  // 100k iterations is far more than any real file needs. Without this cap an
-  // AIFC with COMM+SSND early, no FVER, and a huge padded tail of size-0 chunks
-  // (which still fits inside the decode budget and passes the inspector) forces
-  // this synchronous loop to march to EOF one 4-char allocation per chunk before
-  // finally throwing "missing FVER" — freezing the decoder lane for seconds and
-  // bypassing the maxDecodeMs budget, which cannot interrupt a synchronous loop.
-  while (offset + 8 <= view.byteLength && chunksVisited < 100_000) {
-    const chunkId = readAscii(view, offset, 4);
-    const chunkSize = view.getUint32(offset + 4, false);
-    const dataOffset = offset + 8;
-    chunksVisited += 1;
-
-    // First occurrence wins for every chunk this parser consumes. inspectAiff
-    // (decode-budget.ts) latches the first COMM/SSND pair it sees and stops, so
-    // a later duplicate must not change the geometry used here: an AIFC laid out
-    // COMM#1, SSND, COMM#2, FVER would otherwise get its decode budget approved
-    // from COMM#1 while this parser allocates from COMM#2's frame count. The
-    // scan still continues past COMM+SSND for AIFC because FVER may legitimately
-    // trail them, which is why the latch matters rather than the break below.
-    //
-    // The size predicates mirror inspectAiff's, so both sides skip the same
-    // chunks. The inspector ignores a COMM below 18 bytes and an SSND below 8
-    // and keeps walking; latching one here regardless would reject a file the
-    // inspector reads happily from a later, well-formed chunk.
-    if (chunkId === "FVER" && !fverOffset) {
-      fverOffset = dataOffset;
-      fverSize = chunkSize;
+  // The parser and preflight share the same bounded iterator and selection
+  // rule: the first chunk with each required id wins, and scanning stops as
+  // soon as both COMM and SSND are known, regardless of their order. For AIFC,
+  // FVER therefore has to be encountered before that pair is complete.
+  for (const chunk of iterateContainerChunks(view, {
+    startOffset: 12,
+    totalBytes: view.byteLength,
+    littleEndian: false,
+  })) {
+    if (chunk.id === "FVER" && !fverOffset) {
+      fverOffset = chunk.dataOffset;
+      fverSize = chunk.declaredSize;
     }
 
-    if (chunkId === "COMM" && !commOffset && chunkSize >= 18) {
-      commOffset = dataOffset;
-      commSize = chunkSize;
+    if (chunk.id === "COMM" && !commOffset) {
+      commOffset = chunk.dataOffset;
+      commSize = chunk.declaredSize;
     }
 
-    if (chunkId === "SSND" && !ssndOffset && chunkSize >= 8) {
-      ssndOffset = dataOffset;
-      ssndSize = chunkSize;
+    if (chunk.id === "SSND" && !ssndOffset) {
+      ssndOffset = chunk.dataOffset;
+      ssndSize = chunk.declaredSize;
     }
 
-    // A valid AIFF is described by COMM + SSND; a valid AIFC additionally requires
-    // the mandatory FVER version chunk. Stop scanning once the required chunks are
-    // known so attacker-padded chunk tails can't burn time. FVER may legitimately
-    // appear after COMM/SSND, so for AIFC keep scanning until it is found — but the
-    // chunksVisited cap above guarantees the walk still terminates cheaply on a
-    // crafted FVER-absent flood instead of running all the way to EOF.
-    if (commOffset && ssndOffset && (formType !== "AIFC" || fverOffset)) {
+    if (commOffset && ssndOffset) {
       break;
     }
-
-    offset = dataOffset + chunkSize + (chunkSize % 2);
   }
 
   if (!commOffset || !ssndOffset) {
@@ -256,10 +212,34 @@ export function parseAiffBuffer(
   }
 
   const soundDataOffset = view.getUint32(ssndOffset, false);
-  const bytesPerFrame = channelCount * (bitsPerSample / 8);
+  const bytesPerSample = bitsPerSample / 8;
+  const isFloat = ["fl32", "FL32", "fl64", "FL64"].includes(compressionType);
+  if (!Number.isInteger(bytesPerSample)) {
+    throw new Error(`Unsupported AIFF sample depth: ${bitsPerSample}`);
+  }
+  if (
+    (isFloat && ![32, 64].includes(bitsPerSample)) ||
+    (!isFloat && ![8, 16, 24, 32].includes(bitsPerSample))
+  ) {
+    throw new Error(
+      isFloat
+        ? `Unsupported AIFF floating-point sample depth: ${bitsPerSample}`
+        : `Unsupported AIFF sample depth: ${bitsPerSample}`,
+    );
+  }
+
+  const bytesPerFrame = channelCount * bytesPerSample;
   const audioDataOffset = ssndOffset + 8 + soundDataOffset;
   const declaredAudioBytes = Math.max(0, ssndSize - 8 - soundDataOffset);
-  const declaredFrameBytes = frameCount * bytesPerFrame;
+  const declaredFrameBytes =
+    Number.isSafeInteger(bytesPerFrame) &&
+    bytesPerFrame > 0 &&
+    frameCount <= Math.floor(Number.MAX_SAFE_INTEGER / bytesPerFrame)
+      ? frameCount * bytesPerFrame
+      : null;
+  if (declaredFrameBytes == null) {
+    throw new Error("AIFF frame geometry exceeds the supported range.");
+  }
   const availableBytes = Math.max(0, view.byteLength - audioDataOffset);
   const audioDataByteLength = Math.min(
     declaredAudioBytes,
@@ -267,7 +247,15 @@ export function parseAiffBuffer(
     availableBytes,
   );
   const littleEndian = compressionType === "sowt";
-  const isFloat = ["fl32", "FL32", "fl64", "FL64"].includes(compressionType);
+  const decodedFrameCount = Math.floor(audioDataByteLength / bytesPerFrame);
+  if (!Number.isSafeInteger(decodedFrameCount) || decodedFrameCount <= 0) {
+    throw new Error("AIFF file does not contain decoded audio frames.");
+  }
+  beforePcmAllocation?.({
+    channelCount,
+    bitDepth: bitsPerSample,
+    frameCount: decodedFrameCount,
+  });
 
   const decoded = decodeAiffPcm(
     view,
@@ -278,10 +266,6 @@ export function parseAiffBuffer(
     littleEndian,
     isFloat,
   );
-  if (decoded.frameCount <= 0) {
-    throw new Error("AIFF file does not contain decoded audio frames.");
-  }
-
   return {
     fileName,
     mimeType,
@@ -289,7 +273,7 @@ export function parseAiffBuffer(
     sampleRate,
     bitDepth: bitsPerSample,
     durationSeconds: decoded.frameCount / sampleRate,
-    frameCount: Math.min(frameCount, decoded.frameCount),
+    frameCount: decoded.frameCount,
     channelCount,
     channelLayout: deriveChannelLayout(channelCount, null),
     decoderMode: "native-parser",

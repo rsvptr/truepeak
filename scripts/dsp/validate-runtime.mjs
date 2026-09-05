@@ -1,13 +1,25 @@
 // Focused resource-safety contract checks for decode budgets and bounded folder
-// traversal. Kept standalone so it can run before being wired into package.json.
+// traversal. Wired into package.json as the test:runtime script.
 //
-// Run: node scripts/dsp/validate-runtime.mjs
+// Run: npm run test:runtime
+import assert from "node:assert/strict";
 import { register } from "node:module";
 import { performance } from "node:perf_hooks";
+import test from "node:test";
+import {
+  makeAnalysisJob,
+  makeAnalysisResult,
+  makeAudioMetadata,
+  makeChannelLayout,
+  makeMetrics,
+} from "./lib/job-fixtures.mjs";
+import { encodeAiff, encodeFlacHeader, encodeWav, silentChannels } from "./lib/fixtures.mjs";
 
 register("./alias-loader.mjs", import.meta.url);
 
+const { formatTargetLufs } = await import("../../src/components/preset-taxonomy.tsx");
 const {
+  COMPATIBILITY_WAV_HEADER_ALLOWANCE_BYTES,
   DEFAULT_DECODE_BUDGET,
   DecodeResourceError,
   HARD_DECODE_LIMITS,
@@ -25,9 +37,11 @@ const {
   growDecodePeakReservation,
   inspectAudioContainer,
   planLaneAdmission,
+  planProbedDecodeFootprint,
   resolveAdaptiveDecodeBudget,
   resolveDecodeBudget,
   throwIfAborted,
+  validateDecodeProbeMetadata,
   validatePlanarChannels,
 } = await import("../../src/audio/decode-budget.ts");
 const {
@@ -35,6 +49,7 @@ const {
   getDroppedFileRelativePath,
 } = await import("../../src/lib/dropped-files.ts");
 const {
+  decodeAudioFileInBrowser,
   isBrowserDecodeDrainTimeout,
   waitForBrowserDecodeDrain,
 } = await import("../../src/audio/browser-decode.ts");
@@ -42,16 +57,83 @@ const {
   browserDecodeWindowCapacity,
   createCountingSemaphore,
 } = await import("../../src/audio/decode-window.ts");
+const {
+  completedHistoryFingerprint,
+  isSupportedAudioFile,
+  normalizeDecodeFailure,
+  resolveAggregatePeakBytes,
+  resolveBrowserFirstRoute,
+  resolveHeavyFileBytes,
+} = await import("../../src/hooks/use-truepeak-analyzer.ts");
 
-let passed = 0;
-let failed = 0;
+/** @typedef {import("../../src/types/audio.ts").AnalysisJob} AnalysisJob */
+/** @typedef {import("../../src/audio/decode-budget-core.ts").AudioContainerPreflight} AudioContainerPreflight */
 
-function ok(name, condition) {
-  console.log(`  ${condition ? "PASS" : "FAIL"}  ${name}`);
-  if (condition) passed += 1;
-  else failed += 1;
+/**
+ * @param {AudioContainerPreflight | null} preflight
+ * @param {string} label
+ * @returns {AudioContainerPreflight}
+ */
+function requirePreflight(preflight, label) {
+  if (!preflight) {
+    throw new Error(`${label} fixture did not preflight.`);
+  }
+  return preflight;
 }
 
+/**
+ * @param {string} name
+ * @param {unknown} condition
+ * @param {string | null | undefined} [detail]
+ */
+function ok(name, condition, detail = "") {
+  test(name, () => {
+    assert.ok(condition, detail ?? undefined);
+  });
+}
+
+/**
+ * @template T
+ * @param {number} deviceMemory
+ * @param {boolean} coarsePointer
+ * @param {() => T} operation
+ * @returns {T}
+ */
+function withDeviceEnvironment(deviceMemory, coarsePointer, operation) {
+  const navigatorDescriptor = Object.getOwnPropertyDescriptor(globalThis, "navigator");
+  const windowDescriptor = Object.getOwnPropertyDescriptor(globalThis, "window");
+  Object.defineProperty(globalThis, "navigator", {
+    configurable: true,
+    value: { deviceMemory },
+  });
+  Object.defineProperty(globalThis, "window", {
+    configurable: true,
+    value: {
+      matchMedia: () => ({ matches: coarsePointer }),
+    },
+  });
+
+  try {
+    return operation();
+  } finally {
+    if (navigatorDescriptor) {
+      Object.defineProperty(globalThis, "navigator", navigatorDescriptor);
+    } else {
+      Reflect.deleteProperty(globalThis, "navigator");
+    }
+    if (windowDescriptor) {
+      Object.defineProperty(globalThis, "window", windowDescriptor);
+    } else {
+      Reflect.deleteProperty(globalThis, "window");
+    }
+  }
+}
+
+/**
+ * @param {string} name
+ * @param {string} code
+ * @param {() => unknown} operation
+ */
 function throwsCode(name, code, operation) {
   try {
     operation();
@@ -61,100 +143,52 @@ function throwsCode(name, code, operation) {
   }
 }
 
+/**
+ * @param {DataView} view
+ * @param {number} offset
+ * @param {string} value
+ */
 function writeAscii(view, offset, value) {
   for (let index = 0; index < value.length; index += 1) {
     view.setUint8(offset + index, value.charCodeAt(index));
   }
 }
 
-function encodeFlacHeader(sampleRate, channelCount, bitDepth, frameCount) {
-  const buffer = new ArrayBuffer(42);
-  const view = new DataView(buffer);
-  writeAscii(view, 0, "fLaC");
-  view.setUint8(4, 0x80);
-  view.setUint8(7, 34);
-  const byte10 = (sampleRate >> 12) & 0xff;
-  const byte11 = (sampleRate >> 4) & 0xff;
-  const byte12 =
-    ((sampleRate & 0x0f) << 4) |
-    (((channelCount - 1) & 0x07) << 1) |
-    (((bitDepth - 1) >> 4) & 0x01);
-  const byte13 = (((bitDepth - 1) & 0x0f) << 4) | Math.floor(frameCount / 2 ** 32);
-  view.setUint8(18, byte10);
-  view.setUint8(19, byte11);
-  view.setUint8(20, byte12);
-  view.setUint8(21, byte13);
-  view.setUint32(22, frameCount >>> 0, false);
-  return buffer;
-}
+// The drag-and-drop DOM types (FileSystemEntry, FileList, DataTransfer) cannot
+// be constructed under Node and their `filesystem` back-reference is circular,
+// so each factory below builds the members collectDroppedFiles actually reads
+// and states the DOM type it stands in for at one cast.
 
-function encodeWaveHeader(sampleRate, channelCount, frameCount) {
-  const blockAlign = channelCount * 4;
-  const dataBytes = frameCount * blockAlign;
-  const buffer = new ArrayBuffer(44 + dataBytes);
-  const view = new DataView(buffer);
-  writeAscii(view, 0, "RIFF");
-  view.setUint32(4, buffer.byteLength - 8, true);
-  writeAscii(view, 8, "WAVE");
-  writeAscii(view, 12, "fmt ");
-  view.setUint32(16, 16, true);
-  view.setUint16(20, 1, true);
-  view.setUint16(22, channelCount, true);
-  view.setUint32(24, sampleRate, true);
-  view.setUint32(28, sampleRate * blockAlign, true);
-  view.setUint16(32, blockAlign, true);
-  view.setUint16(34, 32, true);
-  writeAscii(view, 36, "data");
-  view.setUint32(40, dataBytes, true);
-  return buffer;
-}
-
-function writeFloat80(view, offset, value) {
-  const exponent = Math.floor(Math.log2(value));
-  const mantissa = value / 2 ** exponent;
-  view.setUint16(offset, 16383 + exponent, false);
-  view.setUint32(offset + 2, Math.floor(mantissa * 2 ** 31), false);
-  view.setUint32(offset + 6, 0, false);
-}
-
-function encodeAiffHeader(sampleRate, channelCount, frameCount) {
-  const dataBytes = frameCount * channelCount * 3;
-  const buffer = new ArrayBuffer(54 + dataBytes);
-  const view = new DataView(buffer);
-  writeAscii(view, 0, "FORM");
-  view.setUint32(4, buffer.byteLength - 8, false);
-  writeAscii(view, 8, "AIFF");
-  writeAscii(view, 12, "COMM");
-  view.setUint32(16, 18, false);
-  view.setUint16(20, channelCount, false);
-  view.setUint32(22, frameCount, false);
-  view.setUint16(26, 24, false);
-  writeFloat80(view, 28, sampleRate);
-  writeAscii(view, 38, "SSND");
-  view.setUint32(42, 8 + dataBytes, false);
-  view.setUint32(46, 0, false);
-  view.setUint32(50, 0, false);
-  return buffer;
-}
-
+/**
+ * @param {string} name
+ * @param {File} file
+ * @returns {FileSystemFileEntry}
+ */
 function fileEntry(name, file) {
-  return {
+  return /** @type {FileSystemFileEntry} */ (/** @type {unknown} */ ({
     isFile: true,
     isDirectory: false,
     name,
     fullPath: `/${name}`,
     filesystem: {},
+    /** @param {(file: File) => void} success */
     file(success) {
       queueMicrotask(() => success(file));
     },
-  };
+  }));
 }
 
+/**
+ * @param {string} name
+ * @param {FileSystemEntry[][]} pages
+ * @param {{ neverSettles?: boolean }} [options]
+ * @returns {{ entry: FileSystemDirectoryEntry, state: { readCalls: number } }}
+ */
 function directoryEntry(name, pages, options = {}) {
   let pageIndex = 0;
   const state = { readCalls: 0 };
   return {
-    entry: {
+    entry: /** @type {FileSystemDirectoryEntry} */ (/** @type {unknown} */ ({
       isFile: false,
       isDirectory: true,
       name,
@@ -162,6 +196,7 @@ function directoryEntry(name, pages, options = {}) {
       filesystem: {},
       createReader() {
         return {
+          /** @param {(entries: FileSystemEntry[]) => void} success */
           readEntries(success) {
             state.readCalls += 1;
             if (options.neverSettles) return;
@@ -171,23 +206,33 @@ function directoryEntry(name, pages, options = {}) {
           },
         };
       },
-    },
+    })),
     state,
   };
 }
 
+/**
+ * @param {File[]} files
+ * @returns {FileList}
+ */
 function mockFileList(files) {
-  return {
+  return /** @type {FileList} */ (/** @type {unknown} */ ({
+    ...files,
     length: files.length,
+    /** @param {number} index */
     item(index) {
       return files[index] ?? null;
     },
-    ...files,
-  };
+  }));
 }
 
+/**
+ * @param {FileSystemEntry} entry
+ * @param {File[]} [flatFiles]
+ * @returns {DataTransfer}
+ */
 function dataTransferForEntry(entry, flatFiles = []) {
-  return {
+  return /** @type {DataTransfer} */ (/** @type {unknown} */ ({
     files: mockFileList(flatFiles),
     items: {
       0: {
@@ -197,8 +242,128 @@ function dataTransferForEntry(entry, flatFiles = []) {
       },
       length: 1,
     },
-  };
+  }));
 }
+
+console.log("\nTSX loader and analyzer helper contracts");
+ok(
+  "the loader imports the preset taxonomy TSX module",
+  formatTargetLufs(-14) === "-14 LUFS",
+  formatTargetLufs(-14),
+);
+
+const oneMiB = 1024 * 1024;
+const constrainedHeavyBytes = withDeviceEnvironment(4, false, resolveHeavyFileBytes);
+const capableHeavyBytes = withDeviceEnvironment(8, false, resolveHeavyFileBytes);
+ok(
+  "constrained devices lower the heavy-file threshold",
+  constrainedHeavyBytes === 96 * oneMiB,
+  `${constrainedHeavyBytes / oneMiB} MiB`,
+);
+ok(
+  "capable devices retain the desktop heavy-file threshold",
+  capableHeavyBytes === 256 * oneMiB,
+  `${capableHeavyBytes / oneMiB} MiB`,
+);
+
+const conservativeRoutePeak = conservativeDecodePeakBytes(DEFAULT_DECODE_BUDGET);
+const constrainedHelperAggregate = withDeviceEnvironment(4, false, () =>
+  resolveAggregatePeakBytes(DEFAULT_DECODE_BUDGET));
+const capableHelperAggregate = withDeviceEnvironment(8, false, () =>
+  resolveAggregatePeakBytes(DEFAULT_DECODE_BUDGET));
+ok(
+  "constrained devices admit one conservative decode route",
+  constrainedHelperAggregate === conservativeRoutePeak,
+  `${constrainedHelperAggregate} bytes`,
+);
+ok(
+  "capable devices admit two conservative decode routes",
+  capableHelperAggregate === conservativeRoutePeak * 2,
+  `${capableHelperAggregate} bytes`,
+);
+
+ok(
+  "decode failures are normalized for the selected route",
+  normalizeDecodeFailure("Decode failed", "compatibility-first").includes(
+    "compatibility decoder",
+  ),
+);
+ok(
+  "analysis-stage corruption gets actionable copy",
+  normalizeDecodeFailure("Non-finite sample at frame 3", "auto").includes(
+    "audio data was empty or corrupt",
+  ),
+);
+ok(
+  "auto keeps compressed browser decoding available when a probe falls back",
+  resolveBrowserFirstRoute("auto", "bounded.mp3", "audio/mpeg", true, false) &&
+    resolveBrowserFirstRoute("auto", "opaque.mp3", "audio/mpeg", false, false),
+);
+ok(
+  "browser-first keeps trusted WAV and AIFF sources on their native route",
+  !resolveBrowserFirstRoute("browser-first", "layout.wav", "audio/wav", true, true) &&
+    !resolveBrowserFirstRoute("browser-first", "layout.aiff", "audio/aiff", true, true),
+);
+ok(
+  "unrelated failures pass through unchanged",
+  normalizeDecodeFailure("synthetic failure", "auto") === "synthetic failure",
+);
+
+ok(
+  "supported audio MIME types are accepted",
+  isSupportedAudioFile(new File([], "untitled.bin", { type: "audio/x-custom" })),
+);
+ok(
+  "known extensions are accepted without a MIME type",
+  isSupportedAudioFile(new File([], "master.FLAC", { type: "" })),
+);
+ok(
+  "unrelated dropped files are rejected",
+  !isSupportedAudioFile(new File([], "notes.txt", { type: "text/plain" })),
+);
+
+const fingerprintJob = makeAnalysisJob({
+  id: "history-1",
+  fileName: "history.wav",
+  status: "complete",
+  result: makeAnalysisResult({
+    analyzedAt: "2026-09-04T00:00:00.000Z",
+    analysisMode: "measure-only",
+    target: null,
+    metrics: makeMetrics({
+      integratedLufs: -14,
+      integratedValid: true,
+      truePeakDbtp: -1.25,
+      loudnessRange: 3.5,
+    }),
+    metadata: makeAudioMetadata({
+      sampleRate: 48_000,
+      channelLayout: makeChannelLayout({ name: "Stereo" }),
+      decoderLabel: "WAV parser",
+    }),
+  }),
+});
+const fingerprintResult = fingerprintJob.result ?? makeAnalysisResult();
+const completedFingerprint = completedHistoryFingerprint([fingerprintJob]);
+ok(
+  "history fingerprints ignore unfinished jobs",
+  completedHistoryFingerprint([
+    fingerprintJob,
+    makeAnalysisJob({ id: "queued", fileName: "queued.wav" }),
+  ]) === completedFingerprint,
+);
+ok(
+  "history fingerprints change with completed result data",
+  completedHistoryFingerprint([
+    {
+      ...fingerprintJob,
+      result: {
+        ...fingerprintResult,
+        metrics: { ...fingerprintResult.metrics, truePeakDbtp: -0.5 },
+      },
+    },
+  ]) !== completedFingerprint,
+);
 
 console.log("\nDecode arithmetic and hard ceilings");
 ok("checked decoded bytes use planar float32 size", checkedDecodedBytes(100, 2) === 800);
@@ -261,8 +426,8 @@ ok(
   decodePeakResidentBytes("browser", 1_000) === 2_000,
 );
 ok(
-  "compatibility peak counts float-WAV output plus planar PCM",
-  decodePeakResidentBytes("compatibility-worker", 1_000, 1_100) === 2_100,
+  "compatibility peak counts source, two float-WAV copies, and planar PCM",
+  decodePeakResidentBytes("compatibility-worker", 1_000, 1_100, 250) === 3_450,
 );
 throwsCode("peak byte addition fails closed on overflow", "decoded-budget-exceeded", () =>
   checkedResourceByteSum([Number.MAX_SAFE_INTEGER, 1]));
@@ -273,7 +438,9 @@ ok(
   conservativePeak ===
     Math.max(
       DEFAULT_DECODE_BUDGET.maxDecodedBytes * 2,
-      DEFAULT_DECODE_BUDGET.maxDecodedBytes + DEFAULT_DECODE_BUDGET.maxOutputBytes,
+      DEFAULT_DECODE_BUDGET.maxSourceBytes +
+        DEFAULT_DECODE_BUDGET.maxDecodedBytes +
+        DEFAULT_DECODE_BUDGET.maxOutputBytes * 2,
     ),
 );
 ok(
@@ -292,7 +459,8 @@ throwsCode(
   () => growDecodePeakReservation(conservativePeak, 0, 1, conservativePeak),
 );
 
-let finishDecode;
+/** @type {(value: unknown) => void} */
+let finishDecode = () => {};
 const unabortableDecode = new Promise((resolve) => {
   finishDecode = resolve;
 });
@@ -324,6 +492,7 @@ ok("drained browser decode then reports cancellation", wrapperSettled && drained
 {
   const neverSettles = new Promise(() => {});
   const zombieSignal = new AbortController();
+  /** @type {unknown} */
   let zombieError = null;
   const zombieWait = waitForBrowserDecodeDrain(
     neverSettles,
@@ -371,11 +540,13 @@ ok("drained browser decode then reports cancellation", wrapperSettled && drained
 // has not aborted keeps waiting past the grace window without a premature drain
 // timeout, then returns its value once it finally settles.
 {
-  let releasePending;
+  /** @type {(value: unknown) => void} */
+  let releasePending = () => {};
   const pending = new Promise((resolve) => {
     releasePending = resolve;
   });
   const patientSignal = new AbortController();
+  /** @type {{ value: { numberOfChannels: number } | null, errored: boolean }} */
   const outcome = { value: null, errored: false };
   const patientWait = waitForBrowserDecodeDrain(
     pending,
@@ -404,6 +575,85 @@ ok("drained browser decode then reports cancellation", wrapperSettled && drained
   );
 }
 
+// Browser decoding must use an offline context at the probed source rate and
+// disclose the decoded PCM rate when the browser still returns another rate.
+{
+  const windowDescriptor = Object.getOwnPropertyDescriptor(globalThis, "window");
+  // Held on an object so the recorded request reads as its declared type after
+  // the decode call below rather than staying narrowed to its initial null.
+  /** @type {{ request: { channelCount: number, length: number, sampleRate: number } | null }} */
+  const offline = { request: null };
+  let realtimeContexts = 0;
+  class FakeOfflineAudioContext {
+    /**
+     * @param {number} channelCount
+     * @param {number} length
+     * @param {number} sampleRate
+     */
+    constructor(channelCount, length, sampleRate) {
+      offline.request = { channelCount, length, sampleRate };
+    }
+
+    async decodeAudioData() {
+      return {
+        numberOfChannels: 1,
+        length: 4,
+        sampleRate: 48_000,
+        duration: 4 / 48_000,
+        getChannelData: () => new Float32Array(4),
+      };
+    }
+  }
+  class FakeRealtimeAudioContext {
+    constructor() {
+      realtimeContexts += 1;
+    }
+  }
+  Object.defineProperty(globalThis, "window", {
+    configurable: true,
+    value: {
+      AudioContext: FakeRealtimeAudioContext,
+      OfflineAudioContext: FakeOfflineAudioContext,
+      setTimeout,
+      clearTimeout,
+    },
+  });
+  try {
+    const browserAsset = await decodeAudioFileInBrowser(
+      new File([new Uint8Array(4)], "rate-check.mp3", { type: "audio/mpeg" }),
+      undefined,
+      new ArrayBuffer(4),
+      {
+        sourceMetadata: {
+          sampleRate: 44_100,
+          channelCount: 1,
+          frameCount: 4,
+          durationSeconds: 4 / 44_100,
+          codecName: "MP3",
+        },
+      },
+    );
+    ok(
+      "browser decode requests an OfflineAudioContext at the probed source rate",
+      offline.request?.sampleRate === 44_100 &&
+        offline.request?.channelCount === 1 &&
+        realtimeContexts === 0,
+    );
+    ok(
+      "browser decode reports a decoded-rate mismatch and analyzes that PCM rate",
+      browserAsset.sampleRate === 48_000 &&
+        browserAsset.warnings.some((warning) =>
+          warning.includes("48,000 Hz") && warning.includes("44,100 Hz")),
+    );
+  } finally {
+    if (windowDescriptor) {
+      Object.defineProperty(globalThis, "window", windowDescriptor);
+    } else {
+      Reflect.deleteProperty(globalThis, "window");
+    }
+  }
+}
+
 console.log("\nContainer preflight");
 const flac = inspectAudioContainer(encodeFlacHeader(48000, 2, 24, 96000));
 ok(
@@ -413,7 +663,9 @@ ok(
     flac.channelCount === 2 &&
     !flac.nativeDecodeSafe,
 );
-const wav = inspectAudioContainer(encodeWaveHeader(44100, 2, 10));
+const wav = inspectAudioContainer(
+  encodeWav({ channels: silentChannels(2, 10), sampleRate: 44100, formatTag: 1 }),
+);
 ok(
   "WAVE fmt/data expose checked footprint metadata",
   wav?.container === "wav" &&
@@ -421,7 +673,9 @@ ok(
     wav.sampleRate === 44100 &&
     wav.nativeDecodeSafe,
 );
-const aiff = inspectAudioContainer(encodeAiffHeader(48000, 6, 24000));
+const aiff = inspectAudioContainer(
+  encodeAiff({ channels: silentChannels(6, 24000), sampleRate: 48000, bitsPerSample: 24 }),
+);
 ok(
   "AIFF COMM exposes checked footprint metadata",
   aiff?.container === "aiff" &&
@@ -436,6 +690,12 @@ ok("truncated known metadata returns no optimistic estimate", inspectAudioContai
 // reads blockAlign, but blockAlign is an untrusted uint16 from `fmt `, so a file
 // declaring an inflated one used to under-report the footprint by that ratio and
 // the parser then committed the real, far larger buffers before validation ran.
+/**
+ * @param {number} payloadBytes
+ * @param {number} blockAlign
+ * @param {number} bitsPerSample
+ * @param {number} channelCount
+ */
 function encodeHostileBlockAlignWave(payloadBytes, blockAlign, bitsPerSample, channelCount) {
   const buffer = new ArrayBuffer(44 + payloadBytes);
   const view = new DataView(buffer);
@@ -495,7 +755,9 @@ function encodeHostileBlockAlignWave(payloadBytes, blockAlign, bitsPerSample, ch
 // A well-formed file must keep the trusted fast path: min(blockAlign, stride)
 // has to be a no-op whenever the two agree.
 {
-  const consistent = inspectAudioContainer(encodeWaveHeader(48000, 2, 1000));
+  const consistent = inspectAudioContainer(
+    encodeWav({ channels: silentChannels(2, 1000), sampleRate: 48000, formatTag: 1 }),
+  );
   ok(
     "a consistent blockAlign leaves the reported frame count unchanged",
     consistent != null && consistent.frameCount === 1000 && consistent.nativeDecodeSafe,
@@ -655,6 +917,12 @@ try {
 // the aggregate reservation cap must be what actually governs concurrency.
 console.log("\n[I] Parallel admission planning");
 
+/**
+ * @param {number} sampleRate
+ * @param {number} channelCount
+ * @param {number} bitDepth
+ * @param {number} frameCount
+ */
 function wavHeaderSlice(sampleRate, channelCount, bitDepth, frameCount) {
   const blockAlign = channelCount * (bitDepth / 8);
   const dataBytes = frameCount * blockAlign;
@@ -691,9 +959,20 @@ ok(
   "the same slice without totalBytes stays unknown (strict whole-buffer rule)",
   inspectAudioContainer(hiResWav.buffer) === null,
 );
+const clampedWavMetadata = inspectAudioContainer(
+  hiResWav.buffer,
+  hiResWav.totalBytes - 1_000,
+);
 ok(
-  "a declared payload larger than the real file is rejected",
-  inspectAudioContainer(hiResWav.buffer, hiResWav.totalBytes - 1_000) === null,
+  "plain RIFF preflight clamps an oversized data length like the native parser",
+  clampedWavMetadata?.container === "wav" &&
+    clampedWavMetadata.frameCount === Math.floor((hiResFrames * 6 - 1_000) / 6),
+);
+const sentinelWavHeader = hiResWav.buffer.slice(0);
+new DataView(sentinelWavHeader).setUint32(40, 0xffffffff, true);
+ok(
+  "plain RIFF preflight accepts the crashed-recorder data-size sentinel",
+  inspectAudioContainer(sentinelWavHeader, hiResWav.totalBytes)?.frameCount === hiResFrames,
 );
 ok(
   "totalBytes smaller than the supplied buffer is rejected as inconsistent",
@@ -750,6 +1029,91 @@ ok(
   mp3Admission.reservationPeakBytes === conservativeDecodePeakBytes(capable) &&
     mp3Admission.exclusive === false,
 );
+
+const stubbedProbeMetadata = {
+  sampleRate: 48_000,
+  channelCount: 2,
+  frameCount: 5 * 60 * 48_000,
+  durationSeconds: 5 * 60,
+  codecName: "MP3",
+};
+const probedPlan = planProbedDecodeFootprint(stubbedProbeMetadata, capable);
+ok(
+  "a bounded compressed probe produces a known decoded footprint",
+  probedPlan.kind === "known" &&
+    probedPlan.decodedBytes === checkedDecodedBytes(5 * 60 * 48_000, 2),
+);
+const probedCompatibilityAdmission = planLaneAdmission({
+  fileSizeBytes: 5 * 1024 * 1024,
+  heavyFileBytes: heavyBytes,
+  browserFirst: false,
+  plan: probedPlan.kind === "known"
+    ? { kind: "known", decodedBytes: probedPlan.decodedBytes, trustedNative: false }
+    : { kind: "unknown" },
+  budget: capable,
+});
+ok(
+  "known compressed compatibility admission uses source plus three decoded copies",
+  probedPlan.kind === "known" &&
+    probedCompatibilityAdmission.route === "compatibility-worker" &&
+    probedCompatibilityAdmission.reservationPeakBytes ===
+      5 * 1024 * 1024 +
+        probedPlan.decodedBytes +
+        (probedPlan.decodedBytes + COMPATIBILITY_WAV_HEADER_ALLOWANCE_BYTES) * 2,
+);
+
+const failedProbePlan = planProbedDecodeFootprint(null, capable);
+ok(
+  "a failed probe falls back to the conservative unknown-footprint plan",
+  failedProbePlan.kind === "unknown" &&
+    planLaneAdmission({
+      fileSizeBytes: 5 * 1024 * 1024,
+      heavyFileBytes: heavyBytes,
+      browserFirst: false,
+      plan: failedProbePlan,
+      budget: capable,
+    }).reservationPeakBytes === conservativeDecodePeakBytes(capable),
+);
+ok(
+  "a probe above the frame tier cannot lower admission below conservative",
+  planProbedDecodeFootprint(
+    {
+      sampleRate: 48_000,
+      channelCount: 1,
+      frameCount: 6_000 * 48_000,
+      durationSeconds: 6_000,
+      codecName: "Opus",
+    },
+    DEFAULT_DECODE_BUDGET,
+  ).kind === "unknown",
+);
+throwsCode("probe field validation rejects non-numeric sample rates", "invalid-metadata", () =>
+  validateDecodeProbeMetadata(
+    { ...stubbedProbeMetadata, sampleRate: "48000" },
+    capable,
+  ));
+throwsCode("probe field validation rejects frame counts below duration", "invalid-metadata", () =>
+  validateDecodeProbeMetadata(
+    { ...stubbedProbeMetadata, frameCount: stubbedProbeMetadata.frameCount - 1 },
+    capable,
+  ));
+
+const heavyDecodedFrames = heavyBytes / Float32Array.BYTES_PER_ELEMENT;
+const heavyProbedCompatibility = planLaneAdmission({
+  fileSizeBytes: 24 * 1024 * 1024,
+  heavyFileBytes: heavyBytes,
+  browserFirst: false,
+  plan: {
+    kind: "known",
+    decodedBytes: checkedDecodedBytes(heavyDecodedFrames, 1),
+    trustedNative: false,
+  },
+  budget: capable,
+});
+ok(
+  "compatibility jobs become exclusive at the decoded-size threshold",
+  heavyProbedCompatibility.exclusive === true,
+);
 ok(
   "large unknown sources remain hard-exclusive",
   planLaneAdmission({
@@ -771,6 +1135,11 @@ ok(
   }).exclusive === false,
 );
 
+/**
+ * @param {number} reservationBytes
+ * @param {number} aggregateLimit
+ * @param {number} attempts
+ */
 function countAdmissions(reservationBytes, aggregateLimit, attempts) {
   let total = 0;
   let admitted = 0;
@@ -786,8 +1155,8 @@ function countAdmissions(reservationBytes, aggregateLimit, attempts) {
 }
 
 ok(
-  "five 4-minute 24-bit 192 kHz FLACs run concurrently on a capable device",
-  countAdmissions(flacAdmission.reservationPeakBytes, aggregateCapable, 6) === 5,
+  "six 4-minute 24-bit 192 kHz FLACs use all capable-device lanes",
+  countAdmissions(flacAdmission.reservationPeakBytes, aggregateCapable, 6) === 6,
 );
 const cdFlacDecoded = checkedDecodedBytes(4 * 60 * 44_100, 2);
 ok(
@@ -799,8 +1168,8 @@ ok(
   ) === 6,
 );
 ok(
-  "five 24-bit 192 kHz PCM WAVs run concurrently on the native route",
-  countAdmissions(nativeAdmission.reservationPeakBytes, aggregateCapable, 6) === 5,
+  "six 24-bit 192 kHz PCM WAVs use all capable-device lanes",
+  countAdmissions(nativeAdmission.reservationPeakBytes, aggregateCapable, 6) === 6,
 );
 ok(
   "six 24-bit 96 kHz PCM WAVs all run concurrently",
@@ -894,7 +1263,7 @@ console.log("\n[K] FLAC footprint corroboration");
 // stays trusted and keeps decoding in parallel with its peers.
 const honestFlac = inspectAudioContainer(encodeFlacHeader(192000, 2, 24, 192000 * 240));
 const honestFlacDecodedBytes = assertDecodedFootprint(
-  honestFlac,
+  requirePreflight(honestFlac, "Honest FLAC"),
   capable,
   "Honest FLAC",
 ).decodedBytes;
@@ -909,7 +1278,7 @@ ok(
 // bytes, so it is not trusted and the hook falls back to the conservative plan.
 const underDeclaredFlac = inspectAudioContainer(encodeFlacHeader(192000, 2, 24, 1024));
 const underDeclaredDecodedBytes = assertDecodedFootprint(
-  underDeclaredFlac,
+  requirePreflight(underDeclaredFlac, "Under-declared FLAC"),
   capable,
   "Under-declared FLAC",
 ).decodedBytes;
@@ -949,6 +1318,7 @@ const flushMicrotasks = () => new Promise((resolve) => setTimeout(resolve, 0));
 // the slot is released and re-released.
 {
   const semaphore = createCountingSemaphore(1);
+  /** @type {string[]} */
   const served = [];
   const releaseHeld = await semaphore.acquire();
   const first = semaphore.acquire().then((release) => {
@@ -990,21 +1360,23 @@ const flushMicrotasks = () => new Promise((resolve) => setTimeout(resolve, 0));
     "a two-slot window hands both slots out immediately",
     semaphore.available === 0 && semaphore.pending === 0,
   );
-  let thirdRan = false;
+  // Tracked on an object so the flag reads as a boolean after the awaits below
+  // rather than staying narrowed to its initial value.
+  const thirdState = { ran: false };
   const third = semaphore.acquire().then((release) => {
-    thirdRan = true;
+    thirdState.ran = true;
     return release;
   });
   await flushMicrotasks();
   ok(
     "a third acquire waits while both slots are held",
-    thirdRan === false && semaphore.pending === 1,
+    thirdState.ran === false && semaphore.pending === 1,
   );
   releaseA();
   const releaseThird = await third;
   ok(
     "releasing a slot admits exactly one waiter, never exceeding capacity",
-    thirdRan === true && semaphore.available === 0 && semaphore.pending === 0,
+    thirdState.ran === true && semaphore.available === 0 && semaphore.pending === 0,
   );
   releaseThird();
   releaseB();
@@ -1078,19 +1450,33 @@ const flushMicrotasks = () => new Promise((resolve) => setTimeout(resolve, 0));
   releaseQueued();
 }
 
-// Capacity formula: the window that bounds concurrent browser decodes resolves
-// to 2 on the capable large tier (whose aggregate holds two conservative
-// routes) and 1 on a constrained single-route device, and never drops below 1.
-ok(
-  "the capable large tier admits two concurrent browser decodes",
-  browserDecodeWindowCapacity(aggregateCapable, capable) === 2,
+// The legacy capacity helper remains internally consistent with the expanded
+// compatibility-route aggregate. The hook now sizes its browser window from
+// the lane limit because browser-bound sources carry checked probe footprints.
+const capableWindowCapacity = Math.max(
+  1,
+  Math.floor(
+    aggregateCapable /
+      decodePeakResidentBytes("browser", capable.maxDecodedBytes),
+  ),
+);
+const constrainedWindowCapacity = Math.max(
+  1,
+  Math.floor(
+    conservativeDecodePeakBytes(constrained) /
+      decodePeakResidentBytes("browser", constrained.maxDecodedBytes),
+  ),
 );
 ok(
-  "a constrained single-route device admits one browser decode at a time",
+  "the browser-window formula follows the capable aggregate model",
+  browserDecodeWindowCapacity(aggregateCapable, capable) === capableWindowCapacity,
+);
+ok(
+  "the browser-window formula follows the constrained aggregate model",
   browserDecodeWindowCapacity(
     conservativeDecodePeakBytes(constrained),
     constrained,
-  ) === 1,
+  ) === constrainedWindowCapacity,
 );
 ok(
   "the window capacity floor is one even when the aggregate is below a browser peak",
@@ -1108,9 +1494,9 @@ ok(
   (() => {
     const semaphore = createCountingSemaphore(1);
     semaphore.setCapacity(browserDecodeWindowCapacity(aggregateCapable, capable));
-    return semaphore.capacity === 2 && semaphore.available === 2;
+    return (
+      semaphore.capacity === capableWindowCapacity &&
+      semaphore.available === capableWindowCapacity
+    );
   })(),
 );
-
-console.log(`\n==== Runtime safety: ${passed} passed, ${failed} failed ====\n`);
-process.exit(failed ? 1 : 0);

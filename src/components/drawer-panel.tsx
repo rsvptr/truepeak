@@ -47,7 +47,7 @@ export function DrawerPanel({
     <div ref={containerRef} className="fixed inset-0 z-50" aria-hidden={false}>
       <div
         aria-hidden="true"
-        className="tp-fade-in absolute inset-0 bg-black/55 backdrop-blur-sm"
+        className="tp-fade-in absolute inset-0 touch-none overscroll-contain bg-black/55 backdrop-blur-sm"
         onClick={onClose}
       />
       <div className="absolute inset-0 flex items-end justify-stretch lg:items-stretch lg:justify-end">

@@ -62,9 +62,11 @@ TruePeak keeps the whole loudness review in one place. Instead of jumping betwee
 - Exports to CSV, JSON, and a Markdown report
 - Session files you can save and reopen later
 
+Loudness range is built only from complete 3 second short-term windows. A file with fewer than two of them reports LRA as invalid rather than as 0: blank in CSV and Markdown, `null` in JSON, and left out of the Compare range axis. A peak at or below -144 dBFS reads as Silence instead of a numeric floor.
+
 ## Supported files and how they are decoded
 
-Input formats: WAV, RF64, AIFF, AIFC, MP3, AAC and M4A, FLAC, OGG, and Opus.
+Input formats: WAV, RF64, AIFF, AIFC, MP3, AAC and M4A, FLAC, OGG, Opus, and .weba. Any file whose browser-reported MIME type starts with `audio/` is also accepted at intake regardless of extension.
 
 There are three decode routes, picked automatically based on the file and what your browser supports:
 
@@ -76,7 +78,7 @@ If a file cannot be read by any route, the file is marked as failed with a plain
 
 ## Modes and workflows
 
-**Targeted** compares the measured loudness against a delivery target. You pick a preset or enter your own loudness target and true peak ceiling. The app shows how far the file sits from the target, the gain move that would get it there, the projected true peak after that move, and a verdict (on target, needs gain, too hot, or ceiling limited). Which true peak the verdict judges depends on what you would do with the file. Inside the loudness tolerance you ship it as measured, so a measured peak over the ceiling reads as ceiling limited rather than on target. Outside the tolerance you would apply the suggested gain first, so the verdict judges the peak that move would leave behind. A quiet file reads ceiling limited whenever its peak is already over, because adding gain only pushes it further past. A too hot file reads too hot when attenuating to target also brings the peak back inside, and ceiling limited when it does not, which happens whenever the peak is further over the ceiling than the loudness is over target. The peak check runs on every gain policy, not only the ones that cap the move, and the tolerance the verdict uses is exactly the one you entered, including values under 0.1 LU.
+**Targeted** compares the measured loudness against a delivery target. You pick a preset or enter your own loudness target and true peak ceiling. The app shows how far the file sits from the target, the gain move that would get it there, the projected true peak after that move, and a verdict (on target, needs gain, too hot, or ceiling limited). Which true peak the verdict judges depends on what you would do with the file. Inside the loudness tolerance you ship it as measured, so a measured peak over the ceiling reads as ceiling limited rather than on target. Outside the tolerance you would apply the suggested gain first, so the verdict judges the peak that move would leave behind. A quiet file reads ceiling limited whenever its peak is already over, because adding gain only pushes it further past. A too hot file reads too hot when attenuating to target also brings the peak back inside, and ceiling limited when it does not, which happens whenever the peak is further over the ceiling than the loudness is over target. The peak check runs on every gain policy, not only the ones that cap the move, and the tolerance the verdict uses is exactly the one you entered, including values under 0.1 LU. Every operand in the verdict is rounded to the same 0.01 precision the display and the reports use, so a verdict cannot disagree with equal-looking numbers on screen. Preset ceilings follow the platform's own published guidance; Spotify Loud, for example, targets -11 LUFS with a -2 dBTP true peak ceiling.
 
 **Measure only** drops the target and just reports loudness, peaks, range, and the timeline. Use it when you want raw readings without any delivery framing.
 
@@ -86,7 +88,7 @@ If a file cannot be read by any route, the file is marked as failed with a plain
 
 ## Theme
 
-Light and dark themes are both supported. The choice is stored in a cookie and read on the server, so the correct theme is in the very first response and there is no flash of the wrong colors on load. The default is dark, and the toggle sits in the header.
+Light and dark themes are both supported. The choice is stored in the `truepeak-theme` cookie and applied on the client by a short script in `app/layout.tsx` that runs before the first paint, so there is no flash of the wrong colors on load and `/` stays a static, cacheable shell. With no cookie set, the script follows the operating system preference and falls back to dark. The toggle sits in the header.
 
 ## History and session files
 
@@ -94,7 +96,7 @@ Three related things, with different jobs.
 
 **Live session restore** is automatic when IndexedDB is available. Completed results are mirrored into this browser as they finish. Saves, retries, deletes, and Clear Session are serialized; the app reports a persistent warning if the browser blocks storage or a transaction cannot be committed. Restored results are view only because the source audio does not survive a reload. The current target, analysis mode, custom target fields, and decoder preference are restored before results are reconciled. If those settings cannot be committed to localStorage, the app keeps a persistent warning and stops adding new results to recovery so a reload cannot silently combine them with stale settings. Removing a file still updates its existing recovery copy, and Clear Session reports success only after deletion commits; it also empties this tab's quarantined records, which are the recovery rows that failed validation during a restore. With several tabs open at once, each tab owns its recovery copies: restore surfaces everything it can read, but one tab clearing its session leaves the other tabs' copies alone.
 
-**Local history** is off by default. Turn it on and finished readings are saved as small summary cards in this browser only. It keeps the most recent 20. Turning history off stops new summaries but does not delete existing ones; the count and clear control remain available. Migrated legacy summaries are marked when their original validity/provenance contract is unknown. It is a quick recall list, not a full session restore, and it never leaves your machine.
+**Local history** is off by default. Turn it on and finished readings are saved as small summary cards in this browser only. It keeps the newest 20 valid entries, and a stored envelope with one bad row keeps its remaining valid rows instead of being discarded. Turning history off stops new summaries but does not delete existing ones; the count and clear control remain available. Migrated legacy summaries are marked when their original validity/provenance contract is unknown. It is a quick recall list, not a full session restore, and it never leaves your machine.
 
 **Session files** let you save the current results to a versioned `.truepeak.json` file and reopen them later, on this machine or another one. The original audio is not stored, so imported entries are view only and are always labelled as unverified imports; trusted/compliance use requires re-analysis from source audio. The importer hashes the source session, assigns fresh local IDs, retains bounded lineage, validates the entire file in a worker, and rejects a malformed or inconsistent file atomically rather than loading a partial review. Oversized exports fail explicitly, and long timelines are downsampled without changing headline measurements so exported files remain portable.
 
@@ -108,9 +110,11 @@ Completed results export to three formats, each stamped with the export time so 
 
 Session saves and timeline CSVs follow the same pattern, each with its own counter (`truepeak-session-YYYYMMDD-HHMMSS.truepeak.json`, `truepeak-timeline-YYYYMMDD-HHMMSS.csv`). The CSV escapes quotes, commas, and line breaks correctly, neutralizes values that a spreadsheet might otherwise treat as a formula, and starts with a UTF-8 byte-order mark so Excel reads accented filenames correctly. The Markdown file reads like a short technical handoff rather than a raw dump.
 
+The JSON report shares the portable session format's aggregate budget of 500,000 timeline points across the whole export. A session over that budget has its timelines downsampled to fit, and each entry records `timelineDownsampled` and `timelineSourcePoints` so a reader can tell. Headline measurements are unchanged either way. Above 8 MiB the file is written compact rather than indented, which keeps a large batch from doubling in size and serialization cost.
+
 ## Privacy
 
-Audio bytes, decoded PCM, measurements, session recovery data, and optional history remain in your browser; TruePeak has no audio-upload API, account system, or server-side application database. This app does not send usage analytics unless the deployment operator has explicitly enabled them; audio and results are never included, even then. Telemetry is off by default everywhere. Vercel Analytics and Speed Insights mount only when the build runs on Vercel (`VERCEL=1`) and the operator also sets `NEXT_PUBLIC_ENABLE_TELEMETRY=1`; a default Vercel deployment with that flag unset sends nothing. The server reads the theme cookie, which also makes the public route dynamically rendered.
+Audio bytes, decoded PCM, measurements, session recovery data, and optional history remain in your browser; TruePeak has no audio-upload API, account system, or server-side application database. This app does not send usage analytics unless the deployment operator has explicitly enabled them; audio and results are never included, even then. Telemetry is off by default everywhere. Vercel Analytics and Speed Insights mount only when the build runs on Vercel (`VERCEL=1`) and the operator also sets `NEXT_PUBLIC_ENABLE_TELEMETRY=1`; a default Vercel deployment with that flag unset sends nothing. The server reads no cookie or header from you: `/` is prerendered at build time and served as the same static shell to everyone.
 
 ## Security
 
@@ -136,7 +140,7 @@ flowchart LR
     G --> K["Optional local history"]
 ```
 
-Direct container decoding, compatibility decoding, and analysis run in Web Workers. The browser-codec route necessarily uses Web Audio on the page's main realm; cancellation becomes visible immediately, but the scheduler retains that file's lane until the browser's uninterruptible `decodeAudioData()` work has actually drained. Every route receives the same source, channel, frame, duration, decoded-byte, output-byte, and execution-time budget. Before admitting work, the queue reserves aggregate modeled route residency: browser decoding counts both the `AudioBuffer` and its planar copy, while compatibility decoding counts both float-WAV output and parsed planar PCM. Known-footprint files reserve twice their decoded bytes and share the aggregate; unknown-footprint media holds a full conservative reservation (large opaque files run alone), capped/truncated decoder output is rejected, and messages from stale worker generations are ignored. Two further safeguards sit under that model. Browser decodes pass through a small fixed window (two at a time on capable devices, one elsewhere), because `decodeAudioData()` allocates its output before the result can be checked and a batch of misdeclared files must not multiply that allocation across every lane. And when a decoder fallback needs a larger reservation than the aggregate can grant at that moment, the job returns to the queue and retries once capacity frees, instead of failing. Idle workers are shut down after the queue goes quiet.
+Direct container decoding, compatibility decoding, and analysis run in Web Workers. The browser-codec route necessarily uses Web Audio on the page's main realm; cancellation becomes visible immediately, but the scheduler retains that file's lane until the browser's uninterruptible `decodeAudioData()` work has actually drained. Every route receives the same source, channel, frame, duration, decoded-byte, output-byte, and execution-time budget. Before admitting work, the queue reserves aggregate modeled route residency: browser decoding counts both the `AudioBuffer` and its planar copy, while compatibility decoding counts the source bytes plus three decoded-size PCM representations (the float-WAV output in the ffmpeg filesystem, the copy read back out of it, and the parsed planar PCM). A known-footprint file reserves the peak of the route it will take and shares the aggregate; unknown-footprint media holds a full conservative reservation (large opaque files run alone), capped/truncated decoder output is rejected, and messages from stale worker generations are ignored. Two further safeguards sit under that model. Browser decodes pass through a small fixed window (two at a time on capable devices, one elsewhere), because `decodeAudioData()` allocates its output before the result can be checked and a batch of misdeclared files must not multiply that allocation across every lane. And when a decoder fallback needs a larger reservation than the aggregate can grant at that moment, the job returns to the queue and retries once capacity frees, instead of failing. Idle workers are shut down after the queue goes quiet.
 
 ## Tech stack
 
@@ -163,7 +167,7 @@ Install dependencies:
 npm install
 ```
 
-This also copies the ffmpeg assets into `public/vendor/ffmpeg` through a postinstall step.
+A postinstall step checks the SHA-256 hash of every ffmpeg asset against the values pinned in `scripts/prepare-ffmpeg-assets.mjs` and then copies them into versioned paths under `public/vendor/ffmpeg`: `core/0.12.9/` for `@ffmpeg/core` and `ffmpeg/0.12.15/` for the `@ffmpeg/ffmpeg` class worker. A hash that does not match stops the install.
 
 Start the dev server:
 
@@ -175,6 +179,8 @@ Open http://localhost:3000.
 
 A good first run: leave it in Simple mode, add a few WAV or AIFF files (drop them anywhere, folders included), pick Targeted if you want delivery guidance or Measure only if you just want readings, scan the table, then open a file in the inspector. Switch to Advanced if you want compare and insights. Two keyboard shortcuts: `/` focuses the queue search and `Ctrl/Cmd+O` opens the file picker.
 
+On a small screen the toolbar collapses into a More sheet, and that sheet and the confirmation dialogs each take one browser history entry, so hardware Back dismisses them instead of leaving the session. Under each timeline chart is a readout row that follows the cursor and also responds to a touch drag. If the browser reports Data Saver or a 2G connection, TruePeak shows the notice once and leaves the roughly 31 MB compatibility decoder off until you allow the download under Advanced options.
+
 ## Scripts
 
 | Script | What it does |
@@ -183,8 +189,9 @@ A good first run: leave it in Simple mode, add a few WAV or AIFF files (drop the
 | `npm run build` | Production build |
 | `npm run start` | Run the production build locally |
 | `npm run lint` | Run ESLint |
-| `npm run prepare:ffmpeg` | Copy the ffmpeg assets into `public/vendor/ffmpeg` |
-| `npm test` | Run the full validation suite (see below) |
+| `npm run typecheck:scripts` | Type check the validation scripts through `tsconfig.scripts.json` |
+| `npm run prepare:ffmpeg` | Verify the pinned ffmpeg hashes and copy the assets into `public/vendor/ffmpeg` |
+| `npm test` | Run all thirteen validation suites (see below) |
 | `npm run test:dsp` | Reference signal checks for the DSP engine |
 | `npm run test:ebu` | EBU Tech 3341/3342 reference-subset checks |
 | `npm run test:session` | Session file round trip and rejection checks |
@@ -193,25 +200,35 @@ A good first run: leave it in Simple mode, add a few WAV or AIFF files (drop the
 | `npm run test:presets` | Delivery preset and custom-target validation checks |
 | `npm run test:live-session` | Cross-tab persistence, clear/save ordering, and provenance recovery checks |
 | `npm run test:runtime` | Decoded-resource budget, cancellation draining, and bounded folder traversal checks |
+| `npm run test:scheduler` | Lane admission, cancellation, and transport-fault checks for the analysis scheduler |
+| `npm run test:route` | Workspace URL normalization checks |
+| `npm run test:job-ui` | Badge, filter, sort, and session-statistics checks for the queue |
+| `npm run test:render` | React server-render smoke over the result components |
 | `npm run test:fuzz` | Seeded fuzz cases over every untrusted-input parser |
 
 ## Testing
 
-`npm test` runs 629 fixed assertions plus 1,362 deterministic fuzz cases across nine harnesses in `scripts/dsp/`:
+`npm test` runs thirteen suites in `scripts/dsp/` through `node --test`, each in its own process, for 2,583 assertions in total:
 
-- **DSP:** measures known reference signals, validity boundaries, channel weighting (including the maskless fallbacks agreeing with the speaker-mask path), peak/timeline invariants, repeatability, and targeting/compliance behavior.
-- **EBU reference subset:** reproduces the published EBU Tech 3341 and 3342 cases that can be synthesized from their documented parameters, and asserts the standards' own expected readings. It runs 17 of the 23 Tech 3341 cases and 4 of the 6 Tech 3342 cases. The rest (Tech 3341 cases 7, 8, and 20 to 23, and Tech 3342 cases 5 and 6) need the EBU reference-audio downloads or 4x-fs synthesis and are not reproduced. Passing this subset is not EBU certification.
-- **Session files:** exercises v2 round trips, v1 compatibility, provenance, full-file atomic rejection, cross-field invariants, aggregate timeline limits, UTF-8 size limits, and portable downsampling.
-- **Robustness:** feeds malformed parser/analyzer inputs, unsupported rates, RF64/AIFC edge cases, duplicate-chunk containers that would otherwise decode geometry the preflight never saw, and hostile resource declarations through fail-closed paths.
-- **Export:** checks measurement-validity wording, provenance, CSV formula neutralization, Markdown/HTML structure escaping, selectors, and the timestamped filename contract including same-second collisions.
-- **Presets:** checks the delivery presets and the custom-target flow, covering field validation, range boundaries, modified/reset state, and round trips.
-- **Live session:** exercises persistence races, clear/save ordering, cross-tab ownership and heartbeat refresh, quarantine cleanup, and provenance recovery for the IndexedDB-backed live session store.
-- **Runtime:** exercises decoded-resource budgets, container preflight against inconsistent header geometry, reservation contention handling, the browser-decode window, FLAC footprint corroboration, cancellation draining, and bounded folder traversal.
-- **Fuzz (1,362 cases):** a seeded, reproducible fuzzer mutates valid WAV, AIFF, FLAC, and session files, feeds in raw noise as well, and runs all of it through every parser that touches untrusted bytes. Each case has to fail cleanly or produce sane output inside a time budget. The seed is fixed, so any failure reproduces exactly.
+- **DSP (141):** measures known reference signals, validity boundaries, per-rate accuracy at 44.1, 88.2, 96, and 192 kHz, channel weighting (including the maskless fallbacks agreeing with the speaker-mask path), peak/timeline invariants, repeatability, and targeting/compliance behavior. It also runs the gated true-peak stage against an ungated reference loop over 3,008 seeded noise, music-like, silent, DC, square-wave, late-peak, and late-spike signals, and requires every headline and timeline true-peak value to match exactly.
+- **EBU reference subset (25):** reproduces the published EBU Tech 3341 and 3342 cases that can be synthesized from their documented parameters, and asserts the standards' own expected readings. It runs 17 of the 23 Tech 3341 cases and 4 of the 6 Tech 3342 cases. The rest (Tech 3341 cases 7, 8, and 20 to 23, and Tech 3342 cases 5 and 6) need the EBU reference-audio downloads or 4x-fs synthesis and are not reproduced. Passing this subset is not EBU certification.
+- **Session files (90):** exercises v2 round trips, v1 compatibility, provenance, full-file atomic rejection, cross-field invariants, aggregate timeline limits, UTF-8 size limits, and portable downsampling.
+- **Robustness (108):** feeds malformed parser/analyzer inputs, unsupported rates, RF64/AIFC edge cases, duplicate-chunk containers that would otherwise decode geometry the preflight never saw, and hostile resource declarations through fail-closed paths.
+- **Export (109):** checks measurement-validity wording, provenance, CSV formula neutralization, Markdown/HTML structure escaping, selectors, the JSON timeline cap, and the timestamped filename contract including same-second collisions.
+- **Presets (110):** checks the delivery presets and the custom-target flow, covering field validation, range boundaries, modified/reset state, and round trips.
+- **Live session (26):** exercises persistence races, clear/save ordering, cross-tab ownership and heartbeat refresh, quarantine cleanup, and provenance recovery for the IndexedDB-backed live session store.
+- **Runtime (125):** exercises decoded-resource budgets, container preflight against inconsistent header geometry, reservation contention handling, the browser-decode window, FLAC footprint corroboration, cancellation draining, and bounded folder traversal.
+- **Scheduler (15):** drives the real `AnalysisScheduler` over a fake lane transport: lane-limit admission, cancel while queued and while decoding, escalation to an exclusive rerun, transport faults retiring a lane, and the progress checkpoints a worker-route job passes through. It also drives the real admission subscriber, checking that progress commits never trigger a queue scan and that a released lease, a retired lane, a raised lane limit, a resumed circuit, unblocked analysis, and a retried row each admit the next job without one.
+- **Fuzz (1,813):** a seeded, reproducible fuzzer mutates valid WAV, AIFF, FLAC, and session files, feeds in raw noise as well, and runs all of it through every parser that touches untrusted bytes. Each case has to fail cleanly or produce sane output inside a time budget. A differential stage takes 11 WAV and AIFF corpora, mutated and unmutated, and asserts that the pre-flight inspector and the native parser agree on channel count, bit depth, and frame count, with an allocation guard that fails the case if the parser allocates before the geometry is checked. The seed is fixed, so any failure reproduces exactly.
+- **Route (8):** checks that a workspace URL normalizes to one canonical form, so session-only and mode-only params are dropped when they no longer apply.
+- **Job UI (11):** checks queue badges, search haystacks, natural filename sorting, batch progress, and the session statistics that skip invalid readings.
+- **Render smoke (2):** server-renders the real result components and asserts the actionable error copy, view-only hints, paused rows, circuit retry, the single batch-idle summary, and the null-gapped loudness series the chart receives.
 
-The live session and runtime harnesses (`validate-live-session.mjs` and `validate-runtime.mjs`) are included in `npm test` like the rest, but can also be run directly with Node when you only want that one suite.
+Each suite is also a script of its own (`npm run test:dsp` and so on), or you can run one file directly with `node --test scripts/dsp/validate-runtime.mjs`. To run a single case, put `--test-name-pattern` before the file path: `node --test --test-name-pattern="FLAC" scripts/dsp/validate-runtime.mjs`.
 
-The scripts run the real TypeScript source directly through Node, with a small loader that maps the `@/` path alias. That is why they need Node 24.
+The suites run the real TypeScript source directly through Node, with a small loader that maps the `@/` path alias and transpiles `.tsx`. The loader is registered inside each file rather than through `--import`, because Node's module-hook thread snapshots the environment before a file can set the variables the render smoke depends on. That direct-source approach is why the suites need Node 24. `npm run typecheck:scripts` type checks the scripts through `tsconfig.scripts.json`, which runs the repository's strict settings with `checkJs` on over every `scripts/dsp/**/*.mjs` file, so the suites are checked against the app's own types.
+
+`tests/compatibility.spec.mjs` is a separate Playwright suite of seven Chromium cases that runs against the production build (`npm run build`, then `node scripts/dsp/make-alaw-test-audio.mjs` to generate the two WAV fixtures it loads into `public/test-audio/`, then `npx playwright test --project=chromium`), locally and in CI. It covers the cacheable static shell and the theme-color meta tags, an a-law file completing through the compatibility decoder, the plain error shown when the local ffmpeg core cannot load, hardware Back dismissing the mobile More sheet and confirmation dialog, Data Saver keeping the compatibility download opt-in, the loudness chart drawing its LUFS axis, and a touch drag moving the timeline readout.
 
 ## Deploying to Vercel
 
@@ -225,9 +242,9 @@ Notes:
 
 - It is a normal Next.js app and needs no special configuration.
 - Social preview and canonical URLs (`metadataBase`, Open Graph, Twitter card) resolve from `NEXT_PUBLIC_SITE_URL` if set, otherwise from Vercel's auto-injected `VERCEL_URL`, otherwise from the canonical deployment above. Set `NEXT_PUBLIC_SITE_URL` on your own fork if you want shared links to point at your custom domain instead of the deployment URL.
-- The server reads the theme cookie, so `/` is dynamically rendered; all audio decoding and analysis still runs in the browser.
+- `/` is prerendered at build time and served as a static, cacheable shell; the theme is resolved on the client before the first paint. All audio decoding and analysis runs in the browser.
 - Analytics and Speed Insights are off by default. They mount only when the build runs on Vercel (`VERCEL=1`) and you also set `NEXT_PUBLIC_ENABLE_TELEMETRY=1`. A default Vercel deployment without that flag sends no telemetry.
-- `public/vendor/ffmpeg` is generated by `npm run prepare:ffmpeg`, which runs automatically on install, dev, and build, so it is not committed.
+- `public/vendor/ffmpeg` is generated by `npm run prepare:ffmpeg`, which runs automatically on install, dev, and build, so it is not committed. The assets sit under version-stamped paths (`core/0.12.9/`, `ffmpeg/0.12.15/`) and `next.config.ts` serves that directory with `Cache-Control: public, max-age=31536000, immutable`.
 - No server-side database, auth, environment variables, or custom API are required; browser recovery uses IndexedDB.
 
 ## Project structure
@@ -236,36 +253,47 @@ Notes:
 truepeak/
 ├── app/
 │   ├── error.tsx             (styled recovery screen for crashes)
+│   ├── global-error.tsx      (fallback when the root layout itself fails)
 │   ├── globals.css
-│   ├── layout.tsx
+│   ├── layout.tsx            (static shell and the pre-paint theme script)
 │   ├── manifest.ts
 │   ├── not-found.tsx
 │   ├── opengraph-image.png   (social preview card)
 │   └── page.tsx
 ├── public/
 │   ├── favicon.png
+│   ├── icon-maskable.png
 │   ├── logo.png
-│   └── vendor/ffmpeg/        (generated, not committed)
+│   └── vendor/ffmpeg/        (generated, not committed: core/0.12.9, ffmpeg/0.12.15)
 ├── scripts/
 │   ├── prepare-ffmpeg-assets.mjs
-│   └── dsp/                  (validation suites + helpers)
+│   ├── prune-worker-sources.mjs
+│   └── dsp/                  (validation suites, alias loader, lib/ container and object fixtures)
 ├── src/
-│   ├── audio/                (parsers, DSP, targeting, export, persistence)
-│   ├── components/           (workspace UI)
-│   ├── hooks/                (session + worker orchestration)
-│   ├── lib/                  (formatting, selectors, preferences)
+│   ├── analysis/             (scheduler, job store, run-analysis-job, lane reservations)
+│   ├── audio/                (parsers, DSP, targeting, export, decode budgets)
+│   ├── components/           (workspace UI, workspace-contexts.tsx)
+│   ├── hooks/                (route, intake, settings, queue view, overlay history, worker orchestration)
+│   ├── lib/                  (workspace-route, session-selectors, job-ui, formatting, preferences)
+│   ├── session/              (live session store, controller, local persistence)
 │   ├── types/
-│   └── workers/              (decoder + analyzer workers)
+│   └── workers/              (decoder, analyzer, session-import workers)
+├── tests/
+│   └── compatibility.spec.mjs  (Playwright Chromium suite)
 ├── eslint.config.mjs
 ├── next.config.ts
 ├── package.json
+├── playwright.config.mjs
 ├── postcss.config.mjs
-└── tsconfig.json
+├── tsconfig.json
+└── tsconfig.scripts.json
 ```
 
 ## Working with large libraries
 
-The scheduler uses decoded footprint rather than compressed file size. Container metadata is preflighted from a bounded header slice where it is trustworthy (PCM WAV/AIFF and FLAC, including large masters), so several known-footprint files analyze in parallel when their combined reservations fit the device's aggregate budget. A FLAC header whose declared footprint cannot account for the file's own size is not trusted; the file falls back to the conservative reservation instead. Files without a defensible pre-decode footprint hold a conservative reservation instead, which allows two at once on capable devices and one elsewhere. Each decode is bounded by source bytes, decoded bytes, output bytes, channels, frames, duration, and elapsed time, and the compatibility path rejects any capped or inconsistent output instead of analyzing a truncation. The aggregate reservation is reduced on memory-constrained devices.
+The scheduler uses decoded footprint rather than compressed file size. Container metadata is preflighted from a bounded header slice where it is trustworthy (PCM WAV/AIFF and FLAC, including large masters), so several known-footprint files analyze in parallel when their combined reservations fit the device's aggregate budget. A compressed source that no header sniff covers goes through a bounded ffprobe pass in the decoder worker before anything is allocated, and the reservation is sized from what that probe reports. A FLAC header whose declared footprint cannot account for the file's own size is not trusted; the file falls back to the conservative reservation instead. Files without a defensible pre-decode footprint hold a conservative reservation instead, which allows two at once on capable devices and one elsewhere. Each decode is bounded by source bytes, decoded bytes, output bytes, channels, frames, duration, and elapsed time, and the compatibility path rejects any capped or inconsistent output instead of analyzing a truncation. The aggregate reservation is reduced on memory-constrained devices.
+
+Refusals name the device's own limit rather than an abstract one. The constrained tier carries 256 MiB of decoded working memory, which the message reports as room for about 12 minutes of stereo 48 kHz audio; devices reporting 8 GB or more get 1 GiB instead.
 
 One session holds at most 1,000 jobs, and the same limit applies everywhere: intake, recovery restore, portable export, and portable import. Intake counts every job already in the session, so a run of adds can never push the total past 1,000; files beyond the remaining room are turned away and reported rather than dropped silently. An over-limit session export fails explicitly, an over-limit import is rejected rather than truncated, and recovery restores the newest 1,000 records while leaving any extra stored records in place. Recovery reads IndexedDB schema v2: the restore walks a newest-first index, and a record that fails validation is moved to a quarantine store rather than deleted. Folder drops stop during enumeration at file, entry, depth, page, and time budgets (2,000 files, 8,000 entries, depth 12, 256 pages, 5 seconds); those are a traversal safeguard, separate from the 1,000-job session limit.
 
@@ -279,7 +307,7 @@ Parallel lanes still improve normal desktop batches, but browser codec support a
 - Automatic recovery depends on browser IndexedDB. Storage failures are reported, but a downloaded session file is the portable backup.
 - Compressed format behavior can vary slightly by browser and codec support.
 - Telemetry is off by default. Analytics and Speed Insights send visit and performance data only when the build runs on Vercel with `NEXT_PUBLIC_ENABLE_TELEMETRY=1`; audio and measurement content are never sent through those integrations.
-- The EBU harness is a reference subset, not certification. The earlier DSP and parser gaps are now handled (WAVE quad-mask weighting, 400 ms validity at odd rates such as 11,025 Hz, trailing-silence LRA, RF64 declared-size handling, and mandatory AIFC conformance). The suite stays a subset because Tech 3341 cases 7, 8, and 20 to 23, and Tech 3342 cases 5 and 6, need EBU reference-audio downloads or 4x-fs synthesis, so passing it is not a standards conformance guarantee.
-- **Measurement limitations:** the K-weighting filter is re-derived per sample rate with a pre-warped bilinear transform, which matches the 48 kHz reference response almost exactly at normal delivery rates but steepens near Nyquist at low sample rates. For programme sampled below roughly 24 kHz with substantial energy in its top octave, integrated/momentary/short-term loudness can read up to about 0.4 LU higher than the same audio would measure at 48 kHz (for example, roughly +0.42 LU at 8 kHz and +0.15 LU at 16 kHz for a top-octave-heavy signal). 44.1 kHz and 48 kHz and above are effectively unaffected (well under 0.01 LU). True peak measurement is not affected.
+- The EBU harness is a reference subset, not certification. The earlier DSP and parser gaps are now handled (WAVE quad-mask weighting, 400 ms validity at odd rates such as 11,025 Hz, complete-window LRA, RF64 declared-size handling, and mandatory AIFC conformance). The suite stays a subset because Tech 3341 cases 7, 8, and 20 to 23, and Tech 3342 cases 5 and 6, need EBU reference-audio downloads or 4x-fs synthesis, so passing it is not a standards conformance guarantee.
+- **Measurement limitations:** the K-weighting filter is re-derived per sample rate with a pre-warped bilinear transform, which matches the 48 kHz reference response almost exactly at normal delivery rates but steepens near Nyquist at low sample rates. For programme sampled below roughly 24 kHz with substantial energy in its top octave, integrated/momentary/short-term loudness can read up to about 0.4 LU higher than the same audio would measure at 48 kHz (for example, roughly +0.43 LU at 8 kHz, +0.10 LU at 16 kHz and +0.06 LU at 22.05 kHz for a top-octave-heavy signal). 44.1 kHz and 48 kHz and above are effectively unaffected (well under 0.01 LU). True peak measurement is not affected.
 - Shipping ffmpeg.wasm locally adds some weight, in exchange for not depending on a third party runtime fetch.
 - This is a review aid. It has been validated against reference signals and a documented subset of EBU cases, but it is not a certified compliance meter.
