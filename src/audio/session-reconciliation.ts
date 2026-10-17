@@ -34,28 +34,29 @@ export function reconcileSessionJobs(
 }
 
 /**
- * Stable identity for an imported result, used to keep repeated imports of the
- * same measured row idempotent. Lineage alone is not an audio identity: a
- * malformed or hand-edited portable file can repeat a sourceJobId for different
- * rows, so the key folds in the measured fingerprint too and never collapses
- * distinct results that merely share lineage. Returns null for jobs that are
- * not unverified imports (local and restored jobs are never deduplicated here).
+ * Stable identity for a completed result, used to keep imports idempotent
+ * against everything already in the session. The lineage id is the job id the
+ * analysis was first given: a local or restored row's own id, or the
+ * sourceJobId an import carries forward (parseSessionFile sets it from the
+ * exported id and keeps it across re-exports). So importing a session into a
+ * workspace that holds the same rows, live, restored, or imported from any
+ * earlier copy of the file, matches them. Lineage alone is not an audio
+ * identity: a malformed or hand-edited portable file can repeat a sourceJobId
+ * for different rows, so the key folds in the measured fingerprint too and
+ * never collapses distinct results that merely share lineage or a file name.
+ * Returns null when a job has no result or no lineage.
  */
-export function importedProvenanceKey(job: AnalysisJob): string | null {
+export function sessionResultKey(job: AnalysisJob): string | null {
   const provenance = job.provenance;
   const result = job.result;
-  if (
-    provenance?.kind !== "unverified-import" ||
-    !provenance.sourceSessionDigest ||
-    !provenance.sourceJobId ||
-    !result
-  ) {
+  const lineageId =
+    provenance?.kind === "unverified-import" ? provenance.sourceJobId : job.id;
+  if (!lineageId || !result) {
     return null;
   }
 
   return JSON.stringify([
-    provenance.sourceSessionDigest,
-    provenance.sourceJobId,
+    lineageId,
     job.fileName,
     result.analyzedAt,
     result.metadata.frameCount,
@@ -65,6 +66,35 @@ export function importedProvenanceKey(job: AnalysisJob): string | null {
     result.metrics.truePeakDbtp,
     result.metrics.loudnessRange,
   ]);
+}
+
+/**
+ * Recovery rows that are not already in the workspace. A row is already there
+ * when its id is (a remount), or when its result matches by sessionResultKey:
+ * a session opened before the restore landed already holds imported copies of
+ * the same analyses under fresh ids. Matching rows within the batch collapse
+ * too, so a store that holds both an original and its imported copy restores
+ * one row.
+ */
+export function freshRestoredJobs(existing: AnalysisJob[], restored: AnalysisJob[]) {
+  const ids = new Set(existing.map((job) => job.id));
+  const seen = new Set(
+    existing.map(sessionResultKey).filter((key): key is string => key != null),
+  );
+  return restored.filter((job) => {
+    if (ids.has(job.id)) {
+      return false;
+    }
+    const key = sessionResultKey(job);
+    if (key == null) {
+      return true;
+    }
+    if (seen.has(key)) {
+      return false;
+    }
+    seen.add(key);
+    return true;
+  });
 }
 
 export interface ImportMergePlan {
@@ -92,11 +122,11 @@ export function mergeImportedJobs(
 ): ImportMergePlan {
   const seen = new Set(
     current
-      .map(importedProvenanceKey)
+      .map(sessionResultKey)
       .filter((key): key is string => key != null),
   );
   const fresh = incoming.filter((job) => {
-    const key = importedProvenanceKey(job);
+    const key = sessionResultKey(job);
     if (key == null || !seen.has(key)) {
       if (key != null) {
         seen.add(key);

@@ -12,6 +12,7 @@ import type { AnalysisJob, AnalysisMode } from "@/types/audio";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Progress } from "@/components/ui/progress";
+import { keepRowActionFocus } from "@/components/advanced-queue-row";
 
 interface SimpleRowProps {
   job: AnalysisJob;
@@ -34,6 +35,12 @@ interface SimpleResultsTableProps {
 }
 
 const QUEUE_WINDOW_SIZE = 60;
+const numberFormatter = new Intl.NumberFormat("en-GB");
+
+function pageOfJob(jobs: AnalysisJob[], jobId: string | null) {
+  const index = jobId ? jobs.findIndex((job) => job.id === jobId) : -1;
+  return index === -1 ? null : Math.floor(index / QUEUE_WINDOW_SIZE);
+}
 
 interface JobRowModel {
   compliance: ComplianceSummary | null;
@@ -106,9 +113,9 @@ const SimpleQueueCard = memo(function SimpleQueueCard({
   return (
     <article
       className={cn(
-        "tp-selected-row rounded-[22px] border p-4 [content-visibility:auto] [contain-intrinsic-size:260px]",
+        "tp-selected-row rounded-[22px] border p-4 [content-visibility:auto] [contain-intrinsic-size:auto_none_auto_260px]",
         selected
-          ? "border-[color:var(--accent)]/35 bg-[color:var(--accent-soft)]"
+          ? "border-[color:var(--accent)]/35 bg-[color:var(--accent-soft)] forced-colors:border-[Highlight] forced-colors:outline-2 forced-colors:outline-[Highlight]"
           : "border-[var(--line)]/80 bg-[var(--surface-0)]/46",
       )}
       data-selected={selected}
@@ -126,10 +133,10 @@ const SimpleQueueCard = memo(function SimpleQueueCard({
         data-queue-nav="true"
         data-job-id={job.id}
         onClick={() => onOpenJob(job.id)}
-        className="w-full rounded-[18px] text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)]"
+        className="w-full rounded-[18px] text-left focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-[var(--accent)]"
         aria-label={`Inspect ${job.fileName}`}
       >
-        <div className="break-words text-base font-semibold leading-7 text-[var(--ink)]">
+        <div dir="auto" className="break-words text-base font-semibold leading-7 text-[var(--ink)]">
           {job.fileName}
         </div>
       </button>
@@ -145,21 +152,21 @@ const SimpleQueueCard = memo(function SimpleQueueCard({
       ) : null}
       <div className="mt-4 grid grid-cols-2 gap-3">
         <div>
-          <div className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">Integrated</div>
+          <div className="text-[0.6875rem] uppercase tracking-[0.18em] text-[var(--muted)]">Integrated</div>
           <div className="mt-1 font-semibold tabular-nums text-[var(--ink)]">{model.integratedDisplay}</div>
         </div>
         <div>
-          <div className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">True peak</div>
+          <div className="text-[0.6875rem] uppercase tracking-[0.18em] text-[var(--muted)]">True peak</div>
           <div className="mt-1 font-semibold tabular-nums text-[var(--ink)]">{model.truePeakDisplay}</div>
         </div>
         {analysisMode === "targeted" ? (
           <div>
-            <div className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">Gain</div>
+            <div className="text-[0.6875rem] uppercase tracking-[0.18em] text-[var(--muted)]">Gain</div>
             <div className="mt-1 font-semibold tabular-nums text-[var(--ink)]">{model.gainDisplay}</div>
           </div>
         ) : null}
         <div>
-          <div className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">Duration</div>
+          <div className="text-[0.6875rem] uppercase tracking-[0.18em] text-[var(--muted)]">Duration</div>
           <div className="mt-1 font-semibold tabular-nums text-[var(--ink)]">{model.durationDisplay}</div>
         </div>
       </div>
@@ -176,7 +183,7 @@ const SimpleQueueCard = memo(function SimpleQueueCard({
         <div className="mt-3 text-xs leading-5 text-[var(--danger)]">
           {model.errorDisplay.summary}
           {model.errorDisplay.detail ? (
-            <details className="mt-2 rounded-[16px] border border-[var(--danger-line)] bg-[var(--danger-soft)] px-3 py-2 text-[11px] leading-5 text-[var(--ink)]">
+            <details className="mt-2 rounded-[16px] border border-[var(--danger-line)] bg-[var(--danger-soft)] px-3 py-2 text-[0.6875rem] leading-5 text-[var(--ink)]">
               <summary className="cursor-pointer font-semibold uppercase tracking-[0.14em] text-[var(--danger)]">
                 Why it failed
               </summary>
@@ -186,16 +193,19 @@ const SimpleQueueCard = memo(function SimpleQueueCard({
         </div>
       ) : null}
       <div className="mt-4 flex flex-wrap gap-2 border-t border-[var(--line)]/70 pt-4">
-        {model.isIssue ? (
-          <Button type="button" size="sm" variant="secondary" onClick={() => onRetryJob(job.id)} aria-label={`Retry ${job.fileName}`}>
-            <RefreshCcw className="h-4 w-4" aria-hidden="true" />
-            Retry
-          </Button>
-        ) : null}
-        {model.isActive ? (
-          <Button type="button" size="sm" variant="ghost" onClick={() => onCancelJob(job.id)} aria-label={`Cancel ${job.fileName}`}>
-            <Square className="h-4 w-4" aria-hidden="true" />
-            Cancel
+        {/* One element for Retry and Cancel, so Cancel turning into Retry
+            (or back) keeps the same focused node. */}
+        {model.isIssue || model.isActive ? (
+          <Button
+            ref={keepRowActionFocus}
+            type="button"
+            size="sm"
+            variant={model.isIssue ? "secondary" : "ghost"}
+            onClick={() => (model.isIssue ? onRetryJob(job.id) : onCancelJob(job.id))}
+            aria-label={`${model.isIssue ? "Retry" : "Cancel"} ${job.fileName}`}
+          >
+            {model.isIssue ? <RefreshCcw className="h-4 w-4" aria-hidden="true" /> : <Square className="h-4 w-4" aria-hidden="true" />}
+            {model.isIssue ? "Retry" : "Cancel"}
           </Button>
         ) : null}
         <Button type="button" size="sm" variant="ghost" onClick={() => onRemoveJob(job.id)} aria-label={`Remove ${job.fileName}`}>
@@ -222,14 +232,16 @@ const SimpleQueueRow = memo(function SimpleQueueRow({
     <tr
       className={cn(
         "tp-selected-row border-b border-[var(--line)]/70 align-top text-[var(--ink)]",
-        selected ? "bg-[color:var(--accent-soft)]/72" : "hover:bg-[color:var(--surface-0)]/56",
+        selected
+          ? "bg-[color:var(--accent-soft)]/72 forced-colors:outline-2 forced-colors:-outline-offset-2 forced-colors:outline-[Highlight]"
+          : "hover:bg-[color:var(--surface-0)]/56",
       )}
       data-selected={selected}
       aria-current={selected ? "true" : undefined}
     >
       <td className="px-5 py-4 align-top">
         <div className="flex gap-3">
-          <div className={cn("mt-1 h-auto min-h-[54px] w-1.5 rounded-full transition-[background-color] duration-200 ease-out", selected ? "bg-[var(--accent)]" : "bg-transparent")} />
+          <div className={cn("mt-1 h-auto min-h-[54px] w-1.5 rounded-full", selected ? "bg-[var(--accent)] forced-colors:bg-[Highlight]" : "bg-transparent")} />
           <div className="min-w-0 flex-1">
             {/* The file name is this row's one row-navigation affordance
                 (UX-028): it doubles as "Inspect", so the actions cell only
@@ -243,10 +255,10 @@ const SimpleQueueRow = memo(function SimpleQueueRow({
               data-queue-nav="true"
               data-job-id={job.id}
               onClick={() => onOpenJob(job.id)}
-              className="w-full rounded-[10px] text-left transition-[color] duration-200 ease-out focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)]"
+              className="w-full rounded-[10px] text-left focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-[var(--accent)]"
               aria-label={`Inspect ${job.fileName}`}
             >
-              <div className="max-w-[32rem] text-base font-semibold leading-7 break-words text-[var(--ink)]">
+              <div dir="auto" className="max-w-[32rem] text-base font-semibold leading-7 break-words text-[var(--ink)]">
                 {job.fileName}
               </div>
             </button>
@@ -273,7 +285,7 @@ const SimpleQueueRow = memo(function SimpleQueueRow({
               <div className="mt-3 text-xs leading-5 text-[var(--danger)]">
                 {model.errorDisplay.summary}
                 {model.errorDisplay.detail ? (
-                  <details className="mt-2 rounded-[16px] border border-[var(--danger-line)] bg-[var(--danger-soft)] px-3 py-2 text-[11px] leading-5 text-[var(--ink)]">
+                  <details className="mt-2 rounded-[16px] border border-[var(--danger-line)] bg-[var(--danger-soft)] px-3 py-2 text-[0.6875rem] leading-5 text-[var(--ink)]">
                     <summary className="cursor-pointer font-semibold uppercase tracking-[0.14em] text-[var(--danger)]">
                       Why it failed
                     </summary>
@@ -301,14 +313,17 @@ const SimpleQueueRow = memo(function SimpleQueueRow({
       </td>
       <td className="px-5 py-4 align-top">
         <div className="flex flex-wrap justify-end gap-1.5">
-          {model.isIssue ? (
-            <Button type="button" size="sm" variant="secondary" onClick={() => onRetryJob(job.id)} aria-label={`Retry ${job.fileName}`}>
-              <RefreshCcw className="h-4 w-4" aria-hidden="true" />
-            </Button>
-          ) : null}
-          {model.isActive ? (
-            <Button type="button" size="sm" variant="ghost" onClick={() => onCancelJob(job.id)} aria-label={`Cancel ${job.fileName}`}>
-              <Square className="h-4 w-4" aria-hidden="true" />
+          {/* One element for Retry and Cancel; see the card above. */}
+          {model.isIssue || model.isActive ? (
+            <Button
+              ref={keepRowActionFocus}
+              type="button"
+              size="sm"
+              variant={model.isIssue ? "secondary" : "ghost"}
+              onClick={() => (model.isIssue ? onRetryJob(job.id) : onCancelJob(job.id))}
+              aria-label={`${model.isIssue ? "Retry" : "Cancel"} ${job.fileName}`}
+            >
+              {model.isIssue ? <RefreshCcw className="h-4 w-4" aria-hidden="true" /> : <Square className="h-4 w-4" aria-hidden="true" />}
             </Button>
           ) : null}
           <Button type="button" size="sm" variant="ghost" onClick={() => onRemoveJob(job.id)} aria-label={`Remove ${job.fileName}`}>
@@ -329,8 +344,20 @@ export const SimpleResultsTable = memo(function SimpleResultsTable({
   onRemoveJob,
   onRetryJob,
 }: SimpleResultsTableProps) {
-  const isDesktopQueue = useMediaQuery("(min-width: 768px)");
-  const [requestedPage, setRequestedPage] = useState(0);
+  const isDesktopQueue = useMediaQuery("(min-width: 48rem)");
+  const [requestedPage, setRequestedPage] = useState(() => pageOfJob(jobs, selectedJobId) ?? 0);
+  // Keyboard selection (arrows, Home/End) can land on a row outside the
+  // mounted window. When the selection changes, turn to the page that holds
+  // it, so the row exists for the queue focus effect. Manual paging is left
+  // alone until the selection changes again.
+  const [pagedSelectionId, setPagedSelectionId] = useState(selectedJobId);
+  if (pagedSelectionId !== selectedJobId) {
+    setPagedSelectionId(selectedJobId);
+    const selectedPage = pageOfJob(jobs, selectedJobId);
+    if (selectedPage != null) {
+      setRequestedPage(selectedPage);
+    }
+  }
   const pageCount = Math.max(1, Math.ceil(jobs.length / QUEUE_WINDOW_SIZE));
   const pageIndex = Math.min(requestedPage, pageCount - 1);
   const windowStart = pageIndex * QUEUE_WINDOW_SIZE;
@@ -378,7 +405,7 @@ export const SimpleResultsTable = memo(function SimpleResultsTable({
               against a live reproduction; do not reintroduce an offset here
               without restructuring the wrappers. */}
           <thead>
-            <tr className="border-b border-[var(--line)] text-left text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">
+            <tr className="border-b border-[var(--line)] text-left text-[0.6875rem] uppercase tracking-[0.18em] text-[var(--muted)]">
               <th scope="col" className="sticky top-0 bg-[var(--surface-1)]/96 px-5 py-4 backdrop-blur">File</th>
               <th scope="col" className="sticky top-0 bg-[var(--surface-1)]/96 px-4 py-4 backdrop-blur">Integrated</th>
               {analysisMode === "targeted" ? (
@@ -410,8 +437,8 @@ export const SimpleResultsTable = memo(function SimpleResultsTable({
       )}
       {pageCount > 1 ? (
         <div className="flex flex-wrap items-center justify-between gap-3 border-t border-[var(--line)]/70 px-4 py-3 text-sm text-[var(--muted)]">
-          <span>
-            Showing {windowStart + 1}-{windowEnd} of {jobs.length} files
+          <span className="tabular-nums">
+            Showing {numberFormatter.format(windowStart + 1)}–{numberFormatter.format(windowEnd)} of {numberFormatter.format(jobs.length)} files
           </span>
           <div className="flex items-center gap-2" role="group" aria-label="Queue pages">
             {/* aria-disabled, not disabled: a native disabled button drops
@@ -431,7 +458,7 @@ export const SimpleResultsTable = memo(function SimpleResultsTable({
             >
               Previous
             </Button>
-            <span aria-live="polite">
+            <span aria-live="polite" className="tabular-nums">
               Page {pageIndex + 1} of {pageCount}
             </span>
             <Button

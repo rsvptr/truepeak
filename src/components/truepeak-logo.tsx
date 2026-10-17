@@ -1,4 +1,3 @@
-import Image from "next/image";
 import { cn } from "@/lib/utils";
 
 type LogoSize = "sm" | "md" | "lg";
@@ -15,7 +14,7 @@ const logoSizeClasses: Record<
   sm: {
     markWrap: "h-8 w-8",
     title: "text-lg",
-    subtitle: "text-[11px]",
+    subtitle: "text-[0.6875rem]",
     gap: "gap-2.5",
   },
   md: {
@@ -48,7 +47,8 @@ export function TruePeakLogo({
   size?: LogoSize;
 }) {
   const styles = logoSizeClasses[size];
-  const resolvedImageSrc = imageSrc ?? (size === "lg" ? "/logo.png" : "/favicon.png");
+  // The mark renders at 32-48px, so a 96px source covers 2x displays.
+  const resolvedImageSrc = imageSrc ?? "/logo-96.png";
 
   return (
     <span className={cn("inline-flex items-center", styles.gap, className)}>
@@ -56,7 +56,14 @@ export function TruePeakLogo({
         className={cn("relative shrink-0 overflow-hidden", styles.markWrap, markClassName)}
         aria-hidden="true"
       >
-        <Image src={resolvedImageSrc} alt="" fill sizes="48px" className="object-contain" />
+        {/* Plain img: images are unoptimized, so next/image would only add runtime. */}
+        {/* eslint-disable-next-line @next/next/no-img-element */}
+        <img
+          src={resolvedImageSrc}
+          alt=""
+          decoding="async"
+          className="absolute inset-0 h-full w-full object-contain"
+        />
       </span>
       <span className="inline-flex min-w-0 flex-col">
         <span

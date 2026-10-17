@@ -20,7 +20,7 @@ export function WorkspaceMetricTile({
           : "border-[var(--line)] bg-[var(--surface-1)]",
       )}
     >
-      <div className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">
+      <div className="text-[0.6875rem] uppercase tracking-[0.18em] text-[var(--muted)]">
         {label}
       </div>
       <div className="mt-3 space-y-2">

@@ -76,6 +76,14 @@ export function useWorkspaceRoute({
   const [queueSearchDraft, setQueueSearchDraft] = useState(route.searchQuery);
   const deferredSearchQuery = useDeferredValue(queueSearchDraft.trim().toLowerCase());
   const lastWrittenSearchRef = useRef(route.searchQuery);
+  // Setters that only read route fields when called use these refs, so they
+  // stay stable across route changes instead of re-creating every consumer.
+  const routeRef = useRef(route);
+  const queueSearchDraftRef = useRef(queueSearchDraft);
+  useEffect(() => {
+    routeRef.current = route;
+    queueSearchDraftRef.current = queueSearchDraft;
+  }, [queueSearchDraft, route]);
 
   const updateWorkspaceRoute = useCallback((
     updates: WorkspaceRouteUpdates,
@@ -141,16 +149,17 @@ export function useWorkspaceRoute({
     tab: WorkspaceTab,
     options?: { history?: "push" | "replace" },
   ) => {
+    const current = routeRef.current;
     updateWorkspaceRoute(
       {
         screen: "session",
         tab,
-        detail: tab === "queue" ? route.detailTab : null,
-        drawer: tab === "queue" && route.workspaceDrawer === "presets" ? "presets" : null,
+        detail: tab === "queue" ? current.detailTab : null,
+        drawer: tab === "queue" && current.workspaceDrawer === "presets" ? "presets" : null,
       },
       { history: options?.history ?? "push" },
     );
-  }, [route.detailTab, route.workspaceDrawer, updateWorkspaceRoute]);
+  }, [updateWorkspaceRoute]);
 
   const setDetailTab = useCallback((tab: DetailTab) => {
     updateWorkspaceRoute({ detail: tab });
@@ -175,23 +184,24 @@ export function useWorkspaceRoute({
             compareSort: null,
             compareDirection: null,
             reference: null,
-            drawer: route.workspaceDrawer === "history" ? "history" : null,
+            drawer: routeRef.current.workspaceDrawer === "history" ? "history" : null,
           }
         : { ui: next },
     );
-  }, [route.workspaceDrawer, updateWorkspaceRoute]);
+  }, [updateWorkspaceRoute]);
 
   const setAnalysisMode = useCallback((next: AnalysisMode) => {
     onAnalysisModeChange(next);
+    const drawer = routeRef.current.workspaceDrawer;
     updateWorkspaceRoute({
       analysis: next,
-      drawer: next === "measure-only" && route.workspaceDrawer === "presets"
+      drawer: next === "measure-only" && drawer === "presets"
         ? null
-        : route.workspaceDrawer === "history"
+        : drawer === "history"
           ? "history"
           : null,
     });
-  }, [onAnalysisModeChange, route.workspaceDrawer, updateWorkspaceRoute]);
+  }, [onAnalysisModeChange, updateWorkspaceRoute]);
 
   const setReferenceId = useCallback((next: string | null) => {
     updateWorkspaceRoute({ reference: next });
@@ -206,28 +216,31 @@ export function useWorkspaceRoute({
   }, [updateWorkspaceRoute]);
 
   const setCompareSort = useCallback((next: CompareSort) => {
-    const nextDirection = route.compareSort === next
-      ? route.compareDirection === "asc" ? "desc" : "asc"
+    const { compareDirection, compareSort } = routeRef.current;
+    const nextDirection = compareSort === next
+      ? compareDirection === "asc" ? "desc" : "asc"
       : next === "name" ? "asc" : "desc";
     updateWorkspaceRoute({
       compareSort: next === "integrated" ? null : next,
       compareDirection: nextDirection === "desc" ? null : nextDirection,
     });
-  }, [route.compareDirection, route.compareSort, updateWorkspaceRoute]);
+  }, [updateWorkspaceRoute]);
 
   const setQueueFilter = useCallback((next: QueueFilter) => {
+    const draft = queueSearchDraftRef.current;
     updateWorkspaceRoute({
-      search: queueSearchDraft.trim() ? queueSearchDraft : null,
+      search: draft.trim() ? draft : null,
       filter: next === "all" ? null : next,
     });
-  }, [queueSearchDraft, updateWorkspaceRoute]);
+  }, [updateWorkspaceRoute]);
 
   const setQueueSort = useCallback((next: QueueSort) => {
+    const draft = queueSearchDraftRef.current;
     updateWorkspaceRoute({
-      search: queueSearchDraft.trim() ? queueSearchDraft : null,
+      search: draft.trim() ? draft : null,
       sort: next === "recent" ? null : next,
     });
-  }, [queueSearchDraft, updateWorkspaceRoute]);
+  }, [updateWorkspaceRoute]);
 
   const resetQueueView = useCallback(() => {
     setQueueSearchDraft("");

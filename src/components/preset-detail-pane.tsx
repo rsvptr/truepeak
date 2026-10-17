@@ -48,7 +48,6 @@ interface NumberFieldProps {
   name: string;
   label: string;
   unit: string;
-  ariaLabel: string;
   value: string;
   onChange: (value: string) => void;
   onBlur: () => void;
@@ -66,7 +65,6 @@ function NumberField({
   name,
   label,
   unit,
-  ariaLabel,
   value,
   onChange,
   onBlur,
@@ -77,16 +75,21 @@ function NumberField({
   signed,
 }: NumberFieldProps) {
   const errorId = `${id}-error`;
+  const labelId = `${id}-label`;
+  const unitId = `${id}-unit`;
   return (
     <label className="block text-sm text-[var(--muted)]">
-      <span className="mb-2 block text-[11px] font-semibold uppercase tracking-[0.18em]">{label}</span>
+      <span id={labelId} className="mb-2 block text-[0.6875rem] font-semibold uppercase tracking-[0.18em]">{label}</span>
       <span className="relative block">
         <input
           id={id}
           name={name}
           autoComplete="off"
           inputMode={signed ? undefined : "decimal"}
-          aria-label={ariaLabel}
+          // Named by the visible label and unit only. The wrapping <label>
+          // would also pull the error text into the name; that is the
+          // description instead.
+          aria-labelledby={`${labelId} ${unitId}`}
           aria-describedby={error ? errorId : undefined}
           aria-invalid={error ? true : undefined}
           value={value}
@@ -109,13 +112,14 @@ function NumberField({
           min={min}
           max={max}
           className={cn(
-            "w-full rounded-2xl border px-4 py-3 pr-16 tabular-nums text-[var(--ink)] outline-none transition",
+            "w-full rounded-2xl border px-4 py-3 pr-16 tabular-nums text-[var(--ink)] transition-[background-color,border-color,color] duration-200 ease-out focus-visible:outline-hidden",
             "focus-visible:border-[var(--accent)] focus-visible:ring-2 focus-visible:ring-[var(--accent)]",
             surface === "surface-0" ? "bg-[var(--surface-0)]" : "bg-[var(--surface-1)]",
             error ? "border-[var(--danger)]" : "border-[var(--control-line)]",
           )}
         />
         <span
+          id={unitId}
           aria-hidden="true"
           className="pointer-events-none absolute inset-y-0 right-4 flex items-center text-sm text-[var(--muted)]"
         >
@@ -134,7 +138,7 @@ function NumberField({
 function StatTile({ label, value }: { label: string; value: string }) {
   return (
     <div className="rounded-[18px] border border-[var(--line)] bg-[var(--surface-0)] px-4 py-3">
-      <div className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">{label}</div>
+      <div className="text-[0.6875rem] uppercase tracking-[0.18em] text-[var(--muted)]">{label}</div>
       <div className="mt-1.5 text-lg font-semibold tabular-nums text-[var(--ink)]">{value}</div>
     </div>
   );
@@ -146,7 +150,7 @@ function ViewSourceLink({ url, sourceLabel }: { url: string; sourceLabel: string
       href={url}
       target="_blank"
       rel="noreferrer"
-      className="mt-3 inline-flex min-h-11 items-center gap-2 rounded-full border border-[var(--line)] bg-[var(--surface-0)] px-4 py-2 text-sm font-semibold text-[var(--ink)] transition hover:border-[var(--accent)] hover:text-[var(--accent-text)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)] focus-visible:ring-offset-2 focus-visible:ring-offset-[var(--surface-1)]"
+      className="mt-3 inline-flex min-h-11 items-center gap-2 rounded-full border border-[var(--line)] bg-[var(--surface-0)] px-4 py-2 text-sm font-semibold text-[var(--ink)] transition-[background-color,border-color,color,scale] duration-150 ease-out motion-safe:active:scale-[0.97] hover:border-[var(--accent)] hover:text-[var(--accent-text)] focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-[var(--accent)] focus-visible:ring-offset-2 focus-visible:ring-offset-[var(--surface-1)]"
     >
       View {sourceLabel}
       <span className="sr-only"> (opens in a new tab)</span>
@@ -236,7 +240,7 @@ export function PresetDetailPane({
       id={PRESET_TARGET_FORM_ID}
       onSubmit={onSubmit}
       noValidate
-      className={cn("@container min-w-0 space-y-5 overflow-y-auto overscroll-contain", className)}
+      className={cn("@container min-w-0 space-y-5", className)}
     >
       {/* Header: name + provenance + task marker + modified/reset */}
       <div className="space-y-3">
@@ -250,9 +254,9 @@ export function PresetDetailPane({
             <h3
               ref={headingRef}
               tabIndex={-1}
-              className="text-lg font-semibold text-[var(--ink)] focus:outline-none"
+              className="text-lg font-semibold text-[var(--ink)] focus:outline-hidden focus-visible:ring-2 focus-visible:ring-[var(--accent)]"
             >
-              {preset ? preset.label : "Custom Target"}
+              {preset ? preset.label : "Custom target"}
             </h3>
           </div>
           {preset && draftIsModified ? (
@@ -292,8 +296,8 @@ export function PresetDetailPane({
 
       {/* Target settings */}
       <section className="space-y-4 rounded-[20px] border border-[var(--line)] bg-[var(--surface-1)] p-4">
-        <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-[var(--muted)]">
-          Target Settings
+        <div className="text-[0.6875rem] font-semibold uppercase tracking-[0.18em] text-[var(--muted)]">
+          Target settings
         </div>
 
         {isCustom ? (
@@ -301,9 +305,8 @@ export function PresetDetailPane({
             <NumberField
               id="custom-target-lufs"
               name="custom-target-lufs"
-              label="Loudness Target"
+              label="Loudness target"
               unit="LUFS"
-              ariaLabel="Custom loudness target in LUFS"
               value={customTargetLufs}
               onChange={onCustomTargetLufsChange}
               onBlur={() => onFieldBlur("customTargetLufs")}
@@ -316,9 +319,8 @@ export function PresetDetailPane({
             <NumberField
               id="custom-true-peak"
               name="custom-true-peak"
-              label="True Peak Limit"
+              label="True peak limit"
               unit="dBTP"
-              ariaLabel="Custom true peak limit in dBTP"
               value={customTruePeak}
               onChange={onCustomTruePeakChange}
               onBlur={() => onFieldBlur("customTruePeak")}
@@ -331,17 +333,16 @@ export function PresetDetailPane({
           </div>
         ) : preset ? (
           <div className="grid gap-3 @[22rem]:grid-cols-2">
-            <StatTile label="Loudness Target" value={formatTargetLufs(preset.loudnessTargetLufs)} />
-            <StatTile label="True Peak Limit" value={formatTargetDbtp(preset.truePeakCeilingDbtp)} />
+            <StatTile label="Loudness target" value={formatTargetLufs(preset.loudnessTargetLufs)} />
+            <StatTile label="True peak limit" value={formatTargetDbtp(preset.truePeakCeilingDbtp)} />
           </div>
         ) : null}
 
         <NumberField
           id="target-tolerance"
           name="target-tolerance"
-          label="Target Tolerance"
+          label="Target tolerance"
           unit="LU"
-          ariaLabel="Target tolerance window in LU"
           value={toleranceLufs}
           onChange={onToleranceChange}
           onBlur={() => onFieldBlur("toleranceLufs")}
@@ -353,7 +354,7 @@ export function PresetDetailPane({
 
         {isCustom ? (
           <fieldset className="space-y-2 border-0 p-0">
-            <legend className="mb-1 block p-0 text-[11px] font-semibold uppercase tracking-[0.18em] text-[var(--muted)]">
+            <legend className="mb-1 block p-0 text-[0.6875rem] font-semibold uppercase tracking-[0.18em] text-[var(--muted)]">
               {GAIN_POLICY_LEGEND}
             </legend>
             {GAIN_POLICIES.map((option) => {
@@ -362,8 +363,8 @@ export function PresetDetailPane({
                 <label
                   key={option.value}
                   className={cn(
-                    "flex cursor-pointer gap-3 rounded-2xl border p-3 transition",
-                    "has-[:focus-visible]:outline-none has-[:focus-visible]:ring-2 has-[:focus-visible]:ring-[var(--accent)] has-[:focus-visible]:ring-offset-2 has-[:focus-visible]:ring-offset-[var(--surface-1)]",
+                    "flex cursor-pointer gap-3 rounded-2xl border p-3 transition-[background-color,border-color,color] duration-200 ease-out has-checked:transition-none",
+                    "has-[:focus-visible]:outline-hidden has-[:focus-visible]:ring-2 has-[:focus-visible]:ring-[var(--accent)] has-[:focus-visible]:ring-offset-2 has-[:focus-visible]:ring-offset-[var(--surface-1)]",
                     active
                       ? "border-[color:var(--accent)]/45 bg-[color:var(--accent-soft)]"
                       : "border-[var(--line)] bg-[var(--surface-0)] hover:border-[color:var(--accent)]/30",
@@ -375,7 +376,7 @@ export function PresetDetailPane({
                     value={option.value}
                     checked={active}
                     onChange={() => onPolicyChange(option.value)}
-                    className="mt-1 h-4 w-4 shrink-0 accent-[var(--accent-strong)] focus-visible:outline-none"
+                    className="mt-1 h-4 w-4 shrink-0 accent-[var(--accent-strong)] focus-visible:outline-hidden"
                   />
                   <span className="min-w-0 block">
                     <span className="block text-sm font-semibold text-[var(--ink)]">{option.label}</span>
@@ -389,7 +390,7 @@ export function PresetDetailPane({
           </fieldset>
         ) : (
           <div className="rounded-2xl border border-[var(--line)] bg-[var(--surface-0)] p-3">
-            <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-[var(--muted)]">
+            <div className="text-[0.6875rem] font-semibold uppercase tracking-[0.18em] text-[var(--muted)]">
               {GAIN_POLICY_LEGEND}
             </div>
             <div className="mt-1.5 text-sm font-semibold text-[var(--ink)]">
@@ -405,7 +406,7 @@ export function PresetDetailPane({
       {/* Source / reference */}
       {preset ? (
         <section className="rounded-[20px] border border-[var(--line)] bg-[var(--surface-1)] p-4">
-          <div className="flex items-center gap-2 text-[11px] font-semibold uppercase tracking-[0.18em] text-[var(--muted)]">
+          <div className="flex items-center gap-2 text-[0.6875rem] font-semibold uppercase tracking-[0.18em] text-[var(--muted)]">
             <BookOpen className="h-4 w-4 text-[var(--accent)]" aria-hidden="true" />
             Source
           </div>

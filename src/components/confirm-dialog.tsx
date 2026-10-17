@@ -2,6 +2,7 @@
 
 import { useId, useRef } from "react";
 import { AlertTriangle } from "lucide-react";
+import { useExitPresence } from "@/hooks/use-exit-presence";
 import { useModalFocus } from "@/hooks/use-modal-focus";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
@@ -41,20 +42,29 @@ export function ConfirmDialog({
     // The safe action gets initial focus so Enter cannot destroy anything.
     getInitialFocus: () => cancelButtonRef.current,
   });
+  // The modal layer is released when `open` flips false (useModalFocus is
+  // keyed on it); the inert panel only stays mounted for its exit animation.
+  const { mounted, exiting, onAnimationEnd } = useExitPresence(open);
 
-  if (!open) {
+  if (!mounted) {
     return null;
   }
 
   return (
     <div
       ref={containerRef}
-      className="fixed inset-0 z-[70] flex items-center justify-center overflow-y-auto px-4 pt-[max(1.5rem,env(safe-area-inset-top))] pb-[max(1.5rem,env(safe-area-inset-bottom))] sm:px-6 [@media(max-height:640px)]:items-start"
+      className={cn(
+        "fixed inset-0 z-[70] flex items-center justify-center overflow-y-auto px-4 pt-[max(1.5rem,env(safe-area-inset-top))] pb-[max(1.5rem,env(safe-area-inset-bottom))] sm:px-6 [@media(max-height:640px)]:items-start",
+        exiting && "pointer-events-none",
+      )}
       aria-hidden={false}
     >
       <div
         aria-hidden="true"
-        className="tp-fade-in absolute inset-0 touch-none overscroll-contain bg-black/62 backdrop-blur-sm"
+        className={cn(
+          exiting ? "tp-fade-out" : "tp-fade-in",
+          "absolute inset-0 touch-none overscroll-contain bg-black/62 backdrop-blur-sm",
+        )}
         onClick={onClose}
       />
       <div
@@ -64,7 +74,12 @@ export function ConfirmDialog({
         aria-labelledby={titleId}
         aria-describedby={descriptionId}
         tabIndex={-1}
-        className="tp-dialog-in relative z-10 max-h-[calc(100dvh_-_env(safe-area-inset-top)_-_env(safe-area-inset-bottom)_-_3rem)] w-full max-w-[460px] overflow-y-auto rounded-[28px] border border-[var(--line)] bg-[var(--surface-1)] p-5 shadow-[var(--shadow-elevated)] focus:outline-none sm:p-6"
+        inert={exiting}
+        onAnimationEnd={onAnimationEnd}
+        className={cn(
+          exiting ? "tp-dialog-out" : "tp-dialog-in",
+          "relative z-10 max-h-[calc(100dvh_-_env(safe-area-inset-top)_-_env(safe-area-inset-bottom)_-_3rem)] w-full max-w-[460px] overflow-y-auto rounded-[28px] border border-[var(--line)] bg-[var(--surface-1)] p-5 shadow-[var(--shadow-elevated)] focus:outline-none sm:p-6",
+        )}
       >
         <div className="flex items-start gap-4">
           <div
@@ -79,7 +94,7 @@ export function ConfirmDialog({
             <AlertTriangle className="h-5 w-5" />
           </div>
           <div className="min-w-0">
-            <div className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">Please confirm</div>
+            <div className="text-[0.6875rem] uppercase tracking-[0.18em] text-[var(--muted)]">Please confirm</div>
             <h2 id={titleId} className="mt-2 text-xl font-semibold text-[var(--ink)]">
               {title}
             </h2>

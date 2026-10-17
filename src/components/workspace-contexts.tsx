@@ -2,7 +2,7 @@
 
 import {
   createContext,
-  useContext,
+  use,
   type ReactNode,
 } from "react";
 import type { BatchProgress, SessionStats } from "@/lib/session-selectors";
@@ -98,7 +98,7 @@ export function WorkspaceSessionProvider({
 }
 
 export function useWorkspaceCommands() {
-  const value = useContext(WorkspaceCommandContext);
+  const value = use(WorkspaceCommandContext);
   if (!value) {
     throw new Error("useWorkspaceCommands must be used inside WorkspaceCommandProvider.");
   }
@@ -106,7 +106,7 @@ export function useWorkspaceCommands() {
 }
 
 export function useWorkspaceSession() {
-  const value = useContext(WorkspaceSessionContext);
+  const value = use(WorkspaceSessionContext);
   if (!value) {
     throw new Error("useWorkspaceSession must be used inside WorkspaceSessionProvider.");
   }

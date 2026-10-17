@@ -1,6 +1,10 @@
 @import "tailwindcss";
 @import "uplot/dist/uPlot.min.css";
 
+/* Untracked agent docs contain class-like strings; keep them out of the scan. */
+@source not "../.agents";
+@source not "../.claude";
+
 :root {
   color-scheme: dark;
   --ink: #eef7f5;
@@ -15,16 +19,18 @@
      surfaces it sits on, well under the 3:1 non-text contrast target. */
   --control-line: rgba(170, 205, 198, 0.5);
   --accent: #37d2be;
-  --accent-strong: #128d81;
+  /* oklch(0.74 0.12 184.6): light enough that the --surface-0 button label
+     reaches APCA Lc 60.8 (8.75:1); the previous #128d81 was only Lc 36. */
+  --accent-strong: #32c3b4;
   --accent-soft: rgba(55, 210, 190, 0.14);
   /* Accent-colored text on --accent-soft chips. Dark theme can use the bright
      accent, but the light theme needs the deeper shade to reach AA contrast
      on the tinted background. */
   --accent-text: #37d2be;
   /* Hover fill for solid accent controls. Dark theme's near-black button text
-     stays legible either way, so hovering can keep lightening toward
-     --accent. */
-  --accent-hover: var(--accent);
+     stays legible either way, so hovering lightens: oklch(0.84 0.12 184.6),
+     ΔE OK 0.10 above --accent-strong, which now sits next to --accent. */
+  --accent-hover: #5de4d4;
   --danger: #ff7b88;
   --success: #55d59c;
   --warning: #f7b756;
@@ -48,16 +54,26 @@
   --shadow-elevated: 0 24px 100px rgba(0, 0, 0, 0.34);
   --chart-axis: #95aca8;
   --chart-grid: rgba(160, 194, 187, 0.14);
-  --chart-momentary: #37d2be;
-  --chart-shortterm: #f7b756;
-  --chart-truepeak: #ff9c55;
+  /* Series hues sit clear of the status tones and --accent (periwinkle, lime,
+     magenta) so a line never reads as a state, and stay apart under
+     protanopia/deuteranopia. */
+  --chart-momentary: #a3a0f3;
+  --chart-shortterm: #bbd55c;
+  --chart-truepeak: #d066b1;
   --page-bg: linear-gradient(180deg, #050e0d 0%, #071211 36%, #0a1716 100%);
+  --danger-strong: #b9314f;
+  --danger-hover: #992843;
+  --hero-glow-a: rgb(55 210 190 / 0.08);
+  --hero-glow-b: rgb(247 183 86 / 0.04);
+  --ease-out: cubic-bezier(0.23, 1, 0.32, 1);
+  --ease-in-out: cubic-bezier(0.77, 0, 0.175, 1);
+  --ease-drawer: cubic-bezier(0.32, 0.72, 0, 1);
 }
 
 [data-theme="light"] {
   color-scheme: light;
   --ink: #0b1f1c;
-  --muted: #55706b;
+  --muted: #4a645f;
   --surface-0: #ffffff;
   --surface-1: #f3f8f6;
   --surface-2: #e8f1ee;
@@ -67,7 +83,7 @@
   --accent: #0f9684;
   --accent-strong: #0c7568;
   --accent-soft: rgba(15, 150, 132, 0.13);
-  --accent-text: #0c7568;
+  --accent-text: #0a675b;
   /* Light theme's filled controls use white text; lightening the fill on
      hover (as dark theme does) drops white-text contrast to ~3.67:1. Darken
      instead so hover stays comfortably above 4.5:1. Written literally rather
@@ -78,27 +94,39 @@
      values that composite measured 4.07-4.34:1 against --surface-2, under the
      4.5:1 AA floor for the 11px badge text it carries. These are the smallest
      darkenings that clear 4.55:1 as chip text on every surface in use and
-     5.4:1 as plain text. */
-  --danger: #b5263e;
-  --success: #106e4a;
-  --warning: #845600;
-  --info: #1d6691;
-  --danger-soft: rgb(181 38 62 / 0.12);
-  --danger-line: rgb(181 38 62 / 0.32);
-  --success-soft: rgb(16 110 74 / 0.12);
-  --success-line: rgb(16 110 74 / 0.32);
-  --warning-soft: rgb(132 86 0 / 0.13);
-  --warning-line: rgb(132 86 0 / 0.34);
-  --info-soft: rgb(29 102 145 / 0.12);
-  --info-line: rgb(29 102 145 / 0.32);
+     5.4:1 as plain text. Darkened again so chips on a selected row (accent
+     tint under the chip tint) and on --surface-3 also clear 4.6:1. */
+  --danger: #aa243a;
+  --success: #0f6746;
+  --warning: #7d5200;
+  --info: #1b6088;
+  --danger-soft: rgb(170 36 58 / 0.12);
+  --danger-line: rgb(170 36 58 / 0.32);
+  --success-soft: rgb(15 103 70 / 0.12);
+  --success-line: rgb(15 103 70 / 0.32);
+  --warning-soft: rgb(125 82 0 / 0.13);
+  --warning-line: rgb(125 82 0 / 0.34);
+  --info-soft: rgb(27 96 136 / 0.12);
+  --info-line: rgb(27 96 136 / 0.32);
   --selection-bg: rgb(15 150 132 / 0.24);
   --shadow-elevated: 0 24px 80px rgba(10, 55, 49, 0.13);
   --chart-axis: #55706b;
   --chart-grid: rgba(13, 49, 44, 0.1);
-  --chart-momentary: #0c7568;
-  --chart-shortterm: #a4690b;
-  --chart-truepeak: #c4552f;
+  --chart-momentary: #585db7;
+  --chart-shortterm: #5c771b;
+  --chart-truepeak: #c35f92;
   --page-bg: linear-gradient(180deg, #f6faf8 0%, #eef4f2 42%, #e8f1ed 100%);
+  --hero-glow-a: rgb(15 150 132 / 0.08);
+  --hero-glow-b: rgb(132 86 0 / 0.04);
+}
+
+/* Users who ask for more contrast get the 3:1 control boundary on every
+   divider too. Listed after the light block so it wins in both themes. */
+@media (prefers-contrast: more) {
+  :root,
+  [data-theme="light"] {
+    --line: var(--control-line);
+  }
 }
 
 * {
@@ -106,7 +134,6 @@
 }
 
 html {
-  scroll-behavior: smooth;
   background: var(--page-bg);
   /* The session toolbar is sticky at the top of the scroll root. Without
      scroll-padding the browser aligns a newly focused element with the viewport
@@ -125,14 +152,8 @@ body {
   color: var(--ink);
   font-family: var(--font-sans), sans-serif;
   -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
   text-rendering: optimizeLegibility;
-}
-
-button,
-input,
-select,
-textarea {
-  font: inherit;
 }
 
 /* Native <select> popups paint options on a browser-chosen background (often
@@ -205,6 +226,26 @@ summary,
   }
 }
 
+@keyframes tp-sheet-up {
+  from {
+    transform: translate3d(0, 100%, 0);
+  }
+
+  to {
+    transform: translate3d(0, 0, 0);
+  }
+}
+
+@keyframes tp-drawer-left {
+  from {
+    transform: translate3d(100%, 0, 0);
+  }
+
+  to {
+    transform: translate3d(0, 0, 0);
+  }
+}
+
 @keyframes tp-scale-in {
   from {
     opacity: 0;
@@ -217,37 +258,99 @@ summary,
   }
 }
 
+/* Exits retrace the entry path, faster than the entry (the system is
+   responding, not the user deciding). */
+@keyframes tp-fade-out {
+  from {
+    opacity: 1;
+  }
+
+  to {
+    opacity: 0;
+  }
+}
+
+@keyframes tp-sheet-down {
+  from {
+    transform: translate3d(0, 0, 0);
+  }
+
+  to {
+    transform: translate3d(0, 100%, 0);
+  }
+}
+
+@keyframes tp-drawer-right {
+  from {
+    transform: translate3d(0, 0, 0);
+  }
+
+  to {
+    transform: translate3d(100%, 0, 0);
+  }
+}
+
+@keyframes tp-scale-out {
+  from {
+    opacity: 1;
+    transform: translate3d(0, 0, 0) scale(1);
+  }
+
+  to {
+    opacity: 0;
+    transform: translate3d(0, 10px, 0) scale(0.985);
+  }
+}
+
 .tp-enter {
-  animation: tp-fade-up 420ms cubic-bezier(0.2, 0.8, 0.2, 1) both;
+  animation: tp-fade-up 300ms var(--ease-out) backwards;
 }
 
 .tp-enter-soft {
-  animation: tp-fade-up 280ms cubic-bezier(0.2, 0.8, 0.2, 1) both;
+  animation: tp-fade-up 280ms var(--ease-out) backwards;
 }
 
 .tp-fade-in {
-  animation: tp-fade-in 220ms ease-out both;
+  animation: tp-fade-in 220ms var(--ease-out) backwards;
 }
 
-.tp-dialog-in,
+.tp-dialog-in {
+  animation: tp-scale-in 260ms var(--ease-out) backwards;
+}
+
+/* Drawers slide in from the edge they are anchored to: the bottom below lg
+   (sheet and full-height modes are both bottom-aligned), the right edge from
+   lg up. The lg override sits just before the reduced-motion block. */
 .tp-drawer-in {
-  animation: tp-scale-in 260ms cubic-bezier(0.2, 0.8, 0.2, 1) both;
+  animation: tp-sheet-up 300ms var(--ease-drawer) backwards;
+}
+
+/* Exit counterparts: DrawerPanel and ConfirmDialog stay mounted until the
+   panel's animationend, so these must always run (never animation: none). */
+.tp-fade-out {
+  animation: tp-fade-out 200ms var(--ease-out) both;
+}
+
+.tp-dialog-out {
+  animation: tp-scale-out 200ms var(--ease-out) both;
+}
+
+.tp-drawer-out {
+  animation: tp-sheet-down 200ms var(--ease-out) both;
 }
 
 .tp-notice-in {
-  animation: tp-fade-up 220ms ease-out both;
+  animation: tp-fade-up 220ms var(--ease-out) backwards;
 }
 
 .tp-selected-row {
   transition:
-    background-color 180ms ease,
-    border-color 180ms ease,
-    box-shadow 180ms ease,
-    transform 180ms ease;
+    background-color 150ms ease,
+    border-color 150ms ease;
 }
 
 .tp-selected-row[data-selected="true"] {
-  transform: translate3d(0, -1px, 0);
+  transition: none;
 }
 
 /* Layered viewport-height fallback for root/error/empty states: vh first for
@@ -348,26 +451,68 @@ summary,
   }
 }
 
+@media (min-width: 64rem) {
+  .tp-drawer-in {
+    animation-name: tp-drawer-left;
+  }
+
+  .tp-drawer-out {
+    animation-name: tp-drawer-right;
+  }
+}
+
+/* Theme toggle cross-fade (document.startViewTransition in the workbench).
+   A colour change, so a short plain ease; the overlay never eats clicks. */
+::view-transition-old(root),
+::view-transition-new(root) {
+  animation-duration: 200ms;
+  animation-timing-function: ease;
+}
+
+::view-transition {
+  pointer-events: none;
+}
+
+/* A reload into ?screen=session (flagged by the pre-paint script in
+   app/layout.tsx) would otherwise show the static home screen until
+   hydration. Hide it behind a toolbar-shaped placeholder until then; live
+   regions stay exposed. */
+@keyframes tp-boot-pulse {
+  50% {
+    opacity: 0.5;
+  }
+}
+
+html[data-boot-screen="session"] #truepeak-main[data-hydrated="false"]::before {
+  content: "";
+  height: 4.5rem;
+  border: 1px solid var(--line);
+  border-radius: 28px;
+  background-color: var(--surface-1);
+  animation: tp-boot-pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+}
+
+html[data-boot-screen="session"]
+  #truepeak-main[data-hydrated="false"]
+  > :not([role="status"], [role="alert"], [aria-live]) {
+  visibility: hidden;
+}
+
+/* Reduced motion keeps the fades and drops the movement; spinners and pulses
+   keep running. */
 @media (prefers-reduced-motion: reduce) {
-  html {
-    scroll-behavior: auto;
-  }
-
-  *,
-  *::before,
-  *::after {
-    animation-duration: 0.01ms !important;
-    animation-iteration-count: 1 !important;
-    transition-duration: 0.01ms !important;
-    scroll-behavior: auto !important;
-  }
-
   .tp-enter,
   .tp-enter-soft,
-  .tp-fade-in,
+  .tp-notice-in,
   .tp-dialog-in,
-  .tp-drawer-in,
-  .tp-notice-in {
-    animation: none !important;
+  .tp-drawer-in {
+    animation: tp-fade-in 150ms ease-out backwards;
+  }
+
+  /* A real (short) fade rather than none, so animationend still unmounts. */
+  .tp-fade-out,
+  .tp-dialog-out,
+  .tp-drawer-out {
+    animation: tp-fade-out 120ms ease-out both;
   }
 }

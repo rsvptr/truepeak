@@ -440,8 +440,8 @@ console.log("\n[F] UX-003 — gain-policy labels + consequence copy");
   check("two policies are exposed", GAIN_POLICIES.length === 2);
   const protect = GAIN_POLICIES.find((p) => p.value === "protect-true-peak");
   const loudness = GAIN_POLICIES.find((p) => p.value === "loudness-first");
-  check("protect-true-peak label", protect && protect.label === "Respect Peak Limit", protect && protect.label);
-  check("loudness-first label", loudness && loudness.label === "Reach Loudness Target", loudness && loudness.label);
+  check("protect-true-peak label", protect && protect.label === "Respect peak limit", protect && protect.label);
+  check("loudness-first label", loudness && loudness.label === "Reach loudness target", loudness && loudness.label);
   check(
     "protect consequence interpolates values",
     describeGainPolicy("protect-true-peak", { loudnessTargetLufs: -14, truePeakCeilingDbtp: -1 }) ===

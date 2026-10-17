@@ -27,11 +27,11 @@ export const UNSUPPORTED_SAMPLE_RATE_PREFIX = "Unsupported sample rate: ";
 // strip them. Pushed into metrics.warnings when the integrated measurement is not
 // valid, or when the programme is too short for a stable Loudness Range.
 export const INVALID_INTEGRATED_TOO_SHORT_WARNING =
-  "Clip is too short for a valid integrated loudness measurement (no complete 400 ms gated block).";
+  "File is too short for a valid integrated loudness measurement (no complete 400 ms gated block).";
 export const INVALID_INTEGRATED_BELOW_GATE_WARNING =
   "All audio is below the -70 LUFS absolute gate; integrated loudness is not a valid measurement.";
 export const LRA_UNSTABLE_WARNING =
-  "Programme is shorter than 60 s; Loudness Range is not statistically stable (EBU Tech 3341 §2.4).";
+  "Program is shorter than 60 s; Loudness Range is not statistically stable (EBU Tech 3341 §2.4).";
 
 // ITU-R BS.1770 defines K-weighting against a 48 kHz reference. Below ~24 kHz
 // the tan-prewarped bilinear re-derivation steepens the high-shelf transition
@@ -166,17 +166,15 @@ function calculateSegmentEnergies(
   }
 
   // M-11: K-weight into per-channel scratch buffers instead of mutating the
-  // caller's PCM. At most one extra Float32Array per contributing channel; LFE
-  // (weight 0) is never filtered or read, so it reuses the caller's reference.
-  const filteredChannels: Float32Array[] = channels.map((channel, channelIndex) => {
-    if (channelWeights[channelIndex] === 0) {
-      return channel;
-    }
-    const scratch = new Float32Array(channel.length);
-    const filter = new KWeightingFilter(sampleRate);
-    filter.processInto(channel, scratch);
-    return scratch;
-  });
+  // caller's PCM. Each contributing channel is filtered one 100 ms segment at a
+  // time, just before the frame loop reads it, so the extra memory is one
+  // segment per channel rather than a full-length copy of the file. The filter
+  // carries its state across calls, so the output is identical to filtering
+  // the whole channel at once. LFE (weight 0) is never filtered or read.
+  const filters = channels.map(() => new KWeightingFilter(sampleRate));
+  const filteredChunks = channelWeights.map(
+    (weight) => new Float32Array(weight === 0 ? 0 : stepSamples),
+  );
 
   // H-01: streaming high-resolution rolling 400 ms window for Maximum Momentary
   // Loudness. Hops at <= 10 ms so a 400 ms event lands on the grid within 0.055 LU
@@ -203,67 +201,79 @@ function calculateSegmentEnergies(
 
   const progressStride = Math.max(1, Math.floor(frameCount / 20));
   let segmentEnergy = 0;
-  for (let frame = 0; frame < frameCount; frame += 1) {
-    if (onProgress && frame % progressStride === 0) {
-      onProgress(frame / frameCount);
+  for (let chunkStart = 0; chunkStart < frameCount; chunkStart += stepSamples) {
+    const chunkEnd = Math.min(frameCount, chunkStart + stepSamples);
+    for (let channelIndex = 0; channelIndex < channels.length; channelIndex += 1) {
+      if (channelWeights[channelIndex] !== 0) {
+        filters[channelIndex].processInto(
+          channels[channelIndex].subarray(chunkStart, chunkEnd),
+          filteredChunks[channelIndex],
+        );
+      }
     }
 
-    let frameEnergy = 0;
+    for (let frame = chunkStart; frame < chunkEnd; frame += 1) {
+      if (onProgress && frame % progressStride === 0) {
+        onProgress(frame / frameCount);
+      }
 
-    for (let channelIndex = 0; channelIndex < channels.length; channelIndex += 1) {
-      const weight = channelWeights[channelIndex];
-      if (weight === 0) {
+      let frameEnergy = 0;
+
+      for (let channelIndex = 0; channelIndex < channels.length; channelIndex += 1) {
+        const weight = channelWeights[channelIndex];
+        if (weight === 0) {
+          continue;
+        }
+
+        const sample = filteredChunks[channelIndex][frame - chunkStart];
+        if (!Number.isFinite(sample)) {
+          throw new Error(`Decoded audio contains a non-finite sample at frame ${frame + 1}, channel ${channelIndex + 1}.`);
+        }
+        frameEnergy += weight * sample * sample;
+      }
+
+      if (!Number.isFinite(frameEnergy)) {
+        throw new Error(`Decoded audio energy overflowed at frame ${frame + 1}.`);
+      }
+
+      totalEnergy += frameEnergy;
+
+      // High-resolution momentary rolling sum (incremental; ring holds one window).
+      if (frame >= momentaryFrames) {
+        momentaryRingSum -= momentaryRing[momentaryRingIndex];
+      }
+      momentaryRing[momentaryRingIndex] = frameEnergy;
+      momentaryRingSum += frameEnergy;
+      momentaryRingIndex += 1;
+      if (momentaryRingIndex === momentaryFrames) {
+        momentaryRingIndex = 0;
+      }
+      if (frame >= momentaryFrames - 1) {
+        // Evaluate on the hop grid (window start at multiples of momentaryHop) and
+        // always at the final complete window so an end-of-file event is captured.
+        if (momentaryEvalPhase === 0 || frame === frameCount - 1) {
+          const meanEnergy = momentaryRingSum / momentaryFrames;
+          if (!hasMomentaryWindow || meanEnergy > maxMomentaryEnergy) {
+            maxMomentaryEnergy = meanEnergy;
+            hasMomentaryWindow = true;
+          }
+        }
+        momentaryEvalPhase += 1;
+        if (momentaryEvalPhase === momentaryHop) {
+          momentaryEvalPhase = 0;
+        }
+      }
+
+      if (frame >= fullSegmentFrameCount) {
         continue;
       }
 
-      const sample = filteredChannels[channelIndex][frame];
-      if (!Number.isFinite(sample)) {
-        throw new Error(`Decoded audio contains a non-finite sample at frame ${frame + 1}, channel ${channelIndex + 1}.`);
+      segmentEnergy += frameEnergy;
+
+      if ((frame + 1) % stepSamples === 0 || frame === frameCount - 1) {
+        segmentEnergies.push(segmentEnergy);
+        segmentEnergy = 0;
       }
-      frameEnergy += weight * sample * sample;
-    }
-
-    if (!Number.isFinite(frameEnergy)) {
-      throw new Error(`Decoded audio energy overflowed at frame ${frame + 1}.`);
-    }
-
-    totalEnergy += frameEnergy;
-
-    // High-resolution momentary rolling sum (incremental; ring holds one window).
-    if (frame >= momentaryFrames) {
-      momentaryRingSum -= momentaryRing[momentaryRingIndex];
-    }
-    momentaryRing[momentaryRingIndex] = frameEnergy;
-    momentaryRingSum += frameEnergy;
-    momentaryRingIndex += 1;
-    if (momentaryRingIndex === momentaryFrames) {
-      momentaryRingIndex = 0;
-    }
-    if (frame >= momentaryFrames - 1) {
-      // Evaluate on the hop grid (window start at multiples of momentaryHop) and
-      // always at the final complete window so an end-of-file event is captured.
-      if (momentaryEvalPhase === 0 || frame === frameCount - 1) {
-        const meanEnergy = momentaryRingSum / momentaryFrames;
-        if (!hasMomentaryWindow || meanEnergy > maxMomentaryEnergy) {
-          maxMomentaryEnergy = meanEnergy;
-          hasMomentaryWindow = true;
-        }
-      }
-      momentaryEvalPhase += 1;
-      if (momentaryEvalPhase === momentaryHop) {
-        momentaryEvalPhase = 0;
-      }
-    }
-
-    if (frame >= fullSegmentFrameCount) {
-      continue;
-    }
-
-    segmentEnergy += frameEnergy;
-
-    if ((frame + 1) % stepSamples === 0 || frame === frameCount - 1) {
-      segmentEnergies.push(segmentEnergy);
-      segmentEnergy = 0;
     }
   }
 

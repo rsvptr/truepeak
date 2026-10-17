@@ -46,6 +46,8 @@ const securityHeaders = [
 
 const nextConfig: NextConfig = {
   poweredByHeader: false,
+  // Dev-only: without this, `next dev` opened on 127.0.0.1 never hydrates.
+  allowedDevOrigins: ["127.0.0.1"],
   images: {
     unoptimized: true,
   },

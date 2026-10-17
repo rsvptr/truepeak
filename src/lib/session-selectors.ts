@@ -76,13 +76,19 @@ function queueStatusRank(status: AnalysisJob["status"]) {
   }
 }
 
+// createdAt is always an ISO 8601 string, which orders correctly by plain
+// code-unit comparison and is far cheaper than localeCompare in a sort.
+function compareIsoDates(left: string, right: string) {
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+
 export function sortQueueJobs(left: AnalysisJob, right: AnalysisJob, queueSort: QueueSort) {
   switch (queueSort) {
     case "oldest":
-      return left.createdAt.localeCompare(right.createdAt);
+      return compareIsoDates(left.createdAt, right.createdAt);
     case "status": {
       const statusDelta = queueStatusRank(left.status) - queueStatusRank(right.status);
-      return statusDelta || right.createdAt.localeCompare(left.createdAt);
+      return statusDelta || compareIsoDates(right.createdAt, left.createdAt);
     }
     case "integrated": {
       const leftValue = left.result?.metrics.integratedValid === false
@@ -92,24 +98,32 @@ export function sortQueueJobs(left: AnalysisJob, right: AnalysisJob, queueSort: 
         ? undefined
         : right.result?.metrics.integratedLufs;
       return compareOptionalMetric(leftValue, rightValue, "desc") ||
-        right.createdAt.localeCompare(left.createdAt);
+        compareIsoDates(right.createdAt, left.createdAt);
     }
     case "truePeak":
       return compareOptionalMetric(
         left.result?.metrics.truePeakDbtp,
         right.result?.metrics.truePeakDbtp,
         "desc",
-      ) || right.createdAt.localeCompare(left.createdAt);
+      ) || compareIsoDates(right.createdAt, left.createdAt);
     case "name":
       return queueCollator.compare(left.fileName, right.fileName);
     case "recent":
     default:
-      return right.createdAt.localeCompare(left.createdAt);
+      return compareIsoDates(right.createdAt, left.createdAt);
   }
 }
 
+// Jobs are immutable (every update, including a retarget, replaces the job
+// object), and the haystack reads only the job, so cache it per job identity.
+const queueSearchHaystackCache = new WeakMap<AnalysisJob, string>();
+
 export function buildQueueSearchHaystack(job: AnalysisJob) {
-  return [
+  const cached = queueSearchHaystackCache.get(job);
+  if (cached !== undefined) {
+    return cached;
+  }
+  const haystack = [
     job.fileName,
     job.status,
     job.result?.metadata.decoderLabel ?? "",
@@ -117,6 +131,8 @@ export function buildQueueSearchHaystack(job: AnalysisJob) {
     job.result?.target?.label ?? "",
     job.result ? getComplianceSummary(job.result)?.label ?? "" : "",
   ].join("\n").toLowerCase();
+  queueSearchHaystackCache.set(job, haystack);
+  return haystack;
 }
 
 export function queueJobMatchesView(

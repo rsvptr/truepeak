@@ -33,6 +33,12 @@ export function useConfirmDialog({
   workspaceDrawer,
 }: UseConfirmDialogOptions) {
   const [state, setState] = useState<ConfirmDialogState>(null);
+  // The copy follows the last opened dialog, not just the open one, so the
+  // dialog keeps its text while it plays its exit animation after closing.
+  const [shownState, setShownState] = useState<ConfirmDialogState>(null);
+  if (state && state !== shownState) {
+    setShownState(state);
+  }
   const dismissConfirmDialog = useCallback(() => setState(null), []);
   const { closeHistoryEntry, openHistoryEntry } = useOverlayHistoryEntry(
     "confirm-dialog",
@@ -90,37 +96,37 @@ export function useConfirmDialog({
     workspaceDrawer,
   ]);
 
-  const copy = useMemo(() => state?.type === "remove-job"
+  const copy = useMemo(() => shownState?.type === "remove-job"
     ? {
         title: "Remove this file?",
         description: "This removes the file and its result from the current session. You can add it again any time.",
         confirmLabel: "Remove file",
       }
-    : state?.type === "clear-finished"
+    : shownState?.type === "clear-finished"
       ? {
           title: "Clear finished files?",
           description: "Completed, failed, and canceled items will be removed from the current queue. Active work keeps running.",
           confirmLabel: "Clear finished",
         }
-      : state?.type === "clear-session"
+      : shownState?.type === "clear-session"
         ? {
             title: "Clear the current session?",
             description: "This removes every queued and completed file from the current session view. Saved history stays untouched.",
             confirmLabel: "Clear session",
           }
-        : state?.type === "clear-history"
+        : shownState?.type === "clear-history"
           ? {
               title: "Clear saved history?",
               description: "This removes the local summary cards stored in this browser. It does not affect the current queue.",
-              confirmLabel: "Clear history",
+              confirmLabel: "Clear saved history",
             }
-          : state?.type === "close-preset-drawer"
+          : shownState?.type === "close-preset-drawer"
             ? {
                 title: "Discard unapplied preset changes?",
                 description: "The preset drawer has edits that have not been applied yet. Closing now discards them; the active target stays unchanged.",
                 confirmLabel: "Discard changes",
               }
-            : null, [state]);
+            : null, [shownState]);
 
   return {
     closeConfirmDialog,

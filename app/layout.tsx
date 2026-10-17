@@ -1,6 +1,7 @@
 import type { Metadata, Viewport } from "next";
 import { IBM_Plex_Mono, Space_Grotesk } from "next/font/google";
 import { Telemetry } from "@/components/telemetry";
+import { THEME_COLOR } from "@/lib/theme-color";
 import "./globals.css";
 
 const sans = Space_Grotesk({
@@ -12,6 +13,8 @@ const mono = IBM_Plex_Mono({
   subsets: ["latin"],
   variable: "--font-mono",
   weight: ["400", "500", "600"],
+  // Only the lazily loaded timeline chart uses the mono face.
+  preload: false,
 });
 
 // Telemetry defaults to off. A deployment operator must both deploy on Vercel
@@ -68,8 +71,8 @@ export function generateViewport(): Viewport {
     viewportFit: "cover",
     interactiveWidget: "resizes-content",
     themeColor: [
-      { media: "(prefers-color-scheme: light)", color: "#f6faf8" },
-      { media: "(prefers-color-scheme: dark)", color: "#071412" },
+      { media: "(prefers-color-scheme: light)", color: THEME_COLOR.light },
+      { media: "(prefers-color-scheme: dark)", color: THEME_COLOR.dark },
     ],
   };
 }
@@ -81,11 +84,13 @@ export default function RootLayout({ children }: Readonly<{ children: React.Reac
         {/* Pre-paint theme correction: the static shell ships with data-theme="dark" and no
             server ever reads the cookie, so first-time visitors whose OS prefers light would
             otherwise see a dark flash before React applies their preference.
-            Runs before anything renders; cookie still wins when present. */}
+            Runs before anything renders; cookie still wins when present.
+            It also flags a reload into the session screen, which the static shell cannot
+            render, so globals.css hides the home screen until hydration. */}
         <script
           dangerouslySetInnerHTML={{
             __html:
-              "(function(){try{var m=document.cookie.match(/(?:^|;\\s*)truepeak-theme=(light|dark)(?:;|$)/);var t=m?m[1]:(window.matchMedia&&window.matchMedia('(prefers-color-scheme: light)').matches?'light':'dark');document.documentElement.dataset.theme=t;}catch(e){}})();",
+              "(function(){try{var m=document.cookie.match(/(?:^|;\\s*)truepeak-theme=(light|dark)(?:;|$)/);var t=m?m[1]:(window.matchMedia&&window.matchMedia('(prefers-color-scheme: light)').matches?'light':'dark');document.documentElement.dataset.theme=t;if(new URLSearchParams(location.search).get('screen')==='session'){document.documentElement.dataset.bootScreen='session';}}catch(e){}})();",
           }}
         />
         {children}

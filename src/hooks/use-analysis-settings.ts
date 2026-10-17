@@ -46,11 +46,26 @@ export function useAnalysisSettings() {
     () => serializedSettings ? JSON.parse(serializedSettings) as WorkspaceAnalysisSettings : null,
     [serializedSettings],
   );
+  // Key the target on the five fields stateFromStoredSettings reads, so writing
+  // the decode preference or analysis mode keeps the same target object and
+  // does not retarget (and rescore) every result.
+  const hasStoredSettings = storedSettings != null;
+  const storedPresetId = storedSettings?.selectedPresetId;
+  const storedCustomTargetLufs = storedSettings?.customTargetLufs;
+  const storedCustomTruePeak = storedSettings?.customTruePeak;
+  const storedTargetTolerance = storedSettings?.targetTolerance;
+  const storedCustomPolicy = storedSettings?.customPolicy;
   const storedTargetState = useMemo(
-    () => storedSettings
-      ? stateFromStoredSettings(storedSettings)
+    () => hasStoredSettings
+      ? stateFromStoredSettings({
+        selectedPresetId: storedPresetId!,
+        customTargetLufs: storedCustomTargetLufs!,
+        customTruePeak: storedCustomTruePeak!,
+        targetTolerance: storedTargetTolerance!,
+        customPolicy: storedCustomPolicy!,
+      })
       : createDefaultTargetState(),
-    [storedSettings],
+    [hasStoredSettings, storedPresetId, storedCustomTargetLufs, storedCustomTruePeak, storedTargetTolerance, storedCustomPolicy],
   );
   const [targetOverride, setTargetOverride] = useState<TargetWorkspaceState | null>(null);
   const [analysisModeOverride, setAnalysisModeOverride] = useState<AnalysisMode | null>(null);
@@ -99,21 +114,23 @@ export function useAnalysisSettings() {
     }
   }, [decodePreference, persist, persistedAnalysisMode, targetState]);
 
+  // Draft-only edits never persist, so they derive the next state from the
+  // latest one rather than from the render that created the handler.
   const handleToleranceChange = useCallback((value: string) => {
-    setTargetOverride(updateDraft(targetState, { toleranceLufs: value }));
-  }, [targetState]);
+    setTargetOverride((current) => updateDraft(current ?? storedTargetState, { toleranceLufs: value }));
+  }, [storedTargetState]);
 
   const handleCustomTargetLufsChange = useCallback((value: string) => {
-    setTargetOverride(updateDraft(targetState, { customTargetLufs: value }));
-  }, [targetState]);
+    setTargetOverride((current) => updateDraft(current ?? storedTargetState, { customTargetLufs: value }));
+  }, [storedTargetState]);
 
   const handleCustomTruePeakChange = useCallback((value: string) => {
-    setTargetOverride(updateDraft(targetState, { customTruePeak: value }));
-  }, [targetState]);
+    setTargetOverride((current) => updateDraft(current ?? storedTargetState, { customTruePeak: value }));
+  }, [storedTargetState]);
 
   const handlePolicyChange = useCallback((policy: TargetPreset["policy"]) => {
-    setTargetOverride(updateDraft(targetState, { policy }));
-  }, [targetState]);
+    setTargetOverride((current) => updateDraft(current ?? storedTargetState, { policy }));
+  }, [storedTargetState]);
 
   const handleApplyDraft = useCallback(() => {
     const next = applyDraft(targetState);
@@ -124,8 +141,8 @@ export function useAnalysisSettings() {
   }, [decodePreference, persist, persistedAnalysisMode, targetState]);
 
   const handleCancelDraft = useCallback(() => {
-    setTargetOverride(cancelDraft(targetState));
-  }, [targetState]);
+    setTargetOverride((current) => cancelDraft(current ?? storedTargetState));
+  }, [storedTargetState]);
 
   const handleResetToPublished = useCallback(() => {
     const next = resetToPublished(targetState);

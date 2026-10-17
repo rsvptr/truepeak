@@ -42,7 +42,7 @@ self.onmessage = async (event: MessageEvent<SessionImportRequest>) => {
 
   const { file } = event.data;
   if (!(file instanceof File) || file.size <= 0) {
-    post({ type: "error", error: "The selected session file is empty or invalid." });
+    post({ type: "error", error: "That file is empty or isn't a TruePeak session. Choose a session file exported from TruePeak." });
     return;
   }
   if (file.size > MAX_SESSION_FILE_BYTES) {
@@ -63,7 +63,7 @@ self.onmessage = async (event: MessageEvent<SessionImportRequest>) => {
     try {
       text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
     } catch {
-      post({ type: "error", error: "The session file is not valid UTF-8 text." });
+      post({ type: "error", error: "That file isn't a readable TruePeak session. Choose a session file exported from TruePeak." });
       return;
     }
 
@@ -81,7 +81,7 @@ self.onmessage = async (event: MessageEvent<SessionImportRequest>) => {
       error:
         error instanceof Error
           ? error.message
-          : "The session file could not be read or validated.",
+          : "That file couldn't be read as a TruePeak session. Choose a session file exported from TruePeak.",
     });
   }
 };

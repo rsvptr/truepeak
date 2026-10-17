@@ -59,22 +59,35 @@ export const DEFAULT_DECODE_BUDGET: Readonly<DecodeBudget> = Object.freeze({
 
 /**
  * Budget tier for devices that report 8 GB or more of memory (or a fine
- * pointer with no memory signal, matching the aggregate-capacity rule). One
- * GiB of decoded float32 PCM covers about 11.6 minutes of stereo 192 kHz or
- * 23 minutes of stereo 96 kHz, so ordinary high-resolution masters fit. The
- * decode-time ceiling is doubled because files this large legitimately take
- * longer through every route. Heavy-file exclusivity and the aggregate
- * reservation cap still bound the batch-level footprint.
+ * pointer with no memory signal, matching the aggregate-capacity rule). 1.5
+ * GiB of decoded float32 PCM covers about 17 minutes of stereo 192 kHz or 34
+ * minutes of stereo 96 kHz (the 200 million frame cap binds just before the
+ * byte cap at both rates), so ordinary high-resolution masters fit. The source
+ * cap matches the decoded cap so a 24-bit PCM file of the same length is not
+ * refused first. The decode-time ceiling is doubled because files this large
+ * legitimately take longer through every route. The batch-level footprint is
+ * bounded by LARGE_MEMORY_AGGREGATE_PEAK_BYTES, which does not scale with
+ * this tier.
  */
 export const LARGE_MEMORY_DECODE_BUDGET: Readonly<DecodeBudget> = Object.freeze({
-  maxSourceBytes: 1024 * MEBIBYTE,
-  maxDecodedBytes: 1024 * MEBIBYTE,
-  maxOutputBytes: 1025 * MEBIBYTE,
+  maxSourceBytes: 1536 * MEBIBYTE,
+  maxDecodedBytes: 1536 * MEBIBYTE,
+  maxOutputBytes: 1537 * MEBIBYTE,
   maxChannels: MAX_DECODE_CHANNELS,
   maxFrames: 200_000_000,
   maxDurationSeconds: 6 * 60 * 60,
   maxDecodeMs: 4 * 60 * 1000,
 });
+
+/**
+ * Batch-wide modeled-residency cap for devices on the large tier, pinned to
+ * what the former 1 GiB tier produced: two conservative route peaks of 1024
+ * MiB source + 2 x 1025 MiB output + 1024 MiB decoded = 4098 MiB each. Raising
+ * the per-file tier therefore does not raise the batch-level footprint. One
+ * conservative peak at the current tier (6146 MiB) still fits, so any single
+ * file the tier admits can run alone.
+ */
+export const LARGE_MEMORY_AGGREGATE_PEAK_BYTES = 8196 * MEBIBYTE;
 
 export const HARD_DECODE_LIMITS: Readonly<DecodeBudget> = Object.freeze({
   maxSourceBytes: 2048 * MEBIBYTE,
@@ -127,7 +140,7 @@ export function decodeFailureSummary(
     case "source-budget-exceeded":
       return `This file is larger than this device can analyze safely. ${describeDeviceDecodeLimit(budget)} Try a smaller file or another device.`;
     case "decoded-budget-exceeded":
-      return `This file needs more than the available ${formatBudgetBytes(budget.maxDecodedBytes)} of audio working memory. Try a shorter file, fewer channels, or another device.`;
+      return `Long files at high sample rates or with many channels need more audio memory than the ${formatBudgetBytes(budget.maxDecodedBytes)} this device allows. Make a 48 kHz or 96 kHz copy, a shorter one, or one with fewer channels, then try again.`;
     case "output-budget-exceeded":
       return `The compatibility decoder would create more than the available ${formatBudgetBytes(budget.maxOutputBytes)} output limit. Try a shorter file or convert it to WAV or AIFF.`;
     case "channel-limit-exceeded":

@@ -46,7 +46,7 @@ export function describeIntegratedInvalidReason(
 ) {
   switch (reason) {
     case "too-short":
-      return "Clip is too short for a complete 400 ms gated measurement.";
+      return "File is too short for a complete 400 ms gated measurement.";
     case "below-gate":
       return "All audio is below the -70 LUFS absolute gate.";
     default:

@@ -10,7 +10,7 @@ import {
   Upload,
 } from "lucide-react";
 import { useMediaQuery } from "@/hooks/use-media-query";
-import { useWorkspaceCommands, useWorkspaceSession } from "@/components/workspace-contexts";
+import { useWorkspaceCommands } from "@/components/workspace-contexts";
 import { formatPresetLufs, formatPresetPeakDbtp } from "@/lib/format";
 import { cn } from "@/lib/utils";
 import type { ParallelLanesPreference } from "@/lib/workspace-preferences";
@@ -28,6 +28,7 @@ interface DecodeOption {
 interface HomeStageProps {
   supportedFormats: string[];
   decodeOptions: DecodeOption[];
+  parallelLimit: number;
 }
 
 const PARALLEL_OPTIONS: Array<{ id: ParallelLanesPreference; label: string }> = [
@@ -52,9 +53,9 @@ function ToggleButton({
       aria-pressed={active}
       onClick={onClick}
       className={cn(
-        "flex min-h-[44px] items-center justify-center rounded-[14px] px-3 py-2 text-sm font-semibold transition-[background-color,color,box-shadow] duration-200 ease-out focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)]",
+        "flex min-h-[44px] items-center justify-center rounded-[14px] px-3 py-2 text-sm font-semibold transition-[background-color,color,scale] duration-150 ease-out motion-safe:active:scale-[0.97] focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-[var(--accent)]",
         active
-          ? "bg-[color:var(--accent-soft)] text-[var(--ink)] shadow-[0_10px_24px_rgba(18,141,129,0.12)]"
+          ? "bg-[color:var(--accent-soft)] text-[var(--ink)] shadow-[0_10px_24px_rgba(18,141,129,0.12)] forced-colors:border forced-colors:border-[Highlight] forced-colors:bg-[Highlight] forced-colors:text-[HighlightText] forced-colors:forced-color-adjust-none"
           : "text-[var(--muted)] hover:text-[var(--ink)]",
       )}
     >
@@ -91,7 +92,7 @@ function StripSection({
         className,
       )}
     >
-      <div className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">{label}</div>
+      <div className="text-[0.6875rem] uppercase tracking-[0.18em] text-[var(--muted)]">{label}</div>
       <div className="mt-3 flex flex-1 flex-col">{children}</div>
     </section>
   );
@@ -100,6 +101,7 @@ function StripSection({
 export const HomeStage = memo(function HomeStage({
   supportedFormats,
   decodeOptions,
+  parallelLimit: resolvedParallelLimit,
 }: HomeStageProps) {
   const {
     compatibilityDecoderAllowed,
@@ -118,7 +120,6 @@ export const HomeStage = memo(function HomeStage({
     setParallelPreference: onSetParallelPreference,
     setUiMode: onSetUiMode,
   } = useWorkspaceCommands();
-  const { parallelLimit: resolvedParallelLimit } = useWorkspaceSession();
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const advancedPanelId = "home-stage-advanced-options";
   const decodeOption =
@@ -136,7 +137,7 @@ export const HomeStage = memo(function HomeStage({
           z-index so it paints behind this content without needing a second
           "position: relative" layer just to win stacking order. */}
       <div className="relative isolate overflow-hidden rounded-[26px] px-4 py-5 sm:rounded-[34px] sm:px-7 sm:py-7 xl:px-8 xl:py-8">
-        <div className="pointer-events-none absolute inset-0 -z-10 bg-[linear-gradient(135deg,rgba(62,209,189,0.08),transparent_38%,rgba(247,183,86,0.04))]" />
+        <div className="pointer-events-none absolute inset-0 -z-10 bg-[linear-gradient(135deg,var(--hero-glow-a),transparent_38%,var(--hero-glow-b))]" />
         <div className="flex flex-wrap items-center gap-2">
           <Badge>{currentModeLabel}</Badge>
           <Badge className="border-[var(--line)]/80 bg-[var(--surface-1)]/74 text-[var(--muted)]">
@@ -146,10 +147,10 @@ export const HomeStage = memo(function HomeStage({
 
         <div className="mt-5 grid gap-6 xl:grid-cols-[minmax(0,1.34fr)_minmax(300px,0.66fr)] xl:items-stretch">
           <div className="min-w-0">
-            <div className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">
+            <div className="text-[0.6875rem] uppercase tracking-[0.18em] text-[var(--muted)]">
               Start here
             </div>
-            <h2 className="mt-2 text-balance text-3xl font-semibold tracking-tight text-[var(--ink)] sm:text-4xl xl:text-[3.45rem] xl:leading-[1.02]">
+            <h2 id="truepeak-content" tabIndex={-1} className="mt-2 text-balance text-3xl font-semibold tracking-tight text-[var(--ink)] focus:outline-hidden sm:text-4xl xl:text-[3.45rem] xl:leading-[1.02]">
               Choose your files and start the review
             </h2>
             <p className="mt-4 max-w-[68ch] text-sm leading-7 text-[var(--muted)] sm:text-base">
@@ -166,7 +167,7 @@ export const HomeStage = memo(function HomeStage({
                 This app does not send usage analytics unless the deployment operator has explicitly enabled them; audio and results are never included, even then.
               </p>
             </div>
-            <div className="mt-5 flex flex-wrap gap-2 text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">
+            <div className="mt-5 flex flex-wrap gap-2 text-[0.6875rem] uppercase tracking-[0.18em] text-[var(--muted)]">
               <span className="rounded-full border border-[var(--line)]/70 bg-[var(--surface-0)]/54 px-3 py-1.5">
                 Opens results view
               </span>
@@ -188,7 +189,7 @@ export const HomeStage = memo(function HomeStage({
                   : "border-[var(--line)]/72 bg-[var(--surface-0)]/22",
               )}
             >
-              <div className="inline-flex items-center gap-2 text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">
+              <div className="inline-flex items-center gap-2 text-[0.6875rem] uppercase tracking-[0.18em] text-[var(--muted)]">
                 <Upload className="h-4 w-4 text-[var(--accent)]" aria-hidden="true" />
                 Drag and drop
               </div>
@@ -200,7 +201,7 @@ export const HomeStage = memo(function HomeStage({
                   ? "Drag audio files onto this page, or use the file picker below to choose files from your device."
                   : "Drag a batch, or a whole album folder, onto any part of the window. Folders are scanned for supported audio, and the session opens once the files are accepted."}
               </p>
-              <div className="mt-5 inline-flex items-center gap-2 rounded-full border border-[var(--line)]/70 bg-[var(--surface-0)]/54 px-3 py-1.5 text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">
+              <div className="mt-5 inline-flex items-center gap-2 rounded-full border border-[var(--line)]/70 bg-[var(--surface-0)]/54 px-3 py-1.5 text-[0.6875rem] uppercase tracking-[0.18em] text-[var(--muted)]">
                 <span className="h-1.5 w-1.5 rounded-full bg-[var(--accent)]" />
                 {isCoarsePointer ? "Works on every screen" : "Works on every screen, folders included"}
               </div>
@@ -208,7 +209,7 @@ export const HomeStage = memo(function HomeStage({
 
             <div className="order-first flex min-h-[168px] h-full flex-col justify-between gap-4 xl:order-none xl:pl-2">
               <div>
-                <div className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">
+                <div className="text-[0.6875rem] uppercase tracking-[0.18em] text-[var(--muted)]">
                   Browse files
                 </div>
                 <p className="mt-3 max-w-[34ch] text-sm leading-6 text-[var(--muted)]">
@@ -222,7 +223,7 @@ export const HomeStage = memo(function HomeStage({
                 onClick={onOpenPicker}
               >
                 <Plus className="h-4 w-4" aria-hidden="true" />
-                Select Audio Files
+                Select audio files
               </Button>
               <ul className="grid gap-2 text-xs leading-5 text-[var(--muted)]">
                 <SupportNote>Browser decode where available</SupportNote>
@@ -234,7 +235,7 @@ export const HomeStage = memo(function HomeStage({
         </div>
 
         <div className="mt-5 rounded-[24px] border border-[var(--line)]/70 bg-[var(--surface-1)]/54 p-3 sm:p-4">
-          <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4 xl:items-stretch">
+          <div className="grid grid-cols-[minmax(0,1fr)] gap-3 md:grid-cols-2 xl:grid-cols-4 xl:items-stretch">
             <StripSection label="Workspace mode">
               <div className="flex h-full flex-col justify-between gap-4">
                 <div className="grid grid-cols-2 gap-2 rounded-[18px] border border-[var(--control-line)] bg-[var(--surface-1)]/78 p-1" role="group" aria-label="Choose workspace mode">
@@ -258,7 +259,7 @@ export const HomeStage = memo(function HomeStage({
                     Targeted
                   </ToggleButton>
                   <ToggleButton active={analysisMode === "measure-only"} onClick={() => onSetAnalysisMode("measure-only")}>
-                    Measure Only
+                    Measure only
                   </ToggleButton>
                 </div>
                 <p className="text-sm leading-6 text-[var(--muted)]">
@@ -282,13 +283,13 @@ export const HomeStage = memo(function HomeStage({
                   </div>
                   <Button type="button" size="sm" variant="secondary" className="w-full justify-center" onClick={onOpenPresetLibrary}>
                     <SlidersHorizontal className="h-4 w-4" aria-hidden="true" />
-                    Preset Library
+                    Preset library
                   </Button>
                 </div>
               ) : (
                 <div className="flex h-full flex-col justify-between gap-4">
                   <div>
-                    <div className="text-base font-semibold text-[var(--ink)]">Raw measurement</div>
+                    <div className="text-base font-semibold text-[var(--ink)]">Measure only</div>
                     <p className="mt-2 text-sm leading-6 text-[var(--muted)]">
                       The app will show loudness, peaks, dynamics, and timing as measured. No target or gain plan is active.
                     </p>
@@ -309,7 +310,7 @@ export const HomeStage = memo(function HomeStage({
                   variant="ghost"
                   className="h-11 w-full justify-between rounded-[18px] border border-[var(--control-line)] bg-[var(--surface-0)]/58 px-4 text-[var(--ink)]"
                   aria-expanded={advancedOpen}
-                  aria-controls={advancedPanelId}
+                  aria-controls={advancedOpen ? advancedPanelId : undefined}
                   onClick={() => setAdvancedOpen((current) => !current)}
                 >
                   <span className="inline-flex items-center gap-2">
@@ -330,14 +331,13 @@ export const HomeStage = memo(function HomeStage({
               <StripSection label="Decode path" className="min-h-[140px]">
                 <div className="flex h-full flex-col justify-between gap-4">
                   <label htmlFor="decode-preference" className="block text-sm text-[var(--muted)]">
-                    <span className="sr-only">Preferred decode path</span>
                     <select
                       id="decode-preference"
                       name="decode-preference"
                       aria-label="Choose decode path"
                       value={decodePreference}
                       onChange={(event) => onSetDecodePreference(event.target.value as DecodePreference)}
-                      className="h-11 w-full rounded-[18px] border border-[var(--control-line)] bg-[var(--surface-1)] px-3 text-[var(--ink)] outline-none transition-[border-color,background-color] duration-200 ease-out focus:border-[var(--accent)] focus-visible:ring-2 focus-visible:ring-[var(--accent)]"
+                      className="h-11 w-full rounded-[18px] border border-[var(--control-line)] bg-[var(--surface-1)] px-3 text-[var(--ink)] focus-visible:outline-hidden transition-[border-color,background-color] duration-200 ease-out focus:border-[var(--accent)] focus-visible:ring-2 focus-visible:ring-[var(--accent)]"
                     >
                       {decodeOptions.map((option) => (
                         <option key={option.id} value={option.id}>
@@ -371,14 +371,13 @@ export const HomeStage = memo(function HomeStage({
               <StripSection label="Parallel files" className="min-h-[140px]">
                 <div className="flex h-full flex-col justify-between gap-4">
                   <label htmlFor="parallel-files" className="block text-sm text-[var(--muted)]">
-                    <span className="sr-only">How many files analyze at once</span>
                     <select
                       id="parallel-files"
                       name="parallel-files"
                       aria-label="Choose how many files analyze at once"
                       value={parallelPreference}
                       onChange={(event) => onSetParallelPreference(event.target.value as ParallelLanesPreference)}
-                      className="h-11 w-full rounded-[18px] border border-[var(--control-line)] bg-[var(--surface-1)] px-3 text-[var(--ink)] outline-none transition-[border-color,background-color] duration-200 ease-out focus:border-[var(--accent)] focus-visible:ring-2 focus-visible:ring-[var(--accent)]"
+                      className="h-11 w-full rounded-[18px] border border-[var(--control-line)] bg-[var(--surface-1)] px-3 text-[var(--ink)] focus-visible:outline-hidden transition-[border-color,background-color] duration-200 ease-out focus:border-[var(--accent)] focus-visible:ring-2 focus-visible:ring-[var(--accent)]"
                     >
                       {PARALLEL_OPTIONS.map((option) => (
                         <option key={option.id} value={option.id}>

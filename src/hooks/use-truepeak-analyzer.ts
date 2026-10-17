@@ -36,6 +36,7 @@ import { getComplianceSummary } from "@/audio/compliance";
 import { shouldPreferBrowserDecoder } from "@/audio/browser-decode";
 import {
   DecodeResourceError,
+  LARGE_MEMORY_AGGREGATE_PEAK_BYTES,
   assertDecodedFootprint,
   assertSourceWithinBudget,
   checkedResourceByteSum,
@@ -83,7 +84,11 @@ import {
   persistRecentSessions,
 } from "@/session/persistence";
 import { DEFAULT_TARGET_PRESET } from "@/audio/presets";
-import { mergeImportedJobs, reconcileSessionJobs } from "@/audio/session-reconciliation";
+import {
+  freshRestoredJobs,
+  mergeImportedJobs,
+  reconcileSessionJobs,
+} from "@/audio/session-reconciliation";
 import { retargetAnalysisResult } from "@/audio/targeting";
 import { buildRecoveryNotice, composeJobError } from "@/lib/job-ui";
 import {
@@ -253,7 +258,7 @@ function importSessionInWorker(file: File) {
         callback();
       };
       const timeoutId = window.setTimeout(() => {
-        finish(() => reject(new Error("Session validation timed out.")));
+        finish(() => reject(new Error("Opening that session took too long. Try again, or choose a smaller session file.")));
       }, SESSION_IMPORT_TIMEOUT_MS);
 
       worker.onerror = (event) => {
@@ -262,8 +267,8 @@ function importSessionInWorker(file: File) {
           reject(
             new Error(
               event.message
-                ? `Session import worker failed: ${event.message}`
-                : "Session import worker failed.",
+                ? `TruePeak couldn't open that session: ${event.message}`
+                : "TruePeak couldn't open that session. Reload the page and try again.",
             ),
           ),
         );
@@ -348,25 +353,32 @@ export function resolveLaneLimit(preference: ParallelLanesPreference = "auto") {
   return limit;
 }
 
-// Files at or above this size run alone: peak memory while decoding/analyzing
-// is dominated by one file's PCM, so a multi-lane batch of very large masters
-// can't multiply that peak and take the tab down. Constrained devices use a
-// much lower bar — a 100 MB decode is already a big slice of a phone's budget.
+// Unknown-footprint sources at or above this size, and compatibility-route
+// jobs whose decoded PCM reaches it, run alone (see planLaneAdmission). Known
+// footprints on the browser and native routes are bounded by their aggregate
+// reservations instead. Constrained devices use a much lower bar — a 100 MB
+// decode is already a big slice of a phone's budget.
 export function resolveHeavyFileBytes() {
   const memory = deviceMemoryGb();
   const constrained = memory != null ? memory <= 4 : isCoarsePointerDevice();
   return (constrained ? 96 : 256) * 1024 * 1024;
 }
 
+// Capable devices get two conservative route peaks, capped at the fixed
+// large-tier aggregate so a bigger per-file tier cannot raise the batch-wide
+// ceiling. Constrained devices get one peak.
 export function resolveAggregatePeakBytes(budget: DecodeBudget) {
   const memory = deviceMemoryGb();
   const canHoldTwoPeakRoutes =
     memory != null ? memory >= 8 : !isCoarsePointerDevice();
   const singleRoutePeak = conservativeDecodePeakBytes(budget);
   return canHoldTwoPeakRoutes
-    ? checkedResourceByteSum(
-        [singleRoutePeak, singleRoutePeak],
-        "Aggregate decode route capacity",
+    ? Math.min(
+        checkedResourceByteSum(
+          [singleRoutePeak, singleRoutePeak],
+          "Aggregate decode route capacity",
+        ),
+        LARGE_MEMORY_AGGREGATE_PEAK_BYTES,
       )
     : singleRoutePeak;
 }
@@ -428,14 +440,14 @@ export function normalizeDecodeFailure(
     lower.includes("couldn't decode")
   ) {
     if (decodePreference === "browser-first") {
-      return "TruePeak couldn't read this file with the browser decoder or the compatibility decoder. Try Compatibility First in Advanced Options, or convert the file to WAV or AIFF.";
+      return "TruePeak couldn't read this file with the browser decoder or the compatibility decoder. Try Compatibility first in Advanced options, or convert the file to WAV or AIFF.";
     }
 
     if (decodePreference === "compatibility-first") {
-      return "TruePeak couldn't read this file with the compatibility decoder. Try Browser First in Advanced Options, or convert the file to WAV or AIFF.";
+      return "TruePeak couldn't read this file with the compatibility decoder. Try Browser first in Advanced options, or convert the file to WAV or AIFF.";
     }
 
-    return "TruePeak couldn't decode this file in the browser. Try Browser First or Compatibility First in Advanced Options, or convert the file to WAV or AIFF.";
+    return "TruePeak couldn't decode this file in the browser. Try Browser first or Compatibility first in Advanced options, or convert the file to WAV or AIFF.";
   }
 
   // Analysis-stage failures: the file decoded, but the PCM it produced was empty,
@@ -546,18 +558,25 @@ function persistenceFailureMessage(
     return null;
   }
 
-  const actionLabel =
-    action === "restore"
-      ? "restore the previous session"
-      : action === "save"
-        ? "save the recovery copy"
-        : action === "delete"
-          ? "update the recovery copy"
-          : "delete the recovery copy";
-  const retryCopy = result.retryExhausted
-    ? ` after ${result.attempts} attempts`
-    : "";
-  return `TruePeak could not ${actionLabel}${retryCopy}. ${outcome.message} Downloaded session files and report exports are unaffected.`;
+  return describePersistenceFailure(action, outcome.status === "blocked");
+}
+
+// Plain copy for each recovery-storage failure. The raw IndexedDB message stays
+// out of it: it is jargon, and the next step is the same whatever it says.
+function describePersistenceFailure(
+  action: "restore" | "save" | "delete" | "clear",
+  blocked: boolean,
+) {
+  switch (action) {
+    case "restore":
+      return `TruePeak couldn't restore your previous session from this browser. ${blocked ? "Close other TruePeak tabs, then reload." : "Reload to try again."}`;
+    case "save":
+      return `TruePeak couldn't save a recovery copy in this browser, so these results won't survive a reload. ${blocked ? "Export the session to keep them, then close other TruePeak tabs and reload." : "Export the session to keep them."}`;
+    case "delete":
+      return `TruePeak couldn't update the recovery copy in this browser, so removed files may come back after a reload. ${blocked ? "Close other TruePeak tabs. If they come back, remove them again." : "If they do, remove them again."}`;
+    case "clear":
+      return `The session was cleared, but TruePeak couldn't delete its recovery copy from this browser, so the results may come back after a reload. ${blocked ? "Close other TruePeak tabs. If they come back, clear the session again." : "If they do, clear the session again."}`;
+  }
 }
 
 export function useTruePeakAnalyzer(
@@ -581,6 +600,12 @@ export function useTruePeakAnalyzer(
   const setJobs = jobStore.set;
   const [recentSessions, setRecentSessions] = useState<RecentSessionEntry[]>([]);
   const [notice, setNotice] = useState<string | null>(null);
+  // Info the user still needs (a restore summary, skipped files). It never
+  // times out: it stays until dismissed or replaced by the next one.
+  const [persistentNotice, setPersistentNotice] = useState<string | null>(null);
+  // Failed user actions (import, export, clearing history) stay on screen
+  // until dismissed instead of expiring with the transient notice.
+  const [errorNotice, setErrorNotice] = useState<string | null>(null);
   const [persistenceIssue, setPersistenceIssue] = useState<string | null>(null);
   const [workerCircuitIssue, setWorkerCircuitIssue] = useState<string | null>(null);
   const [liveSessionController] = useState(() =>
@@ -709,7 +734,19 @@ export function useTruePeakAnalyzer(
   const completedJobs = completedSetChanged ? filteredCompletedJobs : stableCompletedJobs;
   const hasActiveJobs = useMemo(() => jobs.some(isActiveJob), [jobs]);
 
-  const pushNotice = useCallback((message: string | null) => {
+  const pushNotice = useCallback((
+    message: string | null,
+    tone: "info" | "lasting" | "error" = "info",
+  ) => {
+    if (tone === "error") {
+      setErrorNotice(message);
+      return;
+    }
+    if (tone === "lasting") {
+      setPersistentNotice(message);
+      return;
+    }
+
     setNotice(message);
     if (noticeTimeoutRef.current) {
       window.clearTimeout(noticeTimeoutRef.current);
@@ -720,9 +757,11 @@ export function useTruePeakAnalyzer(
       noticeTimeoutRef.current = window.setTimeout(() => {
         setNotice(null);
         noticeTimeoutRef.current = null;
-      }, 4200);
+      }, 6000);
     }
   }, []);
+  const dismissErrorNotice = useCallback(() => setErrorNotice(null), []);
+  const dismissPersistentNotice = useCallback(() => setPersistentNotice(null), []);
 
   const updateJob = useCallback(
     (jobId: string, updater: (job: AnalysisJob) => AnalysisJob) => {
@@ -1209,7 +1248,7 @@ export function useTruePeakAnalyzer(
   // it aborts browser work and rejects worker work, but the immutable lease is
   // retained until runJob's finally block observes that all decode work drained.
   const interruptLane = useCallback(
-    (lane: WorkerLane, reason = "Job canceled.") => {
+    (lane: WorkerLane, reason = "File canceled.") => {
       const lease = lane.lease;
       if (!lease) {
         return;
@@ -1297,7 +1336,8 @@ export function useTruePeakAnalyzer(
     // Devices with memory headroom get the larger per-job decode budget, so
     // high-resolution masters (24-bit 192 kHz runs well past 256 MiB of
     // decoded PCM) are not turned away on hardware that can hold them. The
-    // aggregate reservation cap below is derived from whichever tier applies.
+    // aggregate reservation cap below follows the tier but is capped at the
+    // fixed large-tier aggregate.
     decodeBudgetRef.current = resolveAdaptiveDecodeBudget(
       deviceMemoryGb(),
       isCoarsePointerDevice(),
@@ -1404,6 +1444,7 @@ export function useTruePeakAnalyzer(
 
     didRestoreRef.current = true;
     let cancelled = false;
+    let readSettled = false;
     const generation = restoreGenerationRef.current;
     const interruptedFileCount = readPendingAnalysisCount();
 
@@ -1439,7 +1480,7 @@ export function useTruePeakAnalyzer(
           interruptedFileCount,
         });
         if (recoveryNotice) {
-          pushNotice(recoveryNotice);
+          pushNotice(recoveryNotice, "lasting");
         }
         return;
       }
@@ -1456,8 +1497,7 @@ export function useTruePeakAnalyzer(
       // so this merge cannot append past MAX_SESSION_JOBS between calculation
       // and publication.
       const existingJobs = jobStore.getSnapshot();
-      const existingIds = new Set(existingJobs.map((job) => job.id));
-      const fresh = restoredJobs.filter((job) => !existingIds.has(job.id));
+      const fresh = freshRestoredJobs(existingJobs, restoredJobs);
       const intakePlan = planSessionIntake(existingJobs.length, fresh.length);
       const acceptedJobs = fresh.slice(0, intakePlan.accepted);
       if (!acceptedJobs.length) {
@@ -1468,7 +1508,7 @@ export function useTruePeakAnalyzer(
           interruptedFileCount,
         });
         if (recoveryNotice) {
-          pushNotice(recoveryNotice);
+          pushNotice(recoveryNotice, "lasting");
         }
         return;
       }
@@ -1488,15 +1528,14 @@ export function useTruePeakAnalyzer(
         overflowRecordCount: outcome.overflowRecordCount + intakePlan.turnedAway,
         interruptedFileCount,
       });
-      pushNotice(recoveryNotice);
-    }).catch((error: unknown) => {
+      pushNotice(recoveryNotice, "lasting");
+    }).catch(() => {
       if (cancelled || generation !== restoreGenerationRef.current) {
         return;
       }
 
-      const message = `TruePeak could not restore the previous session. ${error instanceof Error ? error.message : "Recovery storage failed unexpectedly."}`;
       persistenceFailureEpochRef.current += 1;
-      setPersistenceIssue(message);
+      setPersistenceIssue(describePersistenceFailure("restore", false));
     }).finally(() => {
       // Settled means "the restore has had its chance", success or not. Callers
       // that prune URL state against the job list have to wait for this: on the
@@ -1504,17 +1543,27 @@ export function useTruePeakAnalyzer(
       // ?job/?drawer/?reference for rows the restore is about to add back under
       // their original ids.
       //
-      // Deliberately NOT gated on `cancelled`. didRestoreRef makes this a
-      // once-per-mount read, so if an effect re-run were ever to cancel this
-      // instance (React StrictMode's double invoke, were it enabled) no later
-      // instance would issue another read, and a cancelled latch would leave
-      // pruning disabled for the rest of the session. The flag is one-way and
-      // only enables work, so setting it late is harmless.
-      setRestoreSettled(true);
+      // Gated on `cancelled`: a cancelled run re-arms didRestoreRef in its
+      // cleanup, so the run that replaces it issues its own read and sets the
+      // latch when that read lands. Setting it here would report "settled"
+      // while nothing had been restored.
+      readSettled = true;
+      if (!cancelled) {
+        setRestoreSettled(true);
+      }
     });
 
     return () => {
       cancelled = true;
+      // Next enables StrictMode in development, which runs this cleanup right
+      // after the first run and then runs the effect again with the same refs.
+      // This run's result is discarded, so re-arm the restore for the next run.
+      // Once a read has landed the restore stays once per mount. The deps are
+      // stable (the workbench passes restoreReady: true), so in production
+      // this cleanup only runs on unmount.
+      if (!readSettled) {
+        didRestoreRef.current = false;
+      }
     };
   }, [jobStore, liveSessionController, pushNotice, restoreReady, setJobs]);
 
@@ -2226,7 +2275,7 @@ export function useTruePeakAnalyzer(
           runToken,
           "decoding",
           Math.min(0.42, 0.18 + tick * 0.02),
-          "Still decoding locally - large files can take a moment",
+          "Still decoding locally — large files can take a moment",
         );
       }, 4500);
     },
@@ -2421,10 +2470,12 @@ export function useTruePeakAnalyzer(
     if (skippedParts.length && nextJobs.length) {
       pushNotice(
         `Added ${nextJobs.length} file${nextJobs.length === 1 ? "" : "s"} and skipped ${skippedParts.join(" and ")}.`,
+        "lasting",
       );
     } else if (skippedParts.length) {
       pushNotice(
         `Skipped ${skippedParts.join(" and ")}.`,
+        "lasting",
       );
     } else if (nextJobs.length) {
       pushNotice(
@@ -2447,7 +2498,7 @@ export function useTruePeakAnalyzer(
 
     const lane = laneByJobRef.current.get(jobId);
     if (lane) {
-      interruptLane(lane, "Job canceled.");
+      interruptLane(lane, "File canceled.");
     }
 
     fillLanesRef.current();
@@ -2472,7 +2523,7 @@ export function useTruePeakAnalyzer(
 
     lanesRef.current.forEach((lane) => {
       if (lane.lease !== null && activeIds.has(lane.lease.jobId)) {
-        interruptLane(lane, "Jobs canceled.");
+        interruptLane(lane, "Files canceled.");
       }
     });
 
@@ -2574,7 +2625,7 @@ export function useTruePeakAnalyzer(
     invalidateJobRun(jobId);
     const lane = laneByJobRef.current.get(jobId);
     if (lane) {
-      interruptLane(lane, "Job removed.");
+      interruptLane(lane, "File removed.");
     }
 
     dropJobResources(jobId);
@@ -2624,6 +2675,8 @@ export function useTruePeakAnalyzer(
     pendingAnalysisCountRef.current = 0;
     writePendingAnalysisCount(0);
     setWorkerCircuitIssue(null);
+    // A restore or skipped-files summary describes the session being cleared.
+    setPersistentNotice(null);
     setJobs(() => {
       return [];
     });
@@ -2631,8 +2684,7 @@ export function useTruePeakAnalyzer(
       const failure = persistenceFailureMessage(controllerResult, "clear");
       if (failure) {
         persistenceFailureEpochRef.current += 1;
-        const message = `The visible session was cleared, but its browser recovery copy may remain. ${failure}`;
-        setPersistenceIssue(message);
+        setPersistenceIssue(failure);
         return;
       }
 
@@ -2640,10 +2692,9 @@ export function useTruePeakAnalyzer(
         setPersistenceIssue(null);
         pushNotice("Cleared the current analysis session and its browser recovery copy.");
       }
-    }).catch((error: unknown) => {
+    }).catch(() => {
       persistenceFailureEpochRef.current += 1;
-      const message = `The visible session was cleared, but its browser recovery copy could not be deleted. ${error instanceof Error ? error.message : "Recovery storage failed unexpectedly."}`;
-      setPersistenceIssue(message);
+      setPersistenceIssue(describePersistenceFailure("clear", false));
     });
   }, [interruptLane, liveSessionController, pushNotice, setJobs]);
 
@@ -2656,6 +2707,7 @@ export function useTruePeakAnalyzer(
 
     pushNotice(
       "TruePeak could not clear saved history from this browser. The existing history remains visible.",
+      "error",
     );
     return false;
   }, [pushNotice]);
@@ -2668,7 +2720,7 @@ export function useTruePeakAnalyzer(
         "text/csv;charset=utf-8",
       );
     } catch {
-      pushNotice("The browser blocked the CSV download. Try again or use another export format.");
+      pushNotice("The browser blocked the CSV download. Try again or use another export format.", "error");
     }
   }, [jobStore, pushNotice]);
   const exportJson = useCallback(() => {
@@ -2679,7 +2731,7 @@ export function useTruePeakAnalyzer(
         "application/json;charset=utf-8",
       );
     } catch {
-      pushNotice("The browser blocked the JSON download. Try again or use another export format.");
+      pushNotice("The browser blocked the JSON download. Try again or use another export format.", "error");
     }
   }, [jobStore, pushNotice]);
   const exportMarkdown = useCallback(() => {
@@ -2690,7 +2742,7 @@ export function useTruePeakAnalyzer(
         "text/markdown;charset=utf-8",
       );
     } catch {
-      pushNotice("The browser blocked the Markdown report download. Try again or use another export format.");
+      pushNotice("The browser blocked the Markdown report download. Try again or use another export format.", "error");
     }
   }, [jobStore, pushNotice]);
 
@@ -2706,6 +2758,7 @@ export function useTruePeakAnalyzer(
         error instanceof Error
           ? error.message
           : "The browser blocked the session download. Try again.",
+        "error",
       );
     }
   }, [jobStore, pushNotice]);
@@ -2713,7 +2766,7 @@ export function useTruePeakAnalyzer(
   const importSession = useCallback(
     async (file: File) => {
       if (file.size > MAX_SESSION_FILE_BYTES) {
-        pushNotice("That session file is too large to import safely.");
+        pushNotice("That session file is too large to import safely.", "error");
         return 0;
       }
 
@@ -2724,14 +2777,15 @@ export function useTruePeakAnalyzer(
         pushNotice(
           error instanceof Error
             ? error.message
-            : "Could not read or validate that session file.",
+            : "That file isn't a TruePeak session, or it's damaged. Choose a session file exported from TruePeak.",
+          "error",
         );
         return 0;
       }
 
       const { jobs: importedJobs, error } = importResult;
       if (error || !importedJobs.length) {
-        pushNotice(error ?? "No analyses were found in that session file.");
+        pushNotice(error ?? "No analyses were found in that session file.", "error");
         return 0;
       }
 
@@ -2751,7 +2805,8 @@ export function useTruePeakAnalyzer(
         pushNotice(
           skippedOverCap
             ? `This session is already at the ${MAX_SESSION_JOBS}-file limit, so no analyses were imported.`
-            : "Those analyses are already in this session.",
+            : `Added 0 files. Skipped ${skippedDuplicates} already in this session.`,
+          "lasting",
         );
         return 0;
       }
@@ -2769,7 +2824,7 @@ export function useTruePeakAnalyzer(
       });
 
       const skippedParts = [
-        skippedDuplicates ? `${skippedDuplicates} already present` : null,
+        skippedDuplicates ? `${skippedDuplicates} already in this session` : null,
         skippedOverCap
           ? `${skippedOverCap} over the ${MAX_SESSION_JOBS}-file session limit`
           : null,
@@ -2779,6 +2834,7 @@ export function useTruePeakAnalyzer(
         skippedParts.length
           ? `Loaded ${added} file${added === 1 ? "" : "s"} from the session (${skippedParts.join(", ")}).`
           : `Loaded ${added} file${added === 1 ? "" : "s"} from the saved session.`,
+        skippedParts.length ? "lasting" : "info",
       );
       return added;
     },
@@ -2792,6 +2848,10 @@ export function useTruePeakAnalyzer(
     restoreSettled,
     recentSessions,
     notice,
+    errorNotice,
+    dismissErrorNotice,
+    persistentNotice,
+    dismissPersistentNotice,
     persistenceIssue,
     workerCircuitIssue,
     parallelLimit,

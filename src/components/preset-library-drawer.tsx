@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useLayoutEffect, useRef, useState, type FormEvent } from "react";
+import { memo, useEffect, useLayoutEffect, useRef, useState, type FormEvent } from "react";
 import { Check, ChevronLeft, ChevronRight } from "lucide-react";
 import { CUSTOM_PRESET_ID, TARGET_PRESETS, type TargetDraftErrors } from "@/audio/presets";
 import { DrawerPanel } from "@/components/drawer-panel";
@@ -19,9 +19,9 @@ import type { TargetPreset } from "@/types/audio";
 // Field errors listed in DOM/visual order so the summary and first-error focus
 // walk them the same way the eye does.
 const ERROR_FIELDS: Array<{ key: TargetFieldKey; name: string; label: string }> = [
-  { key: "customTargetLufs", name: "custom-target-lufs", label: "Loudness Target" },
-  { key: "customTruePeak", name: "custom-true-peak", label: "True Peak Limit" },
-  { key: "toleranceLufs", name: "target-tolerance", label: "Target Tolerance" },
+  { key: "customTargetLufs", name: "custom-target-lufs", label: "Loudness target" },
+  { key: "customTruePeak", name: "custom-true-peak", label: "True peak limit" },
+  { key: "toleranceLufs", name: "target-tolerance", label: "Target tolerance" },
 ];
 
 /**
@@ -63,7 +63,7 @@ interface PresetLibraryDrawerProps {
   onResetToPublished: () => void;
 }
 
-export function PresetLibraryDrawer({
+export const PresetLibraryDrawer = memo(function PresetLibraryDrawer({
   open,
   onClose,
   activeTarget,
@@ -93,7 +93,9 @@ export function PresetLibraryDrawer({
   const [focusTick, setFocusTick] = useState(0);
 
   const rootRef = useRef<HTMLDivElement | null>(null);
-  const listScrollRef = useRef<HTMLDivElement | null>(null);
+  // List scroll position kept across the narrow step flow. Below 44rem the
+  // drawer body (the root's parent) scrolls the whole column and the panes
+  // don't scroll on their own, so that is the scroller it reads and restores.
   const listScrollTopRef = useRef(0);
   const pendingFocusRef = useRef<string | null>(null);
   // Which pane should receive focus after a narrow-layout step change. Switching
@@ -109,6 +111,11 @@ export function PresetLibraryDrawer({
   const hasFieldErrors = ERROR_FIELDS.some((field) => fieldErrors?.[field.key]);
   const [touched, setTouched] = useState<Partial<Record<TargetFieldKey, boolean>>>({});
   const [applyAttempted, setApplyAttempted] = useState(false);
+  // Bumped on every invalid submit, so a repeat attempt moves focus to the
+  // first error again even though `applyAttempted` is already true.
+  const [applyAttemptTick, setApplyAttemptTick] = useState(0);
+  // Polite confirmation after a successful Apply; cleared by the next edit.
+  const [appliedMessage, setAppliedMessage] = useState<string | null>(null);
   const displayedErrors = ERROR_FIELDS.filter(
     (field) => fieldErrors?.[field.key] && (applyAttempted || touched[field.key]),
   );
@@ -122,9 +129,16 @@ export function PresetLibraryDrawer({
     event.preventDefault();
     if (!draftIsValid) {
       setApplyAttempted(true);
+      setApplyAttemptTick((tick) => tick + 1);
+      // Narrow layout: the fields live on the detail step, so show it before
+      // the first-error focus below looks for a visible field.
+      setMobileView("detail");
       return;
     }
     onApply();
+    if (draftIsDirty) {
+      setAppliedMessage(`Applied ${applyLabel}.`);
+    }
   };
 
   // Reset touched/apply-attempt state whenever the drawer closes or the
@@ -133,7 +147,15 @@ export function PresetLibraryDrawer({
   useEffect(() => {
     setTouched({});
     setApplyAttempted(false);
+    setAppliedMessage(null);
   }, [open, selectedPresetId]);
+
+  // A new edit makes the "Applied" confirmation stale.
+  useEffect(() => {
+    if (draftIsDirty) {
+      setAppliedMessage(null);
+    }
+  }, [draftIsDirty]);
 
   // `initialFocusError` is a one-shot, caller-driven "open at the first error"
   // signal (UX-008) - kept in a ref so the open effect below can read its
@@ -176,12 +198,13 @@ export function PresetLibraryDrawer({
       }
     }, 80);
     return () => window.clearTimeout(timer);
-  }, [applyAttempted]);
+  }, [applyAttempted, applyAttemptTick]);
 
   // Restore the preserved list scroll position when returning to it (mobile).
   useLayoutEffect(() => {
-    if (mobileView === "list" && listScrollRef.current) {
-      listScrollRef.current.scrollTop = listScrollTopRef.current;
+    const scroller = rootRef.current?.parentElement;
+    if (mobileView === "list" && scroller) {
+      scroller.scrollTop = listScrollTopRef.current;
     }
   }, [mobileView]);
 
@@ -206,6 +229,12 @@ export function PresetLibraryDrawer({
     if (!step) {
       return;
     }
+    // Only move focus when the step change actually hid the focused control.
+    const active = document.activeElement;
+    if (active instanceof HTMLElement && rootRef.current?.contains(active) && active.offsetParent !== null) {
+      pendingStepFocusRef.current = null;
+      return;
+    }
     const target =
       step === "detail"
         ? detailHeadingRef.current
@@ -226,7 +255,7 @@ export function PresetLibraryDrawer({
 
   const handleSelect = (presetId: string, viaPointer: boolean) => {
     // Preserve list scroll before the row navigates to detail on mobile.
-    listScrollTopRef.current = listScrollRef.current?.scrollTop ?? 0;
+    listScrollTopRef.current = rootRef.current?.parentElement?.scrollTop ?? 0;
     onSelectPreset(presetId);
     // Only a pointer activation advances the step. Native radio arrow keys also
     // fire change, and advancing on those hid the pane holding the focused radio
@@ -234,12 +263,17 @@ export function PresetLibraryDrawer({
     // at all. Keyboard users reach the detail step through the explicit button
     // rendered below the list instead.
     if (viaPointer) {
+      // Below 44rem the tapped radio keeps focus while the list is hidden, so
+      // land focus on the detail step. At wide widths the radio stays visible
+      // and the step-focus effect leaves focus where it is.
+      pendingStepFocusRef.current = "detail";
       setMobileView("detail");
+      setFocusTick((tick) => tick + 1);
     }
   };
 
   const showDetailStep = () => {
-    listScrollTopRef.current = listScrollRef.current?.scrollTop ?? 0;
+    listScrollTopRef.current = rootRef.current?.parentElement?.scrollTop ?? 0;
     pendingStepFocusRef.current = "detail";
     setMobileView("detail");
     setFocusTick((tick) => tick + 1);
@@ -253,7 +287,7 @@ export function PresetLibraryDrawer({
 
   const selectedPreset = TARGET_PRESETS.find((preset) => preset.id === selectedPresetId);
   const applyLabel =
-    selectedPresetId === CUSTOM_PRESET_ID ? "Custom Target" : selectedPreset?.label ?? "Preset";
+    selectedPresetId === CUSTOM_PRESET_ID ? "Custom target" : selectedPreset?.label ?? "Preset";
 
   const previewNote =
     draftIsDirty && draftIsValid && !hasFieldErrors ? (
@@ -267,16 +301,23 @@ export function PresetLibraryDrawer({
     <DrawerPanel
       open={open}
       onClose={onClose}
-      title="Loudness Presets"
+      title="Loudness presets"
       description="Compare published guidance, playback references, and TruePeak recommendations. Apply one to the current session."
       mobileMode="full"
       desktopClassName="lg:w-[min(960px,96vw)]"
     >
-      <div ref={rootRef} className="@container flex h-full min-h-0 flex-col overflow-hidden">
+      {/* Below 44rem the drawer body scrolls this whole column, with a sticky
+          footer, so no pane can be squeezed to nothing on a short screen or
+          at high zoom. From 44rem the column is held to the drawer height and
+          the two panes scroll on their own. The master/detail row's
+          @[44rem]:basis-0 keeps it from growing the column past min-h-full;
+          a container cannot query its own width, so the switch lives on the
+          children. */}
+      <div ref={rootRef} className="@container flex min-h-full flex-col">
         {/* Single compact Active Preset summary (UX-007). */}
         <div className="shrink-0 border-b border-[var(--line)] pb-4">
           <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5 rounded-2xl border border-[color:var(--accent)]/20 bg-[color:var(--accent-soft)] px-4 py-2.5">
-            <span className="text-[11px] font-semibold uppercase tracking-[0.18em] text-[var(--muted)]">
+            <span className="text-[0.6875rem] font-semibold uppercase tracking-[0.18em] text-[var(--muted)]">
               Active
             </span>
             <span className="text-sm font-semibold text-[var(--ink)]">{activeTarget.label}</span>
@@ -293,7 +334,7 @@ export function PresetLibraryDrawer({
             time the drawer is open so aria-live="polite" reliably announces
             new errors, and only shows errors for touched fields or after an
             Apply attempt - never merely because they exist. */}
-        <div aria-live="polite" className="shrink-0 empty:hidden">
+        <div aria-live="polite" className="shrink-0">
           {hasDisplayedErrors ? (
             <div className="mt-4 rounded-2xl border tone-danger px-4 py-3">
               <div className="text-sm font-semibold">Fix these settings to apply</div>
@@ -306,7 +347,7 @@ export function PresetLibraryDrawer({
                     <button
                       type="button"
                       onClick={() => requestFieldFocus(field.name)}
-                      className="text-left text-sm underline underline-offset-2 hover:no-underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--danger)]"
+                      className="text-left text-sm underline underline-offset-2 hover:no-underline focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-[var(--danger)]"
                     >
                       {field.label}: {fieldErrors?.[field.key]}
                     </button>
@@ -323,7 +364,7 @@ export function PresetLibraryDrawer({
             <button
               type="button"
               onClick={handleBack}
-              className="-ml-2 inline-flex min-h-11 items-center gap-1.5 rounded-full px-2 py-1 text-sm font-semibold text-[var(--accent-text)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)]"
+              className="-ml-2 inline-flex min-h-11 items-center gap-1.5 rounded-full px-2 py-1 text-sm font-semibold text-[var(--accent-text)] transition-[scale] duration-150 ease-out motion-safe:active:scale-[0.97] focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-[var(--accent)]"
             >
               <ChevronLeft className="h-4 w-4" aria-hidden="true" />
               All presets
@@ -332,13 +373,12 @@ export function PresetLibraryDrawer({
         ) : null}
 
         {/* Master / detail. Container-query driven, never viewport (UX-002). */}
-        <div className="mt-4 flex min-h-0 flex-1 flex-col @[44rem]:flex-row @[44rem]:gap-5">
+        <div className="mt-4 flex flex-1 flex-col @[44rem]:min-h-0 @[44rem]:basis-0 @[44rem]:flex-row @[44rem]:gap-5">
           <PresetListPane
             selectedPresetId={selectedPresetId}
             onSelect={handleSelect}
-            scrollRef={listScrollRef}
             className={cn(
-              "min-h-0 flex-1 @[44rem]:w-80 @[44rem]:flex-none",
+              "flex-1 @[44rem]:min-h-0 @[44rem]:w-80 @[44rem]:flex-none @[44rem]:overflow-y-auto @[44rem]:overscroll-contain",
               mobileView === "detail" ? "hidden @[44rem]:block" : "block",
             )}
           />
@@ -361,7 +401,7 @@ export function PresetLibraryDrawer({
             onSubmit={handleDetailSubmit}
             headingRef={detailHeadingRef}
             className={cn(
-              "min-h-0 flex-1",
+              "flex-1 @[44rem]:min-h-0 @[44rem]:overflow-y-auto @[44rem]:overscroll-contain",
               mobileView === "list" ? "hidden @[44rem]:block" : "block",
             )}
           />
@@ -386,18 +426,32 @@ export function PresetLibraryDrawer({
           </div>
         ) : null}
 
-        {/* Polite status region for the valid-but-unapplied preview (UX-004). */}
-        <div aria-live="polite" className="shrink-0 empty:hidden">
+        {/* Polite status region for the valid-but-unapplied preview (UX-004)
+            and the confirmation after a successful Apply. */}
+        <div aria-live="polite" className="shrink-0">
           {previewNote ? <div className="mt-4">{previewNote}</div> : null}
+          {appliedMessage ? (
+            <p className="mt-4 text-sm text-[var(--muted)]">{appliedMessage}</p>
+          ) : null}
         </div>
 
-        {/* Sticky action footer with safe-area padding (UX redesign). */}
-        <div className="mt-4 flex shrink-0 items-center gap-2 border-t border-[var(--line)] pt-4 pb-[max(0px,env(safe-area-inset-bottom))] @[30rem]:justify-end">
+        {/* Sticky action footer with safe-area padding (UX redesign). It only
+            sticks when the drawer body scrolls (below 44rem, or a very short
+            drawer); there its own bottom padding stands in for the body's. */}
+        <div className="sticky bottom-0 mt-4 flex shrink-0 items-center gap-2 border-t border-[var(--line)] bg-[var(--surface-1)] pt-4 pb-[max(1rem,env(safe-area-inset-bottom))] @[30rem]:justify-end @[44rem]:pb-[max(0px,env(safe-area-inset-bottom))]">
+          {/* aria-disabled, not disabled: Cancel and Apply both make the draft
+              clean, and a native disabled button would drop keyboard focus to
+              <body> mid-click. An invalid draft still submits, so the form's
+              handler can show and focus the errors. */}
           <Button
             type="button"
             variant="secondary"
-            onClick={onCancel}
-            disabled={!draftIsDirty}
+            onClick={() => {
+              if (draftIsDirty) {
+                onCancel();
+              }
+            }}
+            aria-disabled={!draftIsDirty}
             className="flex-1 @[30rem]:flex-none"
           >
             Cancel
@@ -405,8 +459,13 @@ export function PresetLibraryDrawer({
           <Button
             type="submit"
             form={PRESET_TARGET_FORM_ID}
-            disabled={!draftIsDirty || !draftIsValid}
-            className="min-w-0 flex-1 whitespace-normal text-balance @[30rem]:flex-none"
+            onClick={(event) => {
+              if (!draftIsDirty) {
+                event.preventDefault();
+              }
+            }}
+            aria-disabled={!draftIsDirty}
+            className="h-auto min-h-11 min-w-0 flex-1 whitespace-normal py-2 text-balance @[30rem]:flex-none"
           >
             <Check className="h-4 w-4 shrink-0" aria-hidden="true" />
             Apply {applyLabel}
@@ -415,4 +474,4 @@ export function PresetLibraryDrawer({
       </div>
     </DrawerPanel>
   );
-}
+});

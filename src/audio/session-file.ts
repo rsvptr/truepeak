@@ -747,6 +747,31 @@ export function downsampleTimeline(
   };
 }
 
+const roundTo = (value: number, scale: number) => Math.round(value * scale) / scale;
+const roundLevel = (value: number | null) => (value === null ? null : roundTo(value, 100));
+
+// Timeline samples are float32 values that JSON would otherwise print as
+// 17-digit doubles. LUFS/dBTP to 0.01 and times to the millisecond keep a large
+// session several times smaller. The final time never rounds later than its
+// source, so the importer's end-time bound still holds; a series too dense for
+// millisecond times keeps its source times so it stays strictly increasing.
+function roundPortableTimeline(timeline: PortableAnalysisTimeline): PortableAnalysisTimeline {
+  const lastIndex = timeline.timeSeconds.length - 1;
+  const roundedTimes = timeline.timeSeconds.map((time, index) =>
+    index === lastIndex ? Math.min(time, roundTo(time, 1000)) : roundTo(time, 1000),
+  );
+  const strictlyIncreasing = roundedTimes.every(
+    (time, index) => index === 0 || Math.fround(time) > Math.fround(roundedTimes[index - 1]),
+  );
+  return {
+    stepDurationSeconds: timeline.stepDurationSeconds,
+    timeSeconds: strictlyIncreasing ? roundedTimes : timeline.timeSeconds,
+    momentaryLufs: timeline.momentaryLufs.map(roundLevel),
+    shortTermLufs: timeline.shortTermLufs.map(roundLevel),
+    truePeakDbtp: timeline.truePeakDbtp.map((value) => roundTo(value, 100)),
+  };
+}
+
 export function buildSessionFile(jobs: AnalysisJob[]): string {
   const completed = jobs.filter(
     (job): job is AnalysisJob & { result: AnalysisResult } => job.result != null,
@@ -774,7 +799,9 @@ export function buildSessionFile(jobs: AnalysisJob[]): string {
   );
 
   const portableJobs: PortableSessionJob[] = completed.map((job, index) => {
-    const timeline = downsampleTimeline(normalizedTimelines[index], allocations[index]);
+    const timeline = roundPortableTimeline(
+      downsampleTimeline(normalizedTimelines[index], allocations[index]),
+    );
     const wasDownsampled = timeline.timeSeconds.length < normalizedTimelines[index].timeSeconds.length;
     const candidate = {
       id: job.id,
@@ -832,7 +859,7 @@ export function buildSessionFile(jobs: AnalysisJob[]): string {
     jobCount: portableJobs.length,
     jobs: portableJobs,
   };
-  const serialized = JSON.stringify(payload, null, 2);
+  const serialized = JSON.stringify(payload);
   const byteLength = new Blob([serialized]).size;
   if (byteLength > MAX_SESSION_FILE_BYTES) {
     throw new SessionExportError(
@@ -890,7 +917,7 @@ export function parseSessionFile(
   if (envelope.version !== LEGACY_SESSION_VERSION && envelope.version !== SESSION_VERSION) {
     return {
       jobs: [],
-      error: "This session file uses an unsupported version.",
+      error: "This session file uses an unsupported version. Export it again from the current version of TruePeak, then open it.",
     };
   }
   const sourceVersion = envelope.version as 1 | 2;
@@ -915,7 +942,7 @@ export function parseSessionFile(
     return {
       jobs: [],
       sourceVersion,
-      error: "The session job count does not match its analyses.",
+      error: "This session file is damaged or was edited by hand. Export it again from TruePeak, then open it.",
     };
   }
 

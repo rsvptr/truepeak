@@ -106,10 +106,10 @@ export function subscribeLiveSessionPersistence(
             persistedResults.current.delete(job.id);
           }
         });
-      }).catch((error: unknown) => {
+      }).catch(() => {
         persistenceFailureEpoch.current += 1;
         setIssue(
-          `TruePeak could not save the recovery copy. ${error instanceof Error ? error.message : "Recovery storage failed unexpectedly."}`,
+          "TruePeak could not save the recovery copy. Export the session to keep these results.",
         );
         toSave.forEach((job) => {
           if (persistedResults.current.get(job.id) === job.result!.analyzedAt) {
@@ -143,10 +143,10 @@ export function subscribeLiveSessionPersistence(
             persistedResults.current.set(jobId, analyzedAt);
           }
         });
-      }).catch((error: unknown) => {
+      }).catch(() => {
         persistenceFailureEpoch.current += 1;
         setIssue(
-          `TruePeak could not update the recovery copy. ${error instanceof Error ? error.message : "Recovery storage failed unexpectedly."}`,
+          "TruePeak could not update the recovery copy. Export the session to keep these results.",
         );
         previousMarks.forEach((analyzedAt, jobId) => {
           if (analyzedAt != null && !persistedResults.current.has(jobId)) {

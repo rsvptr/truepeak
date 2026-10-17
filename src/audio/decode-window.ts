@@ -163,8 +163,8 @@ export function createCountingSemaphore(capacity: number): CountingSemaphore {
  * peak (the AudioBuffer plus its planar copy = 2x maxDecodedBytes), so the
  * window admits `floor(aggregate / browserPeak)` of them, never fewer than one
  * (a constrained device whose aggregate holds a single route still decodes one
- * file at a time). On the capable large tier the aggregate holds two
- * conservative routes, so this resolves to 2; constrained devices get 1. Pure
+ * file at a time). On the capable large tier this resolves to 2; constrained
+ * devices get 1. Pure
  * so the capacity rule is testable outside the DOM.
  */
 export function browserDecodeWindowCapacity(

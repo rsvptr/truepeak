@@ -197,7 +197,7 @@ test("render smoke covers actionable errors, view-only hints, paused rows, circu
       60,
       "the simple queue should mount at most one 60-row window",
     );
-    assert.ok(scaleHtml.includes("Showing 1-60 of 61 files"));
+    assert.ok(scaleHtml.includes("Showing 1–60 of 61 files"));
 
     const errorDisplay = getJobErrorDisplay(actionableLimitError);
     assert.ok(errorDisplay?.summary.includes("Try a smaller file"));
@@ -277,7 +277,7 @@ test("render smoke covers actionable errors, view-only hints, paused rows, circu
       interruptedFileCount: 4,
     });
     assert.ok(recoveryNotice?.includes("Restored 2 view-only results"));
-    assert.ok(recoveryNotice?.includes("quarantined and not restored"));
+    assert.ok(recoveryNotice?.includes("unreadable and not restored"));
     assert.ok(recoveryNotice?.includes("4 files were still queued or running"));
 
     // The panel takes its job and commands from the workspace providers. It

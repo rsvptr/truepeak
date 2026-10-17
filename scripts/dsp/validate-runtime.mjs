@@ -910,6 +910,27 @@ try {
   );
 }
 
+// The two real-world FLACs refused on the old 1 GiB large tier: 11:51 and
+// 13:33 of stereo 192 kHz (136,474,804 and 156,057,600 frames, so 1,091,798,432
+// and 1,248,460,800 decoded float32 bytes). Both must pass the large tier and
+// still be rejected on the conservative tier.
+const longHiResFootprints = [
+  { frameCount: 136_474_804, decodedBytes: 1_091_798_432 },
+  { frameCount: 156_057_600, decodedBytes: 1_248_460_800 },
+];
+for (const { frameCount, decodedBytes } of longHiResFootprints) {
+  const footprint = { frameCount, channelCount: 2, sampleRate: 192_000 };
+  ok(
+    `${frameCount.toLocaleString("en-GB")}-frame stereo 192 kHz footprint passes the large tier`,
+    assertDecodedFootprint(footprint, capableBudget).decodedBytes === decodedBytes,
+  );
+  throwsCode(
+    `${frameCount.toLocaleString("en-GB")}-frame stereo 192 kHz footprint is still rejected on the conservative tier`,
+    "decoded-budget-exceeded",
+    () => assertDecodedFootprint(footprint, constrainedBudget),
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Parallel admission. Header-slice preflight must classify large PCM masters
 // without reading the whole file, known-footprint FLAC must reserve its exact
@@ -980,10 +1001,8 @@ ok(
 );
 
 const capable = resolveAdaptiveDecodeBudget(8, false);
-const aggregateCapable = checkedResourceByteSum([
-  conservativeDecodePeakBytes(capable),
-  conservativeDecodePeakBytes(capable),
-]);
+const aggregateCapable = withDeviceEnvironment(8, false, () =>
+  resolveAggregatePeakBytes(capable));
 const heavyBytes = 256 * 1024 * 1024;
 const hiResDecodedBytes = checkedDecodedBytes(hiResFrames, 2);
 
@@ -1098,6 +1117,52 @@ throwsCode("probe field validation rejects frame counts below duration", "invali
     capable,
   ));
 
+// Real STREAMINFO values from FLACs that were falsely rejected: the preflight
+// derives durationSeconds = frameCount / sampleRate, and multiplying back lands
+// a hair above the integer count, so a ceil-based coverage check refused them.
+const roundTripStreamInfo = [
+  { name: "ZZ Top - Legs", sampleRate: 44_100, bitDepth: 16, frameCount: 12_079_284 },
+  { name: "Avicii - The Nights", sampleRate: 44_100, bitDepth: 16, frameCount: 7_790_638 },
+  { name: "Dan Romer", sampleRate: 48_000, bitDepth: 24, frameCount: 12_388_599 },
+  { name: "Boston - More Than a Feeling", sampleRate: 88_200, bitDepth: 24, frameCount: 25_139_328 },
+  { name: "AC/DC - Back in Black", sampleRate: 96_000, bitDepth: 24, frameCount: 24_576_011 },
+  { name: "Green Day - American Idiot", sampleRate: 192_000, bitDepth: 24, frameCount: 33_540_304 },
+];
+for (const entry of roundTripStreamInfo) {
+  const { sampleRate, frameCount } = entry;
+  const preflight = inspectAudioContainer(
+    encodeFlacHeader(sampleRate, 2, entry.bitDepth, frameCount),
+  );
+  let accepted = false;
+  try {
+    const validated = validateDecodeProbeMetadata(
+      { ...requirePreflight(preflight, entry.name) },
+      capable,
+      "FLAC STREAMINFO",
+    );
+    accepted = validated.frameCount === frameCount;
+  } catch {
+    accepted = false;
+  }
+  ok(
+    `probe coverage accepts a duration derived from its own frame count (${entry.name}, ${sampleRate} Hz)`,
+    preflight?.durationSeconds === frameCount / sampleRate &&
+      Math.ceil((frameCount / sampleRate) * sampleRate) > frameCount &&
+      accepted,
+  );
+}
+throwsCode("probe coverage still rejects one frame short of a derived duration", "invalid-metadata", () =>
+  validateDecodeProbeMetadata(
+    {
+      sampleRate: 44_100,
+      channelCount: 2,
+      frameCount: 12_079_284 - 1,
+      durationSeconds: 12_079_284 / 44_100,
+      codecName: "FLAC",
+    },
+    capable,
+  ));
+
 const heavyDecodedFrames = heavyBytes / Float32Array.BYTES_PER_ELEMENT;
 const heavyProbedCompatibility = planLaneAdmission({
   fileSizeBytes: 24 * 1024 * 1024,
@@ -1180,8 +1245,8 @@ ok(
   ) === 6,
 );
 ok(
-  "unknown-footprint jobs run two at once on a capable device",
-  countAdmissions(mp3Admission.reservationPeakBytes, aggregateCapable, 3) === 2,
+  "unknown-footprint jobs run one at a time under the capped capable aggregate",
+  countAdmissions(mp3Admission.reservationPeakBytes, aggregateCapable, 3) === 1,
 );
 const constrained = resolveAdaptiveDecodeBudget(4, true);
 ok(
@@ -1203,7 +1268,7 @@ ok(
 console.log("\n[J] Reservation contention classification");
 
 const capablePeak = conservativeDecodePeakBytes(capable);
-const capableAggregate = checkedResourceByteSum([capablePeak, capablePeak]);
+const capableAggregate = aggregateCapable;
 
 ok(
   "a conservative route that fits the empty aggregate is transient contention",
@@ -1227,8 +1292,8 @@ ok(
 throwsCode("contention classification validates its inputs", "invalid-metadata", () =>
   classifyReservationContention(0, capableAggregate));
 
-// End to end with the aggregate model: a full two-route aggregate rejects a
-// further conservative route, and that rejection classifies as retryable
+// End to end with the aggregate model: a full aggregate rejects a further
+// conservative route, and that rejection classifies as retryable
 // contention (the reservation would fit an empty batch) rather than a permanent
 // over-budget. This mirrors the hook flipping a job back to "queued" instead of
 // failing it when >=2 browser-first files contend for the fallback reservation.

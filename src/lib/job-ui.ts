@@ -70,7 +70,7 @@ export function describeJobBadges(
     badges.push({ key: "target", label: job.result.target.label });
   }
   if (analysisMode === "measure-only" && job.result) {
-    badges.push({ key: "measure-only", label: "Measure Only" });
+    badges.push({ key: "measure-only", label: "Measure only" });
   }
   if (job.result?.metadata.decoderLabel) {
     badges.push({
@@ -205,7 +205,7 @@ export function buildRecoveryNotice({
       ? `Restored ${restoredCount} view-only result${restoredCount === 1 ? "" : "s"} from your last session. Add the source ${restoredCount === 1 ? "file" : "files"} again to re-analyze.`
       : null,
     invalidRecordCount > 0
-      ? `${invalidRecordCount} invalid saved recovery record${invalidRecordCount === 1 ? " was" : "s were"} quarantined and not restored.`
+      ? `${invalidRecordCount} invalid saved recovery record${invalidRecordCount === 1 ? " was" : "s were"} unreadable and not restored.`
       : null,
     interruptedFileCount > 0
       ? `${interruptedFileCount} file${interruptedFileCount === 1 ? " was" : "s were"} still queued or running and must be added again.`

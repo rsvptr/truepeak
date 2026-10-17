@@ -3,7 +3,7 @@ import type { TargetPreset } from "@/types/audio";
 export const TARGET_PRESETS: TargetPreset[] = [
   {
     id: "streaming-standard",
-    label: "Streaming Standard",
+    label: "Streaming standard",
     category: "platform",
     evidence: "inferred",
     sourceLabel: "Cross-platform house preset",
@@ -308,13 +308,13 @@ function dbtpLabel(value: number): string {
 export const GAIN_POLICIES: readonly GainPolicyDefinition[] = [
   {
     value: "protect-true-peak",
-    label: "Respect Peak Limit",
+    label: "Respect peak limit",
     describeConsequence: ({ loudnessTargetLufs, truePeakCeilingDbtp }) =>
       `Caps suggested gain at ${dbtpLabel(truePeakCeilingDbtp)}. Loudness may remain below ${lufsLabel(loudnessTargetLufs)}.`,
   },
   {
     value: "loudness-first",
-    label: "Reach Loudness Target",
+    label: "Reach loudness target",
     describeConsequence: ({ loudnessTargetLufs, truePeakCeilingDbtp }) =>
       `Applies the full gain needed for ${lufsLabel(loudnessTargetLufs)}. Projected true peak may exceed ${dbtpLabel(truePeakCeilingDbtp)}.`,
   },

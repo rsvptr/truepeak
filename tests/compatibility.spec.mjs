@@ -76,7 +76,7 @@ test("the production bundle completes through the compatibility decoder", async 
   await expect(page.getByText(/^-?\d+(?:\.\d+)? LUFS$/).first()).toBeVisible();
 
   await page.getByRole("tab", { name: "Technical" }).click();
-  await expect(page.getByText(/Decoder mode:\s*ffmpeg-wasm/)).toBeVisible();
+  await expect(page.getByText(/Decoder mode:\s*FFmpeg \(WebAssembly\)/)).toBeVisible();
   await expect(page.getByText(/Fallback used after another decoder failed/i)).toHaveCount(0);
 });
 
@@ -113,7 +113,7 @@ test("mobile Back dismisses the More sheet and confirmation without leaving the 
   await expect(page).toHaveURL(/screen=session/);
 
   await page.getByRole("button", { name: "More session actions" }).click();
-  await page.getByRole("menuitem", { name: "Clear Session" }).click();
+  await page.getByRole("menuitem", { name: "Clear session" }).click();
   await expect(page.getByRole("alertdialog")).toContainText("Clear the current session?");
   await page.evaluate(() => window.history.back());
   await expect(page.getByRole("alertdialog")).toHaveCount(0);

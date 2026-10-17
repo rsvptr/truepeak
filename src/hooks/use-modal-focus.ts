@@ -13,8 +13,15 @@ function getFocusableElements(container: HTMLElement | null) {
     return [];
   }
 
+  // A negative tabindex (e.g. an inactive roving tab) removes an otherwise
+  // focusable element from the Tab order, so it must not count as the trap's
+  // first or last stop. Checked via the attribute rather than tabIndex alone,
+  // which reports -1 by default for audio/video controls and contenteditable.
   return Array.from(container.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR)).filter(
-    (element) => !element.hasAttribute("aria-hidden") && element.offsetParent !== null,
+    (element) =>
+      !element.hasAttribute("aria-hidden") &&
+      element.offsetParent !== null &&
+      !(element.hasAttribute("tabindex") && element.tabIndex < 0),
   );
 }
 

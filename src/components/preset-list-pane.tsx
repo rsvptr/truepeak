@@ -1,6 +1,6 @@
 "use client";
 
-import { useRef, type Ref } from "react";
+import { useRef } from "react";
 import { CUSTOM_PRESET_ID } from "@/audio/presets";
 import { Badge } from "@/components/ui/badge";
 import {
@@ -61,8 +61,8 @@ function PresetRow({
       // leave it set for a later arrow key.
       onPointerDown={onPointerActivate}
       className={cn(
-        "flex cursor-pointer gap-3 rounded-2xl border p-3 transition",
-        "has-[:focus-visible]:outline-none has-[:focus-visible]:ring-2 has-[:focus-visible]:ring-[var(--accent)] has-[:focus-visible]:ring-offset-2 has-[:focus-visible]:ring-offset-[var(--surface-1)]",
+        "flex cursor-pointer gap-3 rounded-2xl border p-3 transition-[background-color,border-color,color] duration-200 ease-out has-checked:transition-none",
+        "has-[:focus-visible]:outline-hidden has-[:focus-visible]:ring-2 has-[:focus-visible]:ring-[var(--accent)] has-[:focus-visible]:ring-offset-2 has-[:focus-visible]:ring-offset-[var(--surface-1)]",
         selected
           ? "border-[color:var(--accent)]/45 bg-[color:var(--accent-soft)]"
           : "border-[var(--line)] bg-[var(--surface-1)] hover:border-[color:var(--accent)]/30",
@@ -74,7 +74,7 @@ function PresetRow({
         value={id}
         checked={selected}
         onChange={() => onSelect(id)}
-        className="mt-1 h-4 w-4 shrink-0 accent-[var(--accent-strong)] focus-visible:outline-none"
+        className="mt-1 h-4 w-4 shrink-0 accent-[var(--accent-strong)] focus-visible:outline-hidden"
       />
       <span className="min-w-0 flex-1">
         <span className="block text-sm font-semibold text-[var(--ink)]">{label}</span>
@@ -126,8 +126,6 @@ interface PresetListPaneProps {
    * radio that currently holds focus.
    */
   onSelect: (presetId: string, viaPointer: boolean) => void;
-  /** Ref to the scroll container so the mobile flow can preserve list position. */
-  scrollRef: Ref<HTMLDivElement>;
   className?: string;
 }
 
@@ -137,7 +135,7 @@ interface PresetListPaneProps {
  * (name, source, target/limit, provenance) with descriptions moved to the
  * detail pane so the list stays scannable (UX-006/UX-007).
  */
-export function PresetListPane({ selectedPresetId, onSelect, scrollRef, className }: PresetListPaneProps) {
+export function PresetListPane({ selectedPresetId, onSelect, className }: PresetListPaneProps) {
   const pointerSelectRef = useRef(false);
   const handleSelect = (presetId: string) => {
     const viaPointer = pointerSelectRef.current;
@@ -153,13 +151,12 @@ export function PresetListPane({ selectedPresetId, onSelect, scrollRef, classNam
 
   return (
     <div
-      ref={scrollRef}
       onKeyDown={clearPointer}
-      className={cn("min-w-0 space-y-5 overflow-y-auto overscroll-contain pr-1", className)}
+      className={cn("min-w-0 space-y-5 pr-1", className)}
     >
       {GROUPED_PRESETS.map((group) => (
         <fieldset key={group.purpose} className="min-w-0 border-0 p-0">
-          <legend className="mb-1 flex w-full items-center gap-3 p-0 text-[11px] font-semibold uppercase tracking-[0.18em] text-[var(--muted)]">
+          <legend className="mb-1 flex w-full items-center gap-3 p-0 text-[0.6875rem] font-semibold uppercase tracking-[0.18em] text-[var(--muted)]">
             {group.label}
           </legend>
           <p className="mb-2.5 text-xs leading-5 text-[var(--muted)]">{group.blurb}</p>
@@ -184,14 +181,14 @@ export function PresetListPane({ selectedPresetId, onSelect, scrollRef, classNam
       ))}
 
       <fieldset className="min-w-0 border-0 p-0">
-        <legend className="mb-1 flex w-full items-center gap-3 p-0 text-[11px] font-semibold uppercase tracking-[0.18em] text-[var(--muted)]">
+        <legend className="mb-1 flex w-full items-center gap-3 p-0 text-[0.6875rem] font-semibold uppercase tracking-[0.18em] text-[var(--muted)]">
           {PRESET_PURPOSE_LABEL.custom}
         </legend>
         <p className="mb-2.5 text-xs leading-5 text-[var(--muted)]">{PRESET_PURPOSE_BLURB.custom}</p>
         <div className="space-y-2.5">
           <PresetRow
             id={CUSTOM_PRESET_ID}
-            label="Custom Target"
+            label="Custom target"
             selected={selectedPresetId === CUSTOM_PRESET_ID}
             onSelect={handleSelect}
             onPointerActivate={markPointer}

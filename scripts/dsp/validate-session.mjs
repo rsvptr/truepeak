@@ -27,12 +27,15 @@ const {
   SessionExportError,
   buildSessionFile,
   getSessionFileName,
+  normalizeSessionJob,
   parseSessionFile,
   planSessionIntake,
 } = await import("../../src/audio/session-file.ts");
 const { DEFAULT_TARGET_PRESET } = await import("../../src/audio/presets.ts");
 const { fileIdentityKey } = await import("../../src/lib/file-identity.ts");
-const { mergeImportedJobs } = await import("../../src/audio/session-reconciliation.ts");
+const { freshRestoredJobs, mergeImportedJobs, reconcileSessionJobs } = await import(
+  "../../src/audio/session-reconciliation.ts"
+);
 const { loadRecentSessions } = await import("@/session/persistence");
 
 const SAMPLE_RATE = 48_000;
@@ -81,6 +84,68 @@ function check(name, condition, detail = "") {
  */
 function clone(value) {
   return structuredClone(value);
+}
+
+/**
+ * Portable timelines round levels to 0.01 and times to the millisecond; the
+ * importer then stores them as float32 again, so allow that last step too.
+ *
+ * @param {import("../../src/types/audio.ts").AnalysisTimeline} actual
+ * @param {import("../../src/types/audio.ts").AnalysisTimeline} expected
+ */
+function timelineMatchesWithinRounding(actual, expected) {
+  /**
+   * @param {ArrayLike<number>} a
+   * @param {ArrayLike<number>} b
+   * @param {number} tolerance
+   */
+  const close = (a, b, tolerance) => {
+    if (a.length !== b.length) return false;
+    for (let index = 0; index < a.length; index += 1) {
+      if (Number.isNaN(a[index]) || Number.isNaN(b[index])) {
+        if (!(Number.isNaN(a[index]) && Number.isNaN(b[index]))) return false;
+        continue;
+      }
+      if (Math.abs(a[index] - b[index]) > tolerance + Math.abs(b[index]) * 2 ** -23) return false;
+    }
+    return true;
+  };
+  return (
+    close(actual.timeSeconds, expected.timeSeconds, 0.0005) &&
+    close(actual.momentaryLufs, expected.momentaryLufs, 0.005) &&
+    close(actual.shortTermLufs, expected.shortTermLufs, 0.005) &&
+    close(actual.truePeakDbtp, expected.truePeakDbtp, 0.005)
+  );
+}
+
+/**
+ * Deterministic five-minute-style timeline with realistic float32 values: a
+ * wandering programme level, the momentary and short-term warm-up gaps (NaN),
+ * and a true peak a little above the level.
+ *
+ * @param {number} pointCount
+ * @param {number} seed
+ * @returns {import("../../src/types/audio.ts").AnalysisTimeline}
+ */
+function realisticTimeline(pointCount, seed) {
+  let state = seed >>> 0;
+  const random = () => {
+    state = (state * 1_103_515_245 + 12_345) >>> 0;
+    return state / 2 ** 32;
+  };
+  const timeSeconds = new Float32Array(pointCount);
+  const momentaryLufs = new Float32Array(pointCount);
+  const shortTermLufs = new Float32Array(pointCount);
+  const truePeakDbtp = new Float32Array(pointCount);
+  let level = -12;
+  for (let index = 0; index < pointCount; index += 1) {
+    level = Math.max(-30, Math.min(-6, level + (random() - 0.5) * 0.6));
+    timeSeconds[index] = (index + 1) * 0.1;
+    momentaryLufs[index] = index >= 3 ? level + (random() - 0.5) * 2 : Number.NaN;
+    shortTermLufs[index] = index >= 29 ? level : Number.NaN;
+    truePeakDbtp[index] = Math.min(0.3, level + 10 + random() * 2);
+  }
+  return { stepDurationSeconds: 0.1, timeSeconds, momentaryLufs, shortTermLufs, truePeakDbtp };
 }
 
 /**
@@ -142,11 +207,20 @@ check(
 );
 // LOGIC-05: the field-by-field checks above only sample a few metrics. A real
 // analyzeDecodedAsset result (this 3 s stereo tone) must round-trip losslessly
-// in full, including every timeline array, not just the fields asserted above.
-check(
-  "result.metrics (including the nested timeline) round-trips deep-equal from a real analyzeDecodedAsset run",
-  isDeepStrictEqual(restored.result?.metrics, result.metrics),
-);
+// in full apart from the timeline samples, which the portable file rounds to
+// 0.01 LU/dB and to the millisecond to keep large sessions under the limit.
+{
+  const { timeline: restoredTimeline, ...restoredSummary } = restored.result?.metrics ?? {};
+  const { timeline: sourceTimeline, ...sourceSummary } = result.metrics;
+  check(
+    "result.metrics summary values round-trip deep-equal from a real analyzeDecodedAsset run",
+    isDeepStrictEqual(restoredSummary, sourceSummary),
+  );
+  check(
+    "the nested timeline round-trips within the portable rounding, gaps intact",
+    restoredTimeline !== undefined && timelineMatchesWithinRounding(restoredTimeline, sourceTimeline),
+  );
+}
 
 const secondImport = parseSessionFile(text);
 check("re-import creates another fresh id", secondImport.jobs[0]?.id !== restored.id);
@@ -280,7 +354,7 @@ const oversizedVersion = mutateEnvelope(payload, (value) => {
 });
 check(
   "unsupported version error does not echo attacker-controlled content",
-  oversizedVersion.error === "This session file uses an unsupported version.",
+  oversizedVersion.error === "This session file uses an unsupported version. Export it again from the current version of TruePeak, then open it.",
 );
 check(
   "invalid export date rejected",
@@ -443,15 +517,9 @@ oversizedTimelineJob.id = "needs-downsampling";
 oversizedTimelineJob.result.metadata.durationSeconds = sourcePointCount * 0.1;
 oversizedTimelineJob.result.metadata.frameCount = sourcePointCount * 4_800;
 oversizedTimelineJob.result.metrics.loudnessRangeUnstable = false;
-oversizedTimelineJob.result.metrics.timeline = {
-  stepDurationSeconds: 0.1,
-  // Float32Array here, not plain arrays with nulls: the exporter normalizes
-  // either form to the same float32 series, and the in-memory type is typed.
-  timeSeconds: Float32Array.from({ length: sourcePointCount }, (_, index) => (index + 1) * 0.1),
-  momentaryLufs: new Float32Array(sourcePointCount).fill(Number.NaN),
-  shortTermLufs: new Float32Array(sourcePointCount).fill(Number.NaN),
-  truePeakDbtp: new Float32Array(sourcePointCount).fill(-1),
-};
+// Realistic float32 levels, not constant -1/NaN fills: a constant series
+// serialises in a few bytes per point and hid how large a real file gets.
+oversizedTimelineJob.result.metrics.timeline = realisticTimeline(sourcePointCount, 7);
 let downsampledText = "";
 /** @type {SessionImportResult} */
 let downsampledImport = { jobs: [], error: "not built" };
@@ -470,6 +538,61 @@ check(
   "downsampled export byte count obeys importer limit",
   Buffer.byteLength(downsampledText, "utf8") <= MAX_SESSION_FILE_BYTES,
 );
+{
+  const restoredTimeline = downsampledImport.jobs[0]?.result?.metrics.timeline;
+  check(
+    "downsampled realistic timeline keeps its warm-up gaps as nulls and rounded values",
+    restoredTimeline !== undefined &&
+      Number.isNaN(restoredTimeline.momentaryLufs[0]) &&
+      Number.isNaN(restoredTimeline.shortTermLufs[28]) &&
+      Number.isFinite(restoredTimeline.shortTermLufs[29]) &&
+      /"momentaryLufs":\[null,null,null,-?\d+(\.\d{1,2})?,/.test(downsampledText),
+  );
+}
+
+// A full session at the job cap with realistic five-minute timelines (3,000
+// points each, downsampled to the aggregate point cap) must still export under
+// the import limit and round-trip.
+{
+  const fiveMinutePoints = 3_000;
+  const fullSessionJobs = Array.from({ length: MAX_SESSION_JOBS }, (_, index) => {
+    const entry = clone(job);
+    entry.id = `full-session-${index}`;
+    entry.result.metadata.durationSeconds = fiveMinutePoints * 0.1;
+    entry.result.metadata.frameCount = fiveMinutePoints * 4_800;
+    entry.result.metrics.loudnessRangeUnstable = false;
+    entry.result.metrics.timeline = realisticTimeline(fiveMinutePoints, index + 1);
+    return entry;
+  });
+  let fullSessionText = "";
+  /** @type {SessionImportResult} */
+  let fullSessionImport = { jobs: [], error: "not built" };
+  try {
+    fullSessionText = buildSessionFile(fullSessionJobs);
+    fullSessionImport = parseSessionFile(fullSessionText);
+  } catch (error) {
+    fullSessionImport = { jobs: [], error: error instanceof Error ? error.message : String(error) };
+  }
+  check(
+    "1,000 jobs with realistic five-minute timelines export under the import limit",
+    fullSessionText.length > 0 && Buffer.byteLength(fullSessionText, "utf8") <= MAX_SESSION_FILE_BYTES,
+    `${Buffer.byteLength(fullSessionText, "utf8")} bytes`,
+  );
+  check(
+    "the 1,000-job session round-trips every job at the aggregate point cap",
+    !fullSessionImport.error &&
+      fullSessionImport.jobs.length === MAX_SESSION_JOBS &&
+      fullSessionImport.jobs.reduce(
+        (sum, entry) => sum + (entry.result?.metrics.timeline.timeSeconds.length ?? 0),
+        0,
+      ) === MAX_SESSION_TIMELINE_POINTS,
+    fullSessionImport.error,
+  );
+  check(
+    "the portable session is serialised compactly",
+    fullSessionText.startsWith("{\"app\":") && !fullSessionText.includes("\n"),
+  );
+}
 
 console.log("\n[F] Global session intake cap");
 check(
@@ -532,8 +655,8 @@ console.log("\n[G] Portable-import merge shares the global session cap");
 // mergeImportedJobs is the single path importSession() uses to fold a portable
 // file into the live session. It must obey the same 1,000-job cap as file
 // intake: an import onto a full session is turned away, not silently merged
-// past the limit. A local job has no import provenance key, so it counts toward
-// the cap denominator but is never a dedupe target.
+// past the limit. These local fixtures have lineage ids no import below
+// carries, so they count toward the cap denominator without ever matching.
 /**
  * @param {number} id
  * @returns {AnalysisJob}
@@ -658,6 +781,178 @@ const makeMergeImportedJob = (slot, id = `slot-${slot}`) => ({
     current.length + plan.added === MAX_SESSION_JOBS,
     `${current.length} + ${plan.added}`,
   );
+}
+
+console.log("\n[G2] Importing a session already in the workspace adds nothing");
+// Regression: a recovery-restored workspace plus "Open session" on its own
+// export doubled every row. The import must match the rows it came from by
+// lineage (the original job id) and measured fingerprint, whether they are
+// live, restored, or earlier imports.
+{
+  const quietLeft = left.map((sample) => sample * 0.25);
+  const quietAsset = parseWavBuffer(
+    encodeWav({ channels: [quietLeft, quietLeft], sampleRate: SAMPLE_RATE }),
+    "quiet.wav",
+    "audio/wav",
+  );
+  const quietResult = analyzeDecodedAsset(quietAsset, DEFAULT_TARGET_PRESET);
+  /** @type {AnalysisJob} */
+  const jobA = { ...job, id: "analysis-a" };
+  /** @type {AnalysisJob} */
+  const jobB = { ...job, id: "analysis-b", fileName: "quiet.wav", result: quietResult };
+  /** @type {AnalysisJob} */
+  const jobC = { ...job, id: "analysis-c", fileName: "quiet.wav", result: quietResult };
+  const settings = {
+    analysisBlocked: false,
+    analysisMode: /** @type {const} */ ("targeted"),
+    target: DEFAULT_TARGET_PRESET,
+  };
+  /**
+   * @param {AnalysisJob[]} jobs
+   * @param {string} [sourceSessionDigest]
+   */
+  const importOf = (jobs, sourceSessionDigest = digest) =>
+    reconcileSessionJobs(
+      parseSessionFile(buildSessionFile(jobs), { sourceSessionDigest }).jobs,
+      settings,
+    );
+  const sessionAB = importOf([jobA, jobB]);
+  /** @param {AnalysisJob} source */
+  const restoredCopy = (source) => {
+    const normalized = normalizeSessionJob(clone(source));
+    assert.ok(normalized);
+    return { ...normalized, progressLabel: "Restored", restored: true };
+  };
+
+  {
+    const plan = mergeImportedJobs([jobA, jobB], sessionAB);
+    check(
+      "re-importing a session into the workspace that exported it adds 0",
+      plan.added === 0 && plan.skippedDuplicates === 2 && plan.skippedOverCap === 0,
+      JSON.stringify(plan),
+    );
+  }
+  {
+    const plan = mergeImportedJobs([restoredCopy(jobA), restoredCopy(jobB)], sessionAB);
+    check(
+      "importing a session into its recovery-restored copy adds 0",
+      plan.added === 0 && plan.skippedDuplicates === 2 && plan.skippedOverCap === 0,
+      JSON.stringify(plan),
+    );
+  }
+  {
+    const first = mergeImportedJobs([], sessionAB);
+    const second = mergeImportedJobs(first.toAdd, importOf([jobA, jobB], "cd".repeat(32)));
+    const reexported = mergeImportedJobs(first.toAdd, importOf(first.toAdd, "ef".repeat(32)));
+    check(
+      "the same session imported twice adds its rows once",
+      first.added === 2 && second.added === 0 && second.skippedDuplicates === 2,
+      JSON.stringify({ first: first.added, second }),
+    );
+    check(
+      "a re-export of imported rows still matches them by original lineage",
+      reexported.added === 0 && reexported.skippedDuplicates === 2,
+      JSON.stringify(reexported),
+    );
+  }
+  {
+    const measureOnly = reconcileSessionJobs(sessionAB, {
+      ...settings,
+      analysisMode: "measure-only",
+      target: null,
+    });
+    const plan = mergeImportedJobs([jobA, jobB], measureOnly);
+    check(
+      "a duplicate stays a duplicate when reconciled to a different target",
+      plan.added === 0 && plan.skippedDuplicates === 2,
+      JSON.stringify(plan),
+    );
+  }
+  {
+    const plan = mergeImportedJobs([jobA, jobB], importOf([jobC]));
+    check(
+      "a different session merges",
+      plan.added === 1 && plan.skippedDuplicates === 0,
+      JSON.stringify(plan),
+    );
+  }
+  {
+    // jobB and jobC share a file name but are separate analyses (distinct
+    // lineage), so a session holding both keeps both, into any workspace.
+    const empty = mergeImportedJobs([], importOf([jobB, jobC]));
+    const withB = mergeImportedJobs([jobB], importOf([jobB, jobC]));
+    check(
+      "two different files with the same name are both kept",
+      empty.added === 2 && withB.added === 1 && withB.skippedDuplicates === 1,
+      JSON.stringify({ empty: empty.added, withB }),
+    );
+  }
+  {
+    // Same lineage, different measurement (the source was analyzed again): the
+    // import is additive and never replaces or drops a row already present.
+    /** @type {AnalysisJob} */
+    const reanalyzed = { ...jobA, result: { ...result, analyzedAt: "2026-01-03T00:00:00.000Z" } };
+    const plan = mergeImportedJobs([reanalyzed], importOf([jobA]));
+    check(
+      "a different analysis of the same source is added alongside, not merged",
+      plan.added === 1 && plan.skippedDuplicates === 0,
+      JSON.stringify(plan),
+    );
+  }
+  {
+    const full = [
+      ...Array.from({ length: MAX_SESSION_JOBS - 2 }, (_, i) => makeMergeLocalJob(i)),
+      jobA,
+      jobB,
+    ];
+    const plan = mergeImportedJobs(full, sessionAB);
+    check(
+      "duplicates into an at-limit session are reported as duplicates, not over the cap",
+      plan.added === 0 && plan.skippedDuplicates === 2 && plan.skippedOverCap === 0,
+      JSON.stringify(plan),
+    );
+  }
+  {
+    const nearFull = [
+      ...Array.from({ length: MAX_SESSION_JOBS - 2 }, (_, i) => makeMergeLocalJob(i)),
+      jobA,
+    ];
+    const plan = mergeImportedJobs(nearFull, importOf([jobA, jobB, jobC]));
+    check(
+      "skipped duplicates do not consume the room left under the cap",
+      plan.added === 1 &&
+        plan.skippedDuplicates === 1 &&
+        plan.skippedOverCap === 1 &&
+        nearFull.length + plan.added === MAX_SESSION_JOBS,
+      JSON.stringify(plan),
+    );
+  }
+  {
+    // Race: the session is opened before the recovery read lands, so the
+    // workspace already holds imported copies when the restored rows arrive.
+    const imported = mergeImportedJobs([], sessionAB).toAdd;
+    const fresh = freshRestoredJobs(imported, [restoredCopy(jobA), restoredCopy(jobB)]);
+    check("a restore landing after the same session was opened adds 0", fresh.length === 0, `${fresh.length}`);
+    const withNew = freshRestoredJobs(imported, [restoredCopy(jobA), restoredCopy(jobC)]);
+    check(
+      "a restore still adds rows the opened session does not hold",
+      withNew.length === 1 && withNew[0].id === jobC.id,
+      JSON.stringify(withNew.map((row) => row.id)),
+    );
+    const byId = freshRestoredJobs([jobA], [restoredCopy(jobA), restoredCopy(jobB)]);
+    check(
+      "a restore still skips rows already present by id",
+      byId.length === 1 && byId[0].id === jobB.id,
+      JSON.stringify(byId.map((row) => row.id)),
+    );
+    // A store holding both an original and its imported copy restores one row.
+    const batch = freshRestoredJobs([], [restoredCopy(jobA), restoredCopy(imported[0])]);
+    check(
+      "an original and its imported copy in one restore collapse to one row",
+      batch.length === 1 && batch[0].id === jobA.id,
+      JSON.stringify(batch.map((row) => row.id)),
+    );
+  }
 }
 
 console.log("\n[H] LOGIC-07 — persistence.ts keeps valid rows from a v2 recent-sessions envelope");

@@ -632,6 +632,128 @@ console.log("\n[10] M-11 determinism + caller PCM not mutated");
   for (const f of fields) { if (m1[f] !== m2[f]) { identical = false; diff = `${f}: ${m1[f]} vs ${m2[f]}`; break; } }
   assertOk("repeat analysis returns identical metrics", identical, diff);
 }
+// The analyzer K-weights each channel one 100 ms segment at a time through a
+// small scratch buffer, carrying the filter state across chunks. The reference
+// below filters every channel in one full-length pass with the same
+// coefficients and arithmetic, then rebuilds the ungated level and the
+// momentary / short-term timelines from its segment energies; all must match
+// bit for bit. 5.1 at 44.1 kHz covers the LFE skip and surround weights, and
+// the odd length leaves a partial final chunk.
+{
+  const sampleRate = 44100;
+  const stepSamples = 4410;
+  const n = 4 * sampleRate + 13579;
+  let seed = 7;
+  const rand = () => {
+    seed = (seed * 1664525 + 1013904223) >>> 0;
+    return seed / 4294967296 - 0.5;
+  };
+  const channels = Array.from({ length: 6 }, (_, ch) => {
+    const data = new Float32Array(n);
+    for (let i = 0; i < n; i += 1) {
+      const env = 0.1 + 0.4 * Math.abs(Math.sin((2 * Math.PI * i) / (sampleRate * 1.7) + ch));
+      data[i] = env * (0.5 * Math.sin((2 * Math.PI * (31 + 53 * ch) * i) / sampleRate) + 0.5 * rand());
+    }
+    return data;
+  });
+  const asset = makeAsset(channels, { sampleRate });
+  const m = analyzeDecodedAsset(asset, null).metrics;
+
+  /** @param {Float32Array} source */
+  const kWeightFullLength = (source) => {
+    const w = (2 * Math.PI * 38.13547087606643) / sampleRate;
+    const k = Math.tan((1681.9744509555217 * Math.PI) / sampleRate);
+    const q = 1.4140766640886306;
+    const v = Math.sin(w) / 1.00065407464886;
+    const den = k * k + q * k + 1;
+    const [b0, b1, b2, a1, a2] = [1, -2, 1, (-2 * Math.cos(w)) / (1 + v), (1 - v) / (1 + v)];
+    const c0 = (k * k + 1.77992789404 * k + 1.58486470113) / den;
+    const c1 = (2 * (k * k - 1.58486470113)) / den;
+    const c2 = (k * k - 1.77992789404 * k + 1.58486470113) / den;
+    const d1 = (2 * (k * k - 1)) / den;
+    const d2 = (k * k - q * k + 1) / den;
+    const epsilon = 1e-50;
+    const out = new Float32Array(source.length);
+    let s0 = 0;
+    let s1 = 0;
+    let s2 = 0;
+    let s3 = 0;
+    for (let i = 0; i < source.length; i += 1) {
+      const x = source[i];
+      let y = b0 * x + s0 + epsilon;
+      s0 = b1 * x - a1 * y + s1;
+      s1 = b2 * x - a2 * y;
+      const hp = y - epsilon;
+      y = c0 * hp + s2 + epsilon;
+      s2 = c1 * hp - d1 * y + s3;
+      s3 = c2 * hp - d2 * y;
+      out[i] = y - epsilon;
+    }
+    return out;
+  };
+  /** @param {number} energy */
+  const toLufs = (energy) => (energy <= 0 ? -70 : Math.max(10 * Math.log10(energy) - 0.691, -70));
+
+  const weights = asset.channelLayout.labels.map((label) => getLoudnessWeight(label));
+  const filtered = channels.map((channel, ch) => (weights[ch] === 0 ? channel : kWeightFullLength(channel)));
+  const fullSegmentFrames = Math.floor(n / stepSamples) * stepSamples;
+  /** @type {number[]} */
+  const segmentEnergies = [];
+  let totalEnergy = 0;
+  let segmentEnergy = 0;
+  for (let frame = 0; frame < n; frame += 1) {
+    let frameEnergy = 0;
+    for (let ch = 0; ch < channels.length; ch += 1) {
+      if (weights[ch] === 0) continue;
+      const sample = filtered[ch][frame];
+      frameEnergy += weights[ch] * sample * sample;
+    }
+    totalEnergy += frameEnergy;
+    if (frame < fullSegmentFrames) {
+      segmentEnergy += frameEnergy;
+      if ((frame + 1) % stepSamples === 0) {
+        segmentEnergies.push(segmentEnergy);
+        segmentEnergy = 0;
+      }
+    }
+  }
+  const momentary = new Float32Array(segmentEnergies.length).fill(Number.NaN);
+  const shortTerm = new Float32Array(segmentEnergies.length).fill(Number.NaN);
+  let momentarySum = 0;
+  let shortTermSum = 0;
+  for (let i = 0; i < segmentEnergies.length; i += 1) {
+    momentarySum += segmentEnergies[i];
+    shortTermSum += segmentEnergies[i];
+    if (i >= 4) momentarySum -= segmentEnergies[i - 4];
+    if (i >= 30) shortTermSum -= segmentEnergies[i - 30];
+    if (i >= 3) momentary[i] = toLufs(momentarySum / (4 * stepSamples));
+    if (i >= 29) shortTerm[i] = toLufs(shortTermSum / (30 * stepSamples));
+  }
+  /**
+   * @param {Float32Array} actual
+   * @param {Float32Array} expected
+   */
+  const sameValues = (actual, expected) =>
+    actual.length === expected.length && actual.every((value, i) => Object.is(value, expected[i]));
+
+  assertOk(
+    "chunked K-weighting fixture spans many chunks with a partial final chunk",
+    segmentEnergies.length > 30 && n % stepSamples !== 0 && weights.includes(0),
+  );
+  assertOk(
+    "chunked K-weighting: ungated level matches a full-length pass exactly",
+    m.ungatedLufs === toLufs(totalEnergy / n),
+    `${m.ungatedLufs} vs ${toLufs(totalEnergy / n)}`,
+  );
+  assertOk(
+    "chunked K-weighting: momentary timeline matches a full-length pass bit for bit",
+    sameValues(m.timeline.momentaryLufs, momentary),
+  );
+  assertOk(
+    "chunked K-weighting: short-term timeline matches a full-length pass bit for bit",
+    sameValues(m.timeline.shortTermLufs, shortTerm),
+  );
+}
 
 console.log("\n[11] H-03 channel weighting (ITU-R BS.1770-5) + WAVE speaker-mask layouts");
 const SQRT2 = Math.sqrt(2);

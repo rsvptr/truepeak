@@ -76,6 +76,9 @@ export const StudioToolbar = memo(function StudioToolbar() {
   const completedCount = completedJobs.length;
   const finishedCount = queueCounts.complete + queueCounts.issues;
   const jobsCount = jobs.length;
+  const sessionSummary =
+    `${jobsCount} file${jobsCount === 1 ? "" : "s"} in this session, ${activeCount} in progress, ${completedCount} ready to review.` +
+    (parallelLimit && parallelLimit > 1 ? ` Runs up to ${parallelLimit} files at once.` : "");
   const [menuOpen, setMenuOpen] = useState(false);
   const dismissMenu = useCallback(() => setMenuOpen(false), []);
   const { closeHistoryEntry, openHistoryEntry } = useOverlayHistoryEntry(
@@ -86,10 +89,11 @@ export const StudioToolbar = memo(function StudioToolbar() {
   // anchored dropdown so it never has to fight for horizontal room.
   // Hydration-safe (MOB-15): reads matchMedia during render, so the menu
   // never briefly believes it is the anchored dropdown on a phone.
-  const isCompactMenu = useMediaQuery("(max-width: 640px)");
+  const isCompactMenu = useMediaQuery("(max-width: 39.999rem)");
   const [menuPlacement, setMenuPlacement] = useState<"below" | "above">("below");
   const [menuMaxHeight, setMenuMaxHeight] = useState<number | null>(null);
   const menuId = useId();
+  const menuHintId = useId();
   const menuRef = useRef<HTMLDivElement | null>(null);
   const triggerRef = useRef<HTMLButtonElement | null>(null);
   const wrapperRef = useRef<HTMLElement | null>(null);
@@ -106,6 +110,10 @@ export const StudioToolbar = memo(function StudioToolbar() {
   // catch) could still reach and activate background controls, and the
   // dimmed page underneath could still be scrolled by touch.
   useBackgroundInert(menuOpen && isCompactMenu, compactMenuContainerRef);
+
+  // Which item gets focus when the menu opens: ArrowUp on the trigger opens it
+  // on the last item, every other way of opening starts at the first.
+  const focusLastOnOpenRef = useRef(false);
 
   const focusMenuItem = (index: number) => {
     // Unavailable items stay focusable (aria-disabled, not disabled), so
@@ -142,7 +150,13 @@ export const StudioToolbar = memo(function StudioToolbar() {
       return;
     }
 
-    closeMenu(true, action);
+    // Focus the trigger before the action runs: the focused menuitem is gone
+    // by now, so a dialog or drawer the action opens would otherwise record
+    // <body> (or a detached item) as its focus-restore target.
+    closeMenu(true, () => {
+      triggerRef.current?.focus();
+      action();
+    });
   };
 
   // Collision-aware placement for the anchored (non-compact) dropdown: flip
@@ -190,7 +204,15 @@ export const StudioToolbar = memo(function StudioToolbar() {
       return;
     }
 
+    // On short viewports (e.g. 200% zoom) the bar stops being sticky (see the
+    // max-height variant on <header>), so it no longer covers anything and
+    // reserves no scroll-padding.
+    const shortViewport = window.matchMedia("(max-height: 30rem)");
     const publish = () => {
+      if (shortViewport.matches) {
+        document.documentElement.style.setProperty("--tp-toolbar-height", "0px");
+        return;
+      }
       const height = wrapper.getBoundingClientRect().height;
       if (height > 0) {
         document.documentElement.style.setProperty("--tp-toolbar-height", `${Math.round(height)}px`);
@@ -200,8 +222,10 @@ export const StudioToolbar = memo(function StudioToolbar() {
     publish();
     const observer = new ResizeObserver(publish);
     observer.observe(wrapper);
+    shortViewport.addEventListener("change", publish);
     return () => {
       observer.disconnect();
+      shortViewport.removeEventListener("change", publish);
       document.documentElement.style.removeProperty("--tp-toolbar-height");
     };
   }, []);
@@ -211,7 +235,10 @@ export const StudioToolbar = memo(function StudioToolbar() {
       return;
     }
 
-    const focusTimeout = window.setTimeout(() => focusMenuItem(0), 0);
+    // focusMenuItem clamps the index, so MAX_SAFE_INTEGER lands on the last item.
+    const initialIndex = focusLastOnOpenRef.current ? Number.MAX_SAFE_INTEGER : 0;
+    focusLastOnOpenRef.current = false;
+    const focusTimeout = window.setTimeout(() => focusMenuItem(initialIndex), 0);
 
     const handlePointerDown = (event: MouseEvent) => {
       if (!menuRef.current?.contains(event.target as Node) && !triggerRef.current?.contains(event.target as Node)) {
@@ -272,8 +299,29 @@ export const StudioToolbar = memo(function StudioToolbar() {
     }
   };
 
+  // Why each unavailable item is unavailable, read out as its description.
+  // The hint nodes are `hidden`: aria-describedby still reads a directly
+  // referenced hidden node, and nothing extra shows or enters the menu tree.
+  const exportHint = completedCount ? null : jobsCount ? "Available once a file finishes." : "Add files first.";
+  const historyHint = historyEnabled ? null : "Turn history on first.";
+  const finishedHint = finishedCount ? null : jobsCount ? "No files have finished yet." : "Add files first.";
+  const activeHint = activeCount ? null : "No files are in progress.";
+  const sessionHint = jobsCount ? null : "Add files first.";
+  const hintIds = {
+    export: `${menuHintId}-export`,
+    history: `${menuHintId}-history`,
+    finished: `${menuHintId}-finished`,
+    active: `${menuHintId}-active`,
+    session: `${menuHintId}-session`,
+  };
+
   const menuItems = (
     <div className="grid gap-2">
+      {exportHint ? <span id={hintIds.export} hidden>{exportHint}</span> : null}
+      {historyHint ? <span id={hintIds.history} hidden>{historyHint}</span> : null}
+      {finishedHint ? <span id={hintIds.finished} hidden>{finishedHint}</span> : null}
+      {activeHint ? <span id={hintIds.active} hidden>{activeHint}</span> : null}
+      {sessionHint ? <span id={hintIds.session} hidden>{sessionHint}</span> : null}
       <Button
         data-menu-item="true"
         role="menuitem"
@@ -283,6 +331,7 @@ export const StudioToolbar = memo(function StudioToolbar() {
         className="md:hidden"
         onClick={() => runMenuAction(completedCount > 0, onExportCsv)}
         aria-disabled={!completedCount}
+        aria-describedby={exportHint ? hintIds.export : undefined}
       >
         <Download className="h-4 w-4" />
         CSV
@@ -296,6 +345,7 @@ export const StudioToolbar = memo(function StudioToolbar() {
         className="md:hidden"
         onClick={() => runMenuAction(completedCount > 0, onExportJson)}
         aria-disabled={!completedCount}
+        aria-describedby={exportHint ? hintIds.export : undefined}
       >
         <Download className="h-4 w-4" />
         JSON
@@ -309,9 +359,10 @@ export const StudioToolbar = memo(function StudioToolbar() {
         className="md:hidden"
         onClick={() => runMenuAction(completedCount > 0, onExportMarkdown)}
         aria-disabled={!completedCount}
+        aria-describedby={exportHint ? hintIds.export : undefined}
       >
         <FileText className="h-4 w-4" />
-        Report
+        Export report
       </Button>
       <Button
         data-menu-item="true"
@@ -321,9 +372,10 @@ export const StudioToolbar = memo(function StudioToolbar() {
         variant="secondary"
         onClick={() => runMenuAction(completedCount > 0, onExportSession)}
         aria-disabled={!completedCount}
+        aria-describedby={exportHint ? hintIds.export : undefined}
       >
         <Save className="h-4 w-4" />
-        Export Session
+        Export session
       </Button>
       <Button
         data-menu-item="true"
@@ -334,7 +386,7 @@ export const StudioToolbar = memo(function StudioToolbar() {
         onClick={() => runMenuAction(true, onOpenSession)}
       >
         <FolderOpen className="h-4 w-4" />
-        Open Session
+        Open session
       </Button>
       <Button
         data-menu-item="true"
@@ -345,7 +397,7 @@ export const StudioToolbar = memo(function StudioToolbar() {
         onClick={() => runMenuAction(true, onToggleHistory)}
       >
         <History className="h-4 w-4" />
-        {historyEnabled ? "Turn History Off" : "Turn History On"}
+        {historyEnabled ? "Turn history off" : "Turn history on"}
       </Button>
       <Button
         data-menu-item="true"
@@ -355,9 +407,10 @@ export const StudioToolbar = memo(function StudioToolbar() {
         variant="secondary"
         onClick={() => runMenuAction(historyEnabled, onOpenHistory)}
         aria-disabled={!historyEnabled}
+        aria-describedby={historyHint ? hintIds.history : undefined}
       >
         <History className="h-4 w-4" />
-        Open History
+        Open history
       </Button>
       <Button
         data-menu-item="true"
@@ -369,7 +422,7 @@ export const StudioToolbar = memo(function StudioToolbar() {
         onClick={() => runMenuAction(true, toggleTheme)}
       >
         <SunMoon className="h-4 w-4" />
-        Toggle Theme
+        Toggle color theme
       </Button>
       <Button
         data-menu-item="true"
@@ -379,9 +432,10 @@ export const StudioToolbar = memo(function StudioToolbar() {
         variant="secondary"
         onClick={() => runMenuAction(finishedCount > 0, onClearFinished)}
         aria-disabled={!finishedCount}
+        aria-describedby={finishedHint ? hintIds.finished : undefined}
       >
         <Trash2 className="h-4 w-4" />
-        Clear Finished
+        Clear finished
       </Button>
       <Button
         data-menu-item="true"
@@ -391,9 +445,10 @@ export const StudioToolbar = memo(function StudioToolbar() {
         variant="secondary"
         onClick={() => runMenuAction(activeCount > 0, onCancelActive)}
         aria-disabled={!activeCount}
+        aria-describedby={activeHint ? hintIds.active : undefined}
       >
         <Square className="h-4 w-4" />
-        Cancel Active
+        Cancel active files
       </Button>
       <Button
         data-menu-item="true"
@@ -403,9 +458,10 @@ export const StudioToolbar = memo(function StudioToolbar() {
         variant="danger"
         onClick={() => runMenuAction(jobsCount > 0, onClearSession)}
         aria-disabled={!jobsCount}
+        aria-describedby={sessionHint ? hintIds.session : undefined}
       >
         <Trash2 className="h-4 w-4" />
-        Clear Session
+        Clear session
       </Button>
     </div>
   );
@@ -413,11 +469,11 @@ export const StudioToolbar = memo(function StudioToolbar() {
   return (
     <header
       ref={wrapperRef}
-      className="sticky top-[max(0.5rem,env(safe-area-inset-top))] z-30 sm:top-[max(1rem,env(safe-area-inset-top))]"
+      className="sticky top-[max(0.5rem,env(safe-area-inset-top))] z-30 sm:top-[max(1rem,env(safe-area-inset-top))] [@media(max-height:30rem)]:static"
     >
-      <Card className="relative border-[var(--line)]/65 bg-[color:var(--surface-0)]/94 px-2 py-2 shadow-[0_14px_34px_rgba(0,0,0,0.14)] sm:px-5 sm:py-4">
+      <Card className="relative border-[var(--line)]/65 bg-[var(--surface-0)] px-2 py-2 shadow-[0_14px_34px_rgba(0,0,0,0.14)] sm:px-5 sm:py-4">
         <div className="flex flex-row items-center justify-between gap-2 sm:flex-col sm:items-stretch sm:gap-4 xl:flex-row xl:items-center xl:justify-between">
-          <div className="flex min-w-0 flex-1 items-center gap-2 sm:block sm:flex-none">
+          <div className="flex min-w-0 flex-1 items-center gap-2 sm:block sm:flex-none xl:flex-1">
             <div className="flex shrink-0 items-center gap-2 sm:flex-wrap">
               <Button type="button" size="sm" variant="ghost" onClick={onGoHome} aria-label="Home">
                 <ArrowLeft className="h-4 w-4" />
@@ -437,14 +493,14 @@ export const StudioToolbar = memo(function StudioToolbar() {
                 {decodeLabel} decode
               </Badge>
             </div>
-            <div className="min-w-0 flex-1 truncate text-xs leading-5 text-[var(--muted)] sm:mt-3 sm:text-sm sm:leading-6">
+            <div
+              className="min-w-0 flex-1 truncate text-xs leading-5 text-[var(--muted)] sm:mt-3 sm:text-sm sm:leading-6"
+              title={sessionSummary}
+            >
               <span className="sm:hidden">
                 {completedCount}/{jobsCount} ready{activeCount > 0 ? ` · ${activeCount} active` : ""}
               </span>
-              <span className="hidden sm:inline">
-                {jobsCount} file{jobsCount === 1 ? "" : "s"} in this session, {activeCount} in progress, {completedCount} ready to review.
-                {parallelLimit && parallelLimit > 1 ? ` Runs up to ${parallelLimit} files at once.` : ""}
-              </span>
+              <span className="hidden sm:inline">{sessionSummary}</span>
             </div>
             {batchProgress ? (
               <div className="mt-2 hidden items-center gap-3 sm:flex">
@@ -459,13 +515,13 @@ export const StudioToolbar = memo(function StudioToolbar() {
             ) : null}
           </div>
 
-          <div className="flex shrink-0 items-center gap-1 sm:flex-wrap sm:gap-2">
+          <div className="flex items-center gap-1 sm:flex-wrap sm:gap-2">
             <div className="hidden sm:block">
               <WorkspaceThemeToggle onToggle={toggleTheme} />
             </div>
             <Button type="button" size="sm" variant="secondary" onClick={onOpenPicker} aria-label="Add files">
               <Plus className="h-4 w-4" />
-              <span className="sr-only sm:not-sr-only">Add Files</span>
+              <span className="sr-only sm:not-sr-only">Add files</span>
             </Button>
             <Button type="button" size="sm" variant="secondary" onClick={onExportCsv} disabled={!completedCount} className="hidden md:inline-flex">
               <Download className="h-4 w-4" />
@@ -477,7 +533,7 @@ export const StudioToolbar = memo(function StudioToolbar() {
             </Button>
             <Button type="button" size="sm" variant="secondary" onClick={onExportMarkdown} disabled={!completedCount} className="hidden md:inline-flex">
               <FileText className="h-4 w-4" />
-              Report
+              Export report
             </Button>
 
             <div className="relative">
@@ -495,6 +551,12 @@ export const StudioToolbar = memo(function StudioToolbar() {
                     event.preventDefault();
                     openMenu();
                   }
+
+                  if (event.key === "ArrowUp") {
+                    event.preventDefault();
+                    focusLastOnOpenRef.current = true;
+                    openMenu();
+                  }
                 }}
                 aria-label="More session actions"
               >
@@ -509,7 +571,7 @@ export const StudioToolbar = memo(function StudioToolbar() {
                   // or become a fixed-position containing block itself.
                   <div ref={compactMenuContainerRef} className="contents">
                     <div
-                      className="fixed inset-0 z-40 touch-none overscroll-contain bg-black/45"
+                      className="tp-fade-in fixed inset-0 z-40 touch-none overscroll-contain bg-black/45"
                       aria-hidden="true"
                       onClick={() => closeMenu()}
                     />
@@ -519,9 +581,8 @@ export const StudioToolbar = memo(function StudioToolbar() {
                       role="menu"
                       aria-label="Session actions"
                       onKeyDown={handleMenuKeyDown}
-                      className="fixed inset-x-0 bottom-0 z-40 max-h-[calc(100dvh_-_4rem)] overflow-y-auto overscroll-contain rounded-t-[22px] border border-[var(--line)] bg-[var(--surface-1)] p-3 pb-[max(1rem,env(safe-area-inset-bottom))] shadow-[var(--shadow-elevated)]"
+                      className="tp-drawer-in fixed inset-x-0 bottom-0 z-40 max-h-[calc(100dvh_-_4rem)] overflow-y-auto overscroll-contain rounded-t-[22px] border border-[var(--line)] bg-[var(--surface-1)] p-3 pb-[max(1rem,env(safe-area-inset-bottom))] shadow-[var(--shadow-elevated)]"
                     >
-                      <div className="mx-auto mb-2 h-1.5 w-10 shrink-0 rounded-full bg-[var(--line)]" aria-hidden="true" />
                       {menuItems}
                     </div>
                   </div>
@@ -555,8 +616,8 @@ export const StudioToolbar = memo(function StudioToolbar() {
             aria-valuenow={Math.round(batchProgress.percent)}
           >
             <span
-              className="block h-full rounded-full bg-[var(--accent)] transition-[width] duration-200"
-              style={{ width: `${Math.max(0, Math.min(100, batchProgress.percent))}%` }}
+              className="block h-full w-full rounded-full bg-[var(--accent-strong)] transition-transform duration-150 ease-linear"
+              style={{ transform: `translateX(-${100 - Math.max(0, Math.min(100, batchProgress.percent))}%)` }}
             />
           </div>
         ) : null}

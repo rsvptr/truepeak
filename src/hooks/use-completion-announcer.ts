@@ -21,8 +21,11 @@ export function useCompletionAnnouncer(jobs: AnalysisJob[]) {
     const activeJobs = jobs.filter(isActiveJob);
     if (activeJobs.length) {
       activeJobs.forEach((job) => announcedBatchIdsRef.current.add(job.id));
+      // Clear the previous announcement once per batch, not on every progress tick.
+      if (!batchWasActiveRef.current) {
+        setAnnouncement("");
+      }
       batchWasActiveRef.current = true;
-      setAnnouncement("");
       return;
     }
 

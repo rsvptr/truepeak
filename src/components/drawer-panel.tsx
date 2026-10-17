@@ -2,6 +2,7 @@
 
 import { useId, useRef, type ReactNode } from "react";
 import { X } from "lucide-react";
+import { useExitPresence } from "@/hooks/use-exit-presence";
 import { useModalFocus } from "@/hooks/use-modal-focus";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
@@ -38,19 +39,36 @@ export function DrawerPanel({
     onClose,
     getInitialFocus: () => closeButtonRef.current,
   });
+  // useModalFocus is keyed on `open`, so the modal layer (stack entry, inert
+  // background, scroll lock, focus restore) is released the moment `open`
+  // flips false; only the visuals linger, inert, for the exit animation.
+  const { mounted, exiting, onAnimationEnd } = useExitPresence(open);
 
-  if (!open) {
+  if (!mounted) {
     return null;
   }
 
   return (
-    <div ref={containerRef} className="fixed inset-0 z-50" aria-hidden={false}>
+    <div
+      ref={containerRef}
+      className={cn("fixed inset-0 z-50", exiting && "pointer-events-none")}
+      aria-hidden={false}
+    >
+      {/* Preventing the mousedown default keeps focus inside the panel, so a
+          guard dialog opened by onClose (dirty preset draft) restores focus
+          there instead of to <body>. */}
       <div
         aria-hidden="true"
-        className="tp-fade-in absolute inset-0 touch-none overscroll-contain bg-black/55 backdrop-blur-sm"
+        className={cn(
+          exiting ? "tp-fade-out" : "tp-fade-in",
+          "absolute inset-0 touch-none overscroll-contain bg-black/55 backdrop-blur-sm",
+        )}
+        onMouseDown={(event) => event.preventDefault()}
         onClick={onClose}
       />
-      <div className="absolute inset-0 flex items-end justify-stretch lg:items-stretch lg:justify-end">
+      {/* pointer-events-none lets clicks outside the panel fall through to
+          the backdrop (which closes the drawer); the panel re-enables them. */}
+      <div className="pointer-events-none absolute inset-0 flex items-end justify-stretch lg:items-stretch lg:justify-end">
         <div
           ref={panelRef}
           role="dialog"
@@ -58,8 +76,11 @@ export function DrawerPanel({
           aria-labelledby={titleId}
           aria-describedby={description ? descriptionId : undefined}
           tabIndex={-1}
+          inert={exiting}
+          onAnimationEnd={onAnimationEnd}
           className={cn(
-            "tp-drawer-in relative flex w-full flex-col border border-[var(--line)] bg-[var(--surface-1)] shadow-[var(--shadow-elevated)] overscroll-contain focus:outline-none",
+            exiting ? "tp-drawer-out" : "tp-drawer-in pointer-events-auto",
+            "relative flex w-full flex-col border border-[var(--line)] bg-[var(--surface-1)] shadow-[var(--shadow-elevated)] overscroll-contain focus:outline-none",
             mobileMode === "full"
               ? "h-[100dvh] rounded-none"
               : "max-h-[88dvh] rounded-t-[28px] border-b-0",
@@ -73,7 +94,7 @@ export function DrawerPanel({
                 keep a filename-length title from ever hiding the control
                 behind it (UX-034). */}
             <div className="min-w-0 flex-1">
-              <div className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">
+              <div className="text-[0.6875rem] uppercase tracking-[0.18em] text-[var(--muted)]">
                 Studio panel
               </div>
               <h2

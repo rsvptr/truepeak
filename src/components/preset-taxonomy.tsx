@@ -58,9 +58,9 @@ export const PRESET_PURPOSE_ORDER: readonly PresetPurpose[] = [
 ];
 
 export const PRESET_PURPOSE_LABEL: Record<PresetPurpose, string> = {
-  delivery: "Delivery Guidance",
-  playback: "Playback References",
-  recommendation: "TruePeak Recommendations",
+  delivery: "Delivery guidance",
+  playback: "Playback references",
+  recommendation: "TruePeak recommendations",
   custom: "Custom",
 };
 
@@ -96,9 +96,9 @@ export const GROUPED_PRESETS: PresetGroup[] = PRESET_PURPOSE_ORDER.filter(
 export function provenanceLabel(evidence: TargetPreset["evidence"]): string {
   switch (evidence) {
     case "official":
-      return "Published Guidance";
+      return "Published guidance";
     case "inferred":
-      return "TruePeak Recommendation";
+      return "TruePeak recommendation";
     case "custom":
     default:
       return "Custom";

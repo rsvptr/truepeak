@@ -9,7 +9,7 @@ import { describeJobBadges, getJobErrorDisplay, getViewOnlyHint } from "@/lib/jo
 import { complianceToneClass, statusToneClass } from "@/lib/status-tone";
 import { isActiveJob, isIssueJob } from "@/lib/session-selectors";
 import { cn } from "@/lib/utils";
-import type { AnalysisJob, AnalysisMode, SourceFormat } from "@/types/audio";
+import type { AnalysisJob, AnalysisMode, DecoderMode, SourceFormat } from "@/types/audio";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
@@ -59,6 +59,38 @@ function formatSourceFormatLabel(sourceFormat: SourceFormat) {
   }
 }
 
+function formatDecoderModeLabel(decoderMode: DecoderMode) {
+  switch (decoderMode) {
+    case "native-parser":
+      return "Native parser";
+    case "ffmpeg-wasm":
+      return "FFmpeg (WebAssembly)";
+    case "browser-audio":
+    default:
+      return "Browser audio";
+  }
+}
+
+// Ref callback for the inspector's single Retry/Cancel slot. The slot
+// unmounts when neither action applies (e.g. the job finished while Cancel
+// had focus); React detaches refs before it removes the node, so focus can
+// move to the selected detail tab instead of dropping to <body>.
+// Module-level so its identity is stable and the cleanup only runs on unmount.
+function keepInspectorActionFocus(element: HTMLButtonElement | null) {
+  if (!element) {
+    return;
+  }
+  return () => {
+    if (element.ownerDocument.activeElement !== element) {
+      return;
+    }
+    element
+      .closest("[data-inspector-panel]")
+      ?.querySelector<HTMLElement>('[role="tab"][tabindex="0"]')
+      ?.focus({ preventScroll: true });
+  };
+}
+
 function InspectorMetric({
   label,
   value,
@@ -79,7 +111,7 @@ function InspectorMetric({
           : "border-[var(--line)]/80 bg-[var(--surface-1)]",
       )}
     >
-      <div className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">{label}</div>
+      <div className="text-[0.6875rem] uppercase tracking-[0.18em] text-[var(--muted)]">{label}</div>
       <div className="mt-2 break-words text-xl font-semibold text-[var(--ink)] tabular-nums">{value}</div>
       <p className="mt-2 break-words text-xs leading-5 text-[var(--muted)]">{hint}</p>
     </div>
@@ -123,7 +155,7 @@ export const InspectorPanel = memo(function InspectorPanel({
   );
 });
 
-function InspectorPanelContent({
+const InspectorPanelContent = memo(function InspectorPanelContent({
   job,
   analysisMode,
   detailTab,
@@ -166,6 +198,8 @@ function InspectorPanelContent({
     : [];
   const errorDisplay = getJobErrorDisplay(job.error);
   const viewOnlyHint = getViewOnlyHint(job);
+  const isActive = isActiveJob(job);
+  const isIssue = isIssueJob(job);
   const inspectorBadgeOrder = new Map([
     ["status", 0],
     ["imported", 1],
@@ -266,16 +300,17 @@ function InspectorPanelContent({
   };
 
   return (
-    <Card className="p-5 sm:p-6">
+    <Card className="p-5 sm:p-6" data-inspector-panel="">
       <div className="flex flex-col gap-4 border-b border-[var(--line)]/80 pb-5">
         <div className="flex flex-col gap-4 xl:flex-row xl:items-start xl:justify-between">
           <div className="min-w-0">
-            <div className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">File details</div>
+            <div className="text-[0.6875rem] uppercase tracking-[0.18em] text-[var(--muted)]">File details</div>
             <h2
               id={headingId}
               ref={headingRef}
               tabIndex={headingTabIndex}
-              className="mt-2 break-words text-2xl font-semibold leading-tight text-[var(--ink)] focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)]"
+              dir="auto"
+              className="mt-2 break-words text-2xl font-semibold leading-tight text-[var(--ink)] focus:outline-hidden focus-visible:ring-2 focus-visible:ring-[var(--accent)]"
             >
               {job.fileName}
             </h2>
@@ -298,16 +333,19 @@ function InspectorPanelContent({
                 Compare
               </Button>
             ) : null}
-            {isIssueJob(job) ? (
-              <Button type="button" size="sm" variant="secondary" onClick={() => onRetryJob(job.id)} aria-label={`Retry ${job.fileName}`}>
-                <RefreshCcw className="h-4 w-4" />
-                Retry
-              </Button>
-            ) : null}
-            {isActiveJob(job) ? (
-              <Button type="button" size="sm" variant="ghost" onClick={() => onCancelJob(job.id)} aria-label={`Cancel ${job.fileName}`}>
-                <Square className="h-4 w-4" />
-                Cancel
+            {/* One element for Retry and Cancel, so Cancel turning into Retry
+                (or back) keeps the same focused node. */}
+            {isIssue || isActive ? (
+              <Button
+                ref={keepInspectorActionFocus}
+                type="button"
+                size="sm"
+                variant={isIssue ? "secondary" : "ghost"}
+                onClick={() => (isIssue ? onRetryJob(job.id) : onCancelJob(job.id))}
+                aria-label={`${isIssue ? "Retry" : "Cancel"} ${job.fileName}`}
+              >
+                {isIssue ? <RefreshCcw className="h-4 w-4" /> : <Square className="h-4 w-4" />}
+                {isIssue ? "Retry" : "Cancel"}
               </Button>
             ) : null}
           </div>
@@ -317,11 +355,11 @@ function InspectorPanelContent({
           <div className={cn("grid gap-3", analysisMode === "targeted" ? "md:grid-cols-2 2xl:grid-cols-3" : "md:grid-cols-2 xl:grid-cols-3")}>
             <InspectorMetric label="Integrated" value={formatIntegratedLufs(result.metrics)} hint={result.metrics.integratedValid === false ? describeIntegratedInvalidReason(result.metrics.integratedInvalidReason) : selectedTarget?.label ?? "Measured loudness"} accent />
             <InspectorMetric label="True peak" value={formatPeakDbtp(result.metrics.truePeakDbtp)} hint="Measured true peak" />
-            <InspectorMetric label="LRA" value={formatLoudnessRange(result.metrics)} hint={result.metrics.loudnessRangeValid === false ? "Fewer than two complete 3 second windows" : result.metrics.loudnessRangeUnstable === true ? "Programme is under 60 seconds; LRA is not statistically stable" : "Loudness range"} />
+            <InspectorMetric label="LRA" value={formatLoudnessRange(result.metrics)} hint={result.metrics.loudnessRangeValid === false ? "Fewer than two complete 3 second windows" : result.metrics.loudnessRangeUnstable === true ? "Program is under 60 seconds; LRA is not statistically stable" : "Loudness range"} />
             {analysisMode === "targeted" ? (
               <>
                 <InspectorMetric label="Gain move" value={formatRelativeDb(result.metrics.targetDeltaDb)} hint={result.metrics.normalizationLimited ? "Limited by ceiling" : "Planned normalization move"} />
-                <InspectorMetric label="Projected TP" value={formatPeakDbtp(result.metrics.projectedTruePeakDbtp)} hint="After planned normalization" />
+                <InspectorMetric label="Projected peak" value={formatPeakDbtp(result.metrics.projectedTruePeakDbtp)} hint="After planned normalization" />
               </>
             ) : (
               <>
@@ -353,9 +391,9 @@ function InspectorPanelContent({
               id={`inspector-tab-${tab.id}`}
               tabIndex={detailTab === tab.id ? 0 : -1}
               className={cn(
-                "rounded-full border px-3 py-2 text-xs font-semibold uppercase tracking-[0.16em] transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)] disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:border-[var(--line)]",
+                "rounded-full border px-3 py-2 text-xs font-semibold uppercase tracking-[0.16em] transition-[background-color,border-color,color,opacity,scale] duration-150 ease-out aria-selected:transition-[scale] motion-safe:enabled:active:scale-[0.97] focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-[var(--accent)] disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:border-[var(--line)]",
                 detailTab === tab.id
-                  ? "border-[color:var(--accent)] bg-[color:var(--accent-soft)] text-[var(--ink)]"
+                  ? "border-[color:var(--accent)] bg-[color:var(--accent-soft)] text-[var(--ink)] forced-colors:border-[Highlight] forced-colors:bg-[Highlight] forced-colors:text-[HighlightText] forced-colors:forced-color-adjust-none"
                   : "border-[var(--line)] bg-[var(--surface-1)] text-[var(--muted)] hover:border-[color:var(--accent)]/30",
               )}
             >
@@ -370,10 +408,11 @@ function InspectorPanelContent({
           id="inspector-panel-overview"
           role="tabpanel"
           aria-labelledby="inspector-tab-overview"
-          className="mt-5 rounded-[24px] border border-[var(--line)] bg-[var(--surface-1)] p-5"
+          tabIndex={0}
+          className="mt-5 rounded-[24px] border border-[var(--line)] bg-[var(--surface-1)] p-5 focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-[var(--accent)]"
         >
           <div className="flex items-center gap-3 text-[var(--muted)]">
-            {isActiveJob(job) ? (
+            {isActive ? (
               // Spin a wrapper element, not the SVG itself: transforms on SVG
               // elements are not hardware accelerated in several browsers.
               <span className="inline-flex animate-spin">
@@ -382,11 +421,11 @@ function InspectorPanelContent({
             ) : (
               <CircleAlert className="h-5 w-5 text-[var(--accent)]" aria-hidden="true" />
             )}
-            <div className="text-[11px] uppercase tracking-[0.18em]">Status</div>
+            <div className="text-[0.6875rem] uppercase tracking-[0.18em]">Status</div>
           </div>
           <div className="mt-4 flex items-center justify-between gap-3 text-sm text-[var(--muted)]">
             <span>{job.progressLabel}</span>
-            <span>{Math.round(job.progressPercent * 100)}%</span>
+            <span className="tabular-nums">{Math.round(job.progressPercent * 100)}%</span>
           </div>
           <div className="mt-3">
             <Progress value={job.progressPercent * 100} label={`${job.fileName}: ${job.progressLabel}`} />
@@ -404,9 +443,9 @@ function InspectorPanelContent({
       ) : null}
 
       {result && detailTab === "overview" ? (
-        <div id="inspector-panel-overview" role="tabpanel" aria-labelledby="inspector-tab-overview" className="mt-5 space-y-4">
+        <div id="inspector-panel-overview" role="tabpanel" aria-labelledby="inspector-tab-overview" tabIndex={0} className="mt-5 space-y-4 rounded-[24px] focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-[var(--accent)]">
           <section className="rounded-[24px] border border-[var(--line)]/80 bg-[var(--surface-1)] p-5">
-            <h3 className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">Loudness</h3>
+            <h3 className="text-[0.6875rem] uppercase tracking-[0.18em] text-[var(--muted)]">Loudness</h3>
             <div className="mt-4 grid gap-3 md:grid-cols-2">
               <InspectorMetric label="Integrated" value={formatIntegratedLufs(result.metrics)} hint={result.metrics.integratedValid === false ? describeIntegratedInvalidReason(result.metrics.integratedInvalidReason) : "Primary LUFS reading"} accent />
               <InspectorMetric label="Ungated" value={formatLufs(result.metrics.ungatedLufs)} hint="Before gating" />
@@ -416,22 +455,22 @@ function InspectorPanelContent({
           </section>
 
           <section className="rounded-[24px] border border-[var(--line)]/80 bg-[var(--surface-1)] p-5">
-            <h3 className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">Peaks and dynamics</h3>
+            <h3 className="text-[0.6875rem] uppercase tracking-[0.18em] text-[var(--muted)]">Peaks and dynamics</h3>
             <div className="mt-4 grid gap-3 md:grid-cols-2">
               <InspectorMetric label="True peak" value={formatPeakDbtp(result.metrics.truePeakDbtp)} hint="Measured true peak" accent />
               <InspectorMetric label="Sample peak" value={formatDb(result.metrics.samplePeakDbfs, "dBFS")} hint="Highest sample peak" />
-              <InspectorMetric label="LRA" value={formatLoudnessRange(result.metrics)} hint={result.metrics.loudnessRangeValid === false ? "Fewer than two complete 3 second windows" : result.metrics.loudnessRangeUnstable === true ? "Programme is under 60 seconds; LRA is not statistically stable" : "Loudness range"} />
+              <InspectorMetric label="LRA" value={formatLoudnessRange(result.metrics)} hint={result.metrics.loudnessRangeValid === false ? "Fewer than two complete 3 second windows" : result.metrics.loudnessRangeUnstable === true ? "Program is under 60 seconds; LRA is not statistically stable" : "Loudness range"} />
               <InspectorMetric label="Timeline points" value={String(result.metrics.timeline.timeSeconds.length)} hint="Momentary, short-term, and peak samples" />
             </div>
           </section>
 
           {analysisMode === "targeted" && selectedTarget ? (
             <section className="rounded-[24px] border border-[var(--line)]/80 bg-[var(--surface-1)] p-5">
-              <h3 className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">Normalization and delivery</h3>
+              <h3 className="text-[0.6875rem] uppercase tracking-[0.18em] text-[var(--muted)]">Normalization and delivery</h3>
               <div className="mt-4 grid gap-3 md:grid-cols-2">
                 <InspectorMetric label="Requested move" value={formatRelativeDb(result.metrics.unclampedTargetDeltaDb)} hint="Needed before ceiling protection" />
                 <InspectorMetric label="Applied move" value={formatRelativeDb(result.metrics.targetDeltaDb)} hint={result.metrics.normalizationLimited ? "Capped to protect projected true peak" : "Move toward target"} accent={result.metrics.normalizationLimited} />
-                <InspectorMetric label="Projected TP" value={formatPeakDbtp(result.metrics.projectedTruePeakDbtp)} hint="After planned normalization" />
+                <InspectorMetric label="Projected peak" value={formatPeakDbtp(result.metrics.projectedTruePeakDbtp)} hint="After planned normalization" />
                 <InspectorMetric label="Policy" value={selectedTarget.policy === "protect-true-peak" ? "Protect ceiling" : "Hit target"} hint="Current normalization strategy" />
               </div>
               <div className="mt-4 flex flex-wrap gap-2">
@@ -446,7 +485,7 @@ function InspectorPanelContent({
             </section>
           ) : (
             <section className="rounded-[24px] border border-[var(--line)]/80 bg-[var(--surface-1)] p-5 text-sm leading-6 text-[var(--muted)]">
-              <div className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">No target active</div>
+              <div className="text-[0.6875rem] uppercase tracking-[0.18em] text-[var(--muted)]">No target active</div>
               <p className="mt-3">
                 These numbers are the measured source values. No gain move or compliance label is being applied.
               </p>
@@ -454,7 +493,7 @@ function InspectorPanelContent({
           )}
 
           <section className="rounded-[24px] border border-[var(--line)]/80 bg-[var(--surface-1)] p-5">
-            <h3 className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">Technical details</h3>
+            <h3 className="text-[0.6875rem] uppercase tracking-[0.18em] text-[var(--muted)]">Technical details</h3>
             <div className="mt-4 grid gap-3 md:grid-cols-2">
               <InspectorMetric label="Decoder" value={result.metadata.decoderLabel} hint={result.metadata.decoderSummary} accent />
               <InspectorMetric label="Source" value={formatSourceFormatLabel(result.metadata.sourceFormat)} hint={result.metadata.mimeType || "Audio source"} />
@@ -474,7 +513,7 @@ function InspectorPanelContent({
               warning-coloured panel. */}
           {selectedNotes.length ? (
             <section className="rounded-[24px] border border-[var(--warning-line)] bg-[var(--warning-soft)] p-5">
-              <div className="flex items-center gap-2 text-[11px] uppercase tracking-[0.18em] text-[var(--warning)]">
+              <div className="flex items-center gap-2 text-[0.6875rem] uppercase tracking-[0.18em] text-[var(--warning)]">
                 <CircleAlert className="h-4 w-4" aria-hidden="true" />
                 Notes and warnings
               </div>
@@ -493,7 +532,7 @@ function InspectorPanelContent({
       {result && detailTab === "timeline" ? (
         <div id="inspector-panel-timeline" role="tabpanel" aria-labelledby="inspector-tab-timeline" className="mt-5 space-y-4">
           <section className="rounded-[24px] border border-[var(--line)]/80 bg-[var(--surface-1)] p-5">
-            <div className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">Timeline review</div>
+            <div className="text-[0.6875rem] uppercase tracking-[0.18em] text-[var(--muted)]">Timeline review</div>
             <div className="mt-4">
               <TimelineChart timeline={result.metrics.timeline} />
             </div>
@@ -507,9 +546,9 @@ function InspectorPanelContent({
       ) : null}
 
       {result && detailTab === "metadata" ? (
-        <div id="inspector-panel-metadata" role="tabpanel" aria-labelledby="inspector-tab-metadata" className="mt-5 grid gap-4 xl:grid-cols-2">
+        <div id="inspector-panel-metadata" role="tabpanel" aria-labelledby="inspector-tab-metadata" tabIndex={0} className="mt-5 grid gap-4 rounded-[24px] focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-[var(--accent)] xl:grid-cols-2">
           <section className="rounded-[24px] border border-[var(--line)]/80 bg-[var(--surface-1)] p-5">
-            <div className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">Technical metadata</div>
+            <div className="text-[0.6875rem] uppercase tracking-[0.18em] text-[var(--muted)]">Technical metadata</div>
             <div className="mt-4 grid gap-3 md:grid-cols-2">
               <InspectorMetric
                 label={result.metadata.decoderMode === "browser-audio" ? "Decoded sample rate" : "Sample rate"}
@@ -527,19 +566,19 @@ function InspectorPanelContent({
           </section>
 
           <section className="rounded-[24px] border border-[var(--line)]/80 bg-[var(--surface-1)] p-5">
-            <div className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">Container and decode path</div>
+            <div className="text-[0.6875rem] uppercase tracking-[0.18em] text-[var(--muted)]">Container and decode path</div>
             <div className="mt-4 space-y-3 break-words text-sm leading-6 text-[var(--muted)]">
               <div className="rounded-[18px] border border-[var(--line)] bg-[var(--surface-0)] px-4 py-3">
                 <span className="font-semibold text-[var(--ink)]">Container</span>: {formatSourceFormatLabel(result.metadata.sourceFormat)}
               </div>
               <div className="rounded-[18px] border border-[var(--line)] bg-[var(--surface-0)] px-4 py-3">
-                <span className="font-semibold text-[var(--ink)]">Decoder mode</span>: {result.metadata.decoderMode}
+                <span className="font-semibold text-[var(--ink)]">Decoder mode</span>: {formatDecoderModeLabel(result.metadata.decoderMode)}
               </div>
               <div className="rounded-[18px] border border-[var(--line)] bg-[var(--surface-0)] px-4 py-3">
                 <span className="font-semibold text-[var(--ink)]">Decoder summary</span>: {result.metadata.decoderSummary}
               </div>
               <div className="rounded-[18px] border border-[var(--line)] bg-[var(--surface-0)] px-4 py-3">
-                <span className="font-semibold text-[var(--ink)]">Policy</span>: {selectedTarget ? (selectedTarget.policy === "protect-true-peak" ? "Protect ceiling" : "Hit target") : "Measure Only"}
+                <span className="font-semibold text-[var(--ink)]">Policy</span>: {selectedTarget ? (selectedTarget.policy === "protect-true-peak" ? "Protect ceiling" : "Hit target") : "Measure only"}
               </div>
             </div>
           </section>
@@ -547,7 +586,7 @@ function InspectorPanelContent({
       ) : null}
     </Card>
   );
-}
+});
 
 
 

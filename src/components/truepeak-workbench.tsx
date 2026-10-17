@@ -2,6 +2,7 @@
 
 import {
   useCallback,
+  useDeferredValue,
   useEffect,
   useMemo,
   useRef,
@@ -46,6 +47,7 @@ import {
   formatLufs,
   formatPeakDbtp,
 } from "@/lib/format";
+import { THEME_COLOR } from "@/lib/theme-color";
 import { cn } from "@/lib/utils";
 import type {
   DecodePreference,
@@ -73,6 +75,7 @@ import {
   subscribeParallelPreference,
   subscribeThemePreference,
   type ParallelLanesPreference,
+  type WorkspaceTheme,
   writeHistoryPreference,
   writeParallelPreference,
   writeThemePreference,
@@ -83,6 +86,16 @@ import { Card } from "@/components/ui/card";
 
 export { WorkspaceNotices };
 
+function applyDocumentTheme(theme: WorkspaceTheme) {
+  document.documentElement.dataset.theme = theme;
+  const color = theme === "light" ? THEME_COLOR.light : THEME_COLOR.dark;
+  document.querySelectorAll<HTMLMetaElement>('meta[name="theme-color"]').forEach((meta) => {
+    meta.content = color;
+  });
+}
+
+// Changes that do not come from the toggle (the OS theme, the initial load)
+// apply here without a transition; the toggle applies its own change first.
 function ThemeSynchronizer() {
   const theme = useSyncExternalStore(
     subscribeThemePreference,
@@ -91,17 +104,13 @@ function ThemeSynchronizer() {
   );
 
   useEffect(() => {
-    document.documentElement.dataset.theme = theme;
-    const color = theme === "light" ? "#f6faf8" : "#071412";
-    document.querySelectorAll<HTMLMetaElement>('meta[name="theme-color"]').forEach((meta) => {
-      meta.content = color;
-    });
+    applyDocumentTheme(theme);
   }, [theme]);
 
   return null;
 }
 
-const LARGE_WORKSPACE_QUERY = "(min-width: 1024px)";
+const LARGE_WORKSPACE_QUERY = "(min-width: 64rem)";
 
 function readLargeWorkspace() {
   return typeof window !== "undefined" && window.matchMedia(LARGE_WORKSPACE_QUERY).matches;
@@ -166,6 +175,7 @@ const SUPPORTED_FORMATS = [
   "OGG/Opus",
 ];
 const numberFormatter = new Intl.NumberFormat("en-GB");
+const UI_NOTICE_DURATION_MS = 6000;
 const QUEUE_FILTERS: Array<{ id: QueueFilter; label: string }> = [
   { id: "all", label: "All" },
   { id: "active", label: "Active" },
@@ -226,6 +236,14 @@ function shouldIgnoreQueueNavigationTarget(target: EventTarget | null) {
   return !!target.closest(
     "a, button, input, select, textarea, summary, [contenteditable='true'], [role='button'], [role='menuitem'], [role='tab']",
   );
+}
+
+// Both presentations (mobile card, desktop row) are mounted and only
+// CSS-hidden, so offsetParent picks the visible one.
+function findQueueNavTarget(region: HTMLElement, jobId: string) {
+  return Array.from(
+    region.querySelectorAll<HTMLElement>('[data-queue-nav="true"]'),
+  ).find((element) => element.dataset.jobId === jobId && element.offsetParent !== null);
 }
 
 export function TruePeakWorkbench() {
@@ -308,11 +326,31 @@ export function TruePeakWorkbench() {
   const setParallelPreference = useCallback((next: ParallelLanesPreference) => {
     writeParallelPreference(next);
   }, []);
+  // A user toggle cross-fades the whole page (root view transition). The next
+  // theme is read inside the update so rapid toggles still alternate.
   const toggleTheme = useCallback(() => {
-    writeThemePreference(readThemePreference() === "dark" ? "light" : "dark");
+    const flipTheme = () => {
+      const next = readThemePreference() === "dark" ? "light" : "dark";
+      applyDocumentTheme(next);
+      writeThemePreference(next);
+    };
+    if (
+      typeof document.startViewTransition === "function" &&
+      !window.matchMedia("(prefers-reduced-motion: reduce)").matches
+    ) {
+      document.startViewTransition(flipTheme);
+    } else {
+      flipTheme();
+    }
   }, []);
   const [uiNotice, setUiNotice] = useState<string | null>(null);
-  const uiNoticeTimeoutRef = useRef<number | null>(null);
+  const uiNoticeTimerRef = useRef({
+    timeoutId: null as number | null,
+    remainingMs: 0,
+    startedAt: 0,
+    hovered: false,
+    focused: false,
+  });
   const isLargeScreen = useSyncExternalStore(
     subscribeLargeWorkspace,
     readLargeWorkspace,
@@ -329,6 +367,7 @@ export function TruePeakWorkbench() {
   // a tick that drives the focus effect independently of selection resolution.
   const queueRegionRef = useRef<HTMLDivElement | null>(null);
   const pendingQueueFocusRef = useRef<string | null>(null);
+  const pendingQueueFocusRecoveryRef = useRef<string[] | null>(null);
   const [queueFocusTick, setQueueFocusTick] = useState(0);
 
   useEffect(() => {
@@ -344,29 +383,86 @@ export function TruePeakWorkbench() {
   }, [updateWorkspaceRoute, workspaceDrawer]);
 
   const toggleHistoryEnabled = useCallback(() => {
-    setHistoryEnabled(!historyEnabled);
-  }, [historyEnabled, setHistoryEnabled]);
+    setHistoryEnabled(!readHistoryPreference());
+  }, [setHistoryEnabled]);
+
+  // The confirmation timer pauses while the tab is hidden and while the
+  // notice is hovered or focused, and resumes with the time it had left.
+  const pauseUiNoticeTimer = useCallback(() => {
+    const timer = uiNoticeTimerRef.current;
+    if (timer.timeoutId == null) {
+      return;
+    }
+    window.clearTimeout(timer.timeoutId);
+    timer.timeoutId = null;
+    timer.remainingMs = Math.max(1, timer.remainingMs - (Date.now() - timer.startedAt));
+  }, []);
+
+  const resumeUiNoticeTimer = useCallback(() => {
+    const timer = uiNoticeTimerRef.current;
+    if (
+      timer.timeoutId != null ||
+      timer.remainingMs <= 0 ||
+      timer.hovered ||
+      timer.focused ||
+      document.visibilityState === "hidden"
+    ) {
+      return;
+    }
+    timer.startedAt = Date.now();
+    timer.timeoutId = window.setTimeout(() => {
+      timer.timeoutId = null;
+      timer.remainingMs = 0;
+      setUiNotice(null);
+    }, timer.remainingMs);
+  }, []);
 
   useEffect(() => {
-    return () => {
-      if (uiNoticeTimeoutRef.current) {
-        window.clearTimeout(uiNoticeTimeoutRef.current);
+    const timer = uiNoticeTimerRef.current;
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === "hidden") {
+        pauseUiNoticeTimer();
+      } else {
+        resumeUiNoticeTimer();
       }
     };
-  }, []);
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    return () => {
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+      if (timer.timeoutId != null) {
+        window.clearTimeout(timer.timeoutId);
+      }
+    };
+  }, [pauseUiNoticeTimer, resumeUiNoticeTimer]);
+
+  const holdUiNotice = useCallback((reason: "hover" | "focus", held: boolean) => {
+    const timer = uiNoticeTimerRef.current;
+    if (reason === "hover") {
+      timer.hovered = held;
+    } else {
+      timer.focused = held;
+    }
+    if (held) {
+      pauseUiNoticeTimer();
+    } else {
+      resumeUiNoticeTimer();
+    }
+  }, [pauseUiNoticeTimer, resumeUiNoticeTimer]);
 
   const pushUiNotice = useCallback((message: string) => {
     setUiNotice(message);
-    if (uiNoticeTimeoutRef.current) {
-      window.clearTimeout(uiNoticeTimeoutRef.current);
-      uiNoticeTimeoutRef.current = null;
+    const timer = uiNoticeTimerRef.current;
+    if (timer.timeoutId != null) {
+      window.clearTimeout(timer.timeoutId);
+      timer.timeoutId = null;
     }
-
-    uiNoticeTimeoutRef.current = window.setTimeout(() => {
-      setUiNotice(null);
-      uiNoticeTimeoutRef.current = null;
-    }, 3600);
-  }, []);
+    timer.remainingMs = UI_NOTICE_DURATION_MS;
+    // The region collapses to sr-only between notices without a pointerleave,
+    // so a hold left over from an earlier notice must not freeze this one.
+    timer.hovered = false;
+    timer.focused = false;
+    resumeUiNoticeTimer();
+  }, [resumeUiNoticeTimer]);
 
   const connectionNoticeShownRef = useRef(false);
   useEffect(() => {
@@ -385,6 +481,10 @@ export function TruePeakWorkbench() {
     restoreSettled,
     recentSessions,
     notice,
+    errorNotice,
+    dismissErrorNotice,
+    persistentNotice,
+    dismissPersistentNotice,
     persistenceIssue,
     workerCircuitIssue,
     parallelLimit,
@@ -443,6 +543,10 @@ export function TruePeakWorkbench() {
     queueSort,
     selectedJobId,
   });
+  // The advanced list renders every row, so it renders from a deferred copy
+  // to keep filter, sort, and view switches responsive. Keyboard navigation
+  // and selection keep using the up-to-date list.
+  const deferredQueueJobs = useDeferredValue(sortedQueueJobs);
   // Two independent channels (UX-035): a persistent warning region holds
   // worker and storage/recovery failures with clear warning styling until they resolve,
   // while a separate transient polite region carries short-lived action
@@ -460,12 +564,12 @@ export function TruePeakWorkbench() {
     ? {
         title: "No files match this view",
         body: "Reset the queue view to show the current session again, or add more files.",
-        actionLabel: "Reset View",
+        actionLabel: "Reset view",
       }
     : {
         title: "No files queued yet",
         body: "Add audio files to start a local loudness and true peak review.",
-        actionLabel: "Add Files",
+        actionLabel: "Add files",
       };
   const simpleInlineInspector = activeWorkspaceTab === "queue" && uiMode === "simple" && isLargeScreen;
   // Advanced now shows the inspector inline only on large screens; below the
@@ -480,34 +584,103 @@ export function TruePeakWorkbench() {
     activeWorkspaceTab === "queue" &&
     !useInlineInspector;
 
+  // Progress ticks replace the job arrays without changing which ids they
+  // hold, so the id Sets are keyed on the id lists. Route normalisation then
+  // reruns only when membership (or another input) actually changes.
+  const jobIdsKey = useMemo(() => jobs.map((job) => job.id).join("\n"), [jobs]);
+  const completedJobIdsKey = useMemo(
+    () => completedJobs.map((job) => job.id).join("\n"),
+    [completedJobs],
+  );
+  const jobIds = useMemo(() => new Set(jobIdsKey ? jobIdsKey.split("\n") : []), [jobIdsKey]);
+  const completedJobIds = useMemo(
+    () => new Set(completedJobIdsKey ? completedJobIdsKey.split("\n") : []),
+    [completedJobIdsKey],
+  );
+  const selectedJobAvailable = selectedJob != null;
   const routeNormalizationOptions = useMemo(() => ({
-    completedJobIds: new Set(completedJobs.map((job) => job.id)),
+    completedJobIds,
     historyEnabled,
-    jobIds: new Set(jobs.map((job) => job.id)),
+    jobIds,
     resolvedSelectedJobId,
     restoreSettled,
-    selectedJobAvailable: selectedJob != null,
+    selectedJobAvailable,
     showInlineInspector,
   }), [
-    completedJobs,
+    completedJobIds,
     historyEnabled,
-    jobs,
+    jobIds,
     resolvedSelectedJobId,
     restoreSettled,
-    selectedJob,
+    selectedJobAvailable,
     showInlineInspector,
   ]);
   useNormalizeWorkspaceRoute(workspaceRoute, routeNormalizationOptions);
 
+  // The control that moved the user from home to the session view unmounts
+  // with the home screen, so focus moves to the session heading instead of
+  // dropping to <body>. Only these user-driven transitions request it; a
+  // reload or restore straight into the session view leaves focus alone.
+  // goHome does the same in reverse with the home heading. Both transitions
+  // also start the new screen at the top instead of the old scroll offset.
+  const sessionHeadingRef = useRef<HTMLHeadingElement | null>(null);
+  const pendingSessionHeadingFocusRef = useRef(false);
+  const homeHeadingRef = useRef<HTMLHeadingElement | null>(null);
+  const pendingHomeHeadingFocusRef = useRef(false);
+  useEffect(() => {
+    if (workspaceScreen === "session" && pendingSessionHeadingFocusRef.current) {
+      pendingSessionHeadingFocusRef.current = false;
+      window.scrollTo(0, 0);
+      sessionHeadingRef.current?.focus({ preventScroll: true });
+    } else if (workspaceScreen === "home" && pendingHomeHeadingFocusRef.current) {
+      pendingHomeHeadingFocusRef.current = false;
+      window.scrollTo(0, 0);
+      homeHeadingRef.current?.focus({ preventScroll: true });
+    }
+  }, [workspaceScreen]);
+
+  useEffect(() => {
+    if (workspaceScreen === "home") {
+      document.title = "TruePeak";
+      return;
+    }
+    const tabLabel = SESSION_TABS.find((tab) => tab.id === activeWorkspaceTab)?.label ?? "Queue";
+    document.title = `${tabLabel} · Review session · TruePeak`;
+  }, [activeWorkspaceTab, workspaceScreen]);
+
+  // Dismissing a notice removes the focused button, so focus moves to a
+  // stable target instead of falling to <body>.
+  const focusStableTarget = useCallback(() => {
+    const target = sessionHeadingRef.current ?? mainRef.current;
+    if (!target) {
+      return;
+    }
+    if (!target.hasAttribute("tabindex")) {
+      target.setAttribute("tabindex", "-1");
+      target.addEventListener("blur", () => target.removeAttribute("tabindex"), { once: true });
+    }
+    target.focus({ preventScroll: true });
+  }, []);
+  const handleDismissError = useCallback(() => {
+    dismissErrorNotice();
+    focusStableTarget();
+  }, [dismissErrorNotice, focusStableTarget]);
+  const handleDismissPersistentNotice = useCallback(() => {
+    dismissPersistentNotice();
+    focusStableTarget();
+  }, [dismissPersistentNotice, focusStableTarget]);
+
   const openSessionWorkspace = useCallback(() => {
+    pendingSessionHeadingFocusRef.current = workspaceScreen === "home";
     updateWorkspaceRoute({ screen: "session", tab: "queue" }, { history: "push" });
-  }, [updateWorkspaceRoute]);
+  }, [updateWorkspaceRoute, workspaceScreen]);
   const handleFilesAdded = useCallback(() => {
+    pendingSessionHeadingFocusRef.current = workspaceScreen === "home";
     updateWorkspaceRoute(
       { screen: "session", tab: "queue", drawer: null },
       { history: "push" },
     );
-  }, [updateWorkspaceRoute]);
+  }, [updateWorkspaceRoute, workspaceScreen]);
   const {
     handleFiles,
     handleSessionFile,
@@ -528,11 +701,26 @@ export function TruePeakWorkbench() {
   // from the visible list, so the inspector keeping that job's data on
   // screen (see selectedJob above) is never mistaken for a stale or broken
   // view. "Show in list" clears the filter/search/sort so the row reappears.
+  // Reset view and Show in list unmount themselves, so focus moves to the
+  // search field. Inside the inspector drawer the field is inert behind the
+  // modal, so focus stays in the drawer instead.
+  const resetQueueViewAndFocusSearch = useCallback(() => {
+    const dialog = document.activeElement instanceof HTMLElement
+      ? document.activeElement.closest<HTMLElement>('[role="dialog"]')
+      : null;
+    resetQueueView();
+    const search = document.getElementById("queue-search");
+    if (search && !search.closest("[inert]")) {
+      search.focus();
+    } else {
+      dialog?.focus();
+    }
+  }, [resetQueueView]);
+
   const selectionHiddenNotice =
     selectedJobHiddenByFilter && selectedJob ? (
       <div
-        role="status"
-        className="tp-notice-in mb-4 flex items-start gap-3 rounded-[22px] border border-[color:var(--accent)]/15 bg-[color:var(--accent-soft)] px-4 py-3 text-sm text-[var(--ink)]"
+        className="mb-4 flex items-start gap-3 rounded-[22px] border border-[color:var(--accent)]/15 bg-[color:var(--accent-soft)] px-4 py-3 text-sm text-[var(--ink)]"
       >
         <Info className="mt-0.5 h-4 w-4 shrink-0 text-[var(--accent-text)]" aria-hidden="true" />
         <div className="min-w-0 flex-1">
@@ -542,7 +730,7 @@ export function TruePeakWorkbench() {
             {"."}
           </span>
           <div className="mt-2">
-            <Button type="button" size="sm" variant="secondary" onClick={resetQueueView}>
+            <Button type="button" size="sm" variant="secondary" onClick={resetQueueViewAndFocusSearch}>
               <RefreshCcw className="h-4 w-4" aria-hidden="true" />
               Show in list
             </Button>
@@ -555,10 +743,21 @@ export function TruePeakWorkbench() {
     retryJob(jobId);
   }, [retryJob]);
 
+  // aria-disabled, not disabled: the button stays focusable when the last
+  // issue clears, so focus does not drop to <body>.
   const retryIssueJobs = () => {
-
+    if (!queueCounts.issues) {
+      return;
+    }
     retryIssues();
   };
+
+  // Read at call time so a detail-tab switch does not replace selectJob (and
+  // with it chooseJob, which every queue row receives).
+  const detailTabRef = useRef(detailTab);
+  useEffect(() => {
+    detailTabRef.current = detailTab;
+  }, [detailTab]);
 
   // Deliberate open (click / Enter on a row / open-from-Compare). Pushes a
   // history entry (UX-013) and opens the inspector inline or as a drawer per
@@ -580,7 +779,7 @@ export function TruePeakWorkbench() {
       screen: "session",
       tab: "queue",
       job: jobId,
-      detail: detailTab || "overview",
+      detail: detailTabRef.current || "overview",
       drawer: useInlineInspector ? null : "inspector",
     };
 
@@ -590,7 +789,7 @@ export function TruePeakWorkbench() {
     }
 
     updateWorkspaceRoute(updates, { history: "push" });
-  }, [detailTab, setQueueSearchDraft, sortedQueueJobsRef, useInlineInspector, updateWorkspaceRoute]);
+  }, [setQueueSearchDraft, sortedQueueJobsRef, useInlineInspector, updateWorkspaceRoute]);
 
   const chooseJob = useCallback((jobId: string) => {
     // Only the advanced inline layout needs the programmatic scroll/focus to the
@@ -677,11 +876,7 @@ export function TruePeakWorkbench() {
 
     pendingInspectorFocusRef.current = false;
     const frame = window.requestAnimationFrame(() => {
-      const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-      advancedInspectorSectionRef.current?.scrollIntoView({
-        behavior: reduceMotion ? "auto" : "smooth",
-        block: "start",
-      });
+      advancedInspectorSectionRef.current?.scrollIntoView({ block: "start" });
       advancedInspectorHeadingRef.current?.focus({ preventScroll: true });
     });
 
@@ -693,23 +888,64 @@ export function TruePeakWorkbench() {
   // control ("Inspect <file>") is announced (UX-024). Runs after the commit so
   // the row exists; picks the visible presentation (mobile card vs desktop row)
   // via offsetParent, since both are mounted and only CSS-hidden.
+  //
+  // The same effect recovers focus after Remove or Cancel takes the focused
+  // control (or its whole row) away: the row itself if it is still listed,
+  // else the next row, else the previous one, else the queue region. It acts
+  // only once the deferred advanced list has caught up with the real one, and
+  // only when focus was actually lost.
   useEffect(() => {
-    const jobId = pendingQueueFocusRef.current;
-    if (!jobId) {
-      return;
-    }
     const region = queueRegionRef.current;
     if (!region) {
       return;
     }
-    const target = Array.from(
-      region.querySelectorAll<HTMLElement>('[data-queue-nav="true"]'),
-    ).find((element) => element.dataset.jobId === jobId && element.offsetParent !== null);
+    const listSettled = deferredQueueJobs === sortedQueueJobs;
+
+    const recovery = pendingQueueFocusRecoveryRef.current;
+    if (recovery && listSettled) {
+      pendingQueueFocusRecoveryRef.current = null;
+      const active = document.activeElement;
+      if (!active || active === document.body || !active.isConnected) {
+        const target = recovery
+          .map((jobId) => findQueueNavTarget(region, jobId))
+          .find((element) => element != null) ?? region;
+        target.focus();
+      }
+    }
+
+    const jobId = pendingQueueFocusRef.current;
+    if (!jobId) {
+      return;
+    }
+    const target = findQueueNavTarget(region, jobId);
     if (target) {
       pendingQueueFocusRef.current = null;
       target.focus();
+    } else if (listSettled) {
+      pendingQueueFocusRef.current = null;
     }
-  }, [queueFocusTick]);
+  }, [deferredQueueJobs, queueFocusTick, sortedQueueJobs]);
+
+  const queueFocusCandidates = useCallback((jobId: string, includeSelf: boolean) => {
+    const list = sortedQueueJobsRef.current;
+    const index = list.findIndex((job) => job.id === jobId);
+    const neighbours = index < 0 ? [] : [list[index + 1]?.id, list[index - 1]?.id];
+    return [includeSelf ? jobId : undefined, ...neighbours].filter(
+      (id): id is string => id != null,
+    );
+  }, [sortedQueueJobsRef]);
+
+  const removeJobAndRecoverFocus = useCallback((jobId: string) => {
+    pendingQueueFocusRecoveryRef.current = queueFocusCandidates(jobId, false);
+    removeJob(jobId);
+    setQueueFocusTick((current) => current + 1);
+  }, [queueFocusCandidates, removeJob]);
+
+  const cancelJobAndRecoverFocus = useCallback((jobId: string) => {
+    pendingQueueFocusRecoveryRef.current = queueFocusCandidates(jobId, true);
+    cancelJob(jobId);
+    setQueueFocusTick((current) => current + 1);
+  }, [cancelJob, queueFocusCandidates]);
 
   const {
     closeConfirmDialog,
@@ -727,15 +963,29 @@ export function TruePeakWorkbench() {
     clearSession,
     handleCancelDraft,
     pushUiNotice,
-    removeJob,
+    removeJob: removeJobAndRecoverFocus,
     setWorkspaceDrawer,
     workspaceDrawer,
   });
 
-  const goHome = useCallback(() => setWorkspaceScreen("home"), [setWorkspaceScreen]);
+  const goHome = useCallback(() => {
+    pendingHomeHeadingFocusRef.current = workspaceScreen === "session";
+    setWorkspaceScreen("home");
+  }, [setWorkspaceScreen, workspaceScreen]);
   const openCompare = useCallback(() => setWorkspaceTab("compare"), [setWorkspaceTab]);
   const openHistory = useCallback(() => setWorkspaceDrawer("history"), [setWorkspaceDrawer]);
   const openPresetLibrary = useCallback(() => setWorkspaceDrawer("presets"), [setWorkspaceDrawer]);
+  const openQueue = useCallback(() => setWorkspaceTab("queue"), [setWorkspaceTab]);
+  const closePresetDrawer = useCallback(() => {
+    // Escape, backdrop click, and the Close button all route through
+    // here (browser Back does not - see WP-17 notes). A dirty draft
+    // asks first instead of silently discarding it (UX-09).
+    if (draftIsDirty) {
+      requestClosePresetDrawer();
+      return;
+    }
+    setWorkspaceDrawer("none");
+  }, [draftIsDirty, requestClosePresetDrawer, setWorkspaceDrawer]);
   const commandContextValue = useMemo<WorkspaceCommandContextValue>(() => ({
     cancelActiveJobs,
     cancelJob,
@@ -853,7 +1103,7 @@ export function TruePeakWorkbench() {
       <WorkspaceSessionProvider value={sessionContextValue}>
       <>
       <ThemeSynchronizer />
-      <a href="#truepeak-main" className="sr-only focus:not-sr-only focus:fixed focus:left-4 focus:top-4 focus:z-[60] focus:rounded-full focus:bg-[var(--surface-1)] focus:px-4 focus:py-2 focus:text-sm focus:font-semibold focus:text-[var(--ink)] focus:shadow-[var(--shadow-elevated)]">
+      <a href="#truepeak-content" className="sr-only focus:not-sr-only focus:fixed focus:left-4 focus:top-4 focus:z-[60] focus:rounded-full focus:bg-[var(--surface-1)] focus:px-4 focus:py-2 focus:text-sm focus:font-semibold focus:text-[var(--ink)] focus:shadow-[var(--shadow-elevated)]">
         Skip to main content
       </a>
       <main
@@ -887,14 +1137,13 @@ export function TruePeakWorkbench() {
       />
 
       {workspaceScreen === "home" ? (
-        <>
           <header className="flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between">
             <div className="min-w-0">
               <div className="inline-flex items-center gap-2 rounded-full border border-[color:var(--accent)]/18 bg-[color:var(--accent-soft)] px-3 py-1 text-xs font-semibold uppercase tracking-[0.18em] text-[var(--accent-text)]">
                 <Waves className="h-3.5 w-3.5" />
                 In-browser loudness analysis
               </div>
-              <h1 className="mt-4"><TruePeakLogo size="lg" subtitle="Loudness and true peak review" titleClassName="leading-none" /></h1>
+              <h1 ref={homeHeadingRef} tabIndex={-1} className="mt-4 focus:outline-hidden focus-visible:ring-2 focus-visible:ring-[var(--accent)]"><TruePeakLogo size="lg" subtitle="Loudness and true peak review" titleClassName="leading-none" /></h1>
               <p className="mt-3 max-w-[60rem] text-sm leading-6 text-[var(--muted)] sm:text-base">
                 Load a batch, measure LUFS and true peak, and review delivery targets without sending files anywhere. Use it as a review aid, not a certified compliance meter.
               </p>
@@ -903,29 +1152,57 @@ export function TruePeakWorkbench() {
               <ThemeToggle onToggle={toggleTheme} />
               <Button type="button" size="sm" variant="secondary" onClick={openSessionPicker}>
                 <FolderOpen className="h-4 w-4" />
-                Open Session
+                Open session
               </Button>
               {jobs.length ? (
                 <Button type="button" size="sm" variant="secondary" onClick={openSessionWorkspace}>
                   <BarChart3 className="h-4 w-4" />
-                  Resume Session ({jobs.length})
+                  Resume session ({jobs.length})
                 </Button>
               ) : null}
             </div>
           </header>
+      ) : (
+        <>
+          {isDragging ? (
+            <div
+              aria-hidden="true"
+              className="tp-fade-in pointer-events-none fixed inset-0 z-[80] flex items-center justify-center bg-[color:var(--surface-0)]/72 p-6 backdrop-blur-[2px]"
+            >
+              <div className="rounded-[26px] border-2 border-dashed border-[var(--accent)] bg-[var(--surface-1)] px-8 py-6 text-center shadow-[var(--shadow-elevated)]">
+                <div className="text-lg font-semibold text-[var(--ink)]">Drop audio files to add them</div>
+                <div className="mt-1 text-sm text-[var(--muted)]">They join the current session queue. Folders are scanned for audio.</div>
+              </div>
+            </div>
+          ) : null}
+          <StudioToolbar />
+          {/* After the toolbar so it doubles as the skip link target. */}
+          <h1 id="truepeak-content" ref={sessionHeadingRef} tabIndex={-1} className="sr-only">Review session</h1>
+        </>
+      )}
 
-          {/* Notice regions stay mounted even when empty: live regions inserted
-              together with their content are skipped by several screen readers,
-              so only the message inside may come and go. */}
-          <WorkspaceNotices
-            persistentWarning={persistentWarning}
-            transientNotice={transientNotice}
-            persistentAction={persistentAction}
-          />
+      {/* Notice regions stay mounted even when empty, and this element keeps
+          the same position in both screens so it also survives the switch
+          from home to the session: live regions inserted together with their
+          content are skipped by several screen readers, so only the message
+          inside may come and go. */}
+      <WorkspaceNotices
+        persistentWarning={persistentWarning}
+        transientNotice={transientNotice}
+        persistentAction={persistentAction}
+        errorNotice={errorNotice}
+        onDismissError={handleDismissError}
+        persistentNotice={persistentNotice}
+        onDismissPersistentNotice={handleDismissPersistentNotice}
+        onTransientNoticeHold={holdUiNotice}
+      />
 
+      {workspaceScreen === "home" ? (
+        <>
           <HomeStage
             supportedFormats={SUPPORTED_FORMATS}
             decodeOptions={DECODE_PREFERENCES}
+            parallelLimit={parallelLimit}
           />
 
           {showHomeSupportSection ? (
@@ -934,7 +1211,7 @@ export function TruePeakWorkbench() {
               <div className="flex h-full flex-col">
                 <div className="flex flex-col gap-4 xl:flex-row xl:items-start xl:justify-between">
                   <div>
-                    <div className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">Session snapshot</div>
+                    <div className="text-[0.6875rem] uppercase tracking-[0.18em] text-[var(--muted)]">Session snapshot</div>
                     <h2 className="mt-2 text-balance text-2xl font-semibold text-[var(--ink)]">Where the current run stands</h2>
                     <p className="mt-2 max-w-[56rem] text-sm leading-6 text-[var(--muted)]">
                       Your queue and finished results stay put as you move between the home screen, the simple table, and the advanced tools.
@@ -943,14 +1220,14 @@ export function TruePeakWorkbench() {
                   {jobs.length ? (
                     <Button type="button" size="sm" variant="secondary" onClick={openSessionWorkspace}>
                       <BarChart3 className="h-4 w-4" />
-                      Open Results
+                      Open results
                     </Button>
                   ) : null}
                 </div>
                 <div className="mt-5">{sessionOverviewCards}</div>
                 <div className="mt-5 grid flex-1 gap-3 lg:grid-cols-2">
                   <div className="flex h-full min-h-[176px] flex-col rounded-[24px] border border-[var(--line)]/80 bg-[var(--surface-1)] px-5 py-5">
-                    <div className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">Current workflow</div>
+                    <div className="text-[0.6875rem] uppercase tracking-[0.18em] text-[var(--muted)]">Current workflow</div>
                     <div className="mt-3 text-base font-semibold text-[var(--ink)]">{uiMode === "simple" ? "Simple view is ready" : "Advanced view is ready"}</div>
                     <p className="mt-3 text-sm leading-6 text-[var(--muted)]">
                       {uiMode === "simple"
@@ -959,7 +1236,7 @@ export function TruePeakWorkbench() {
                     </p>
                   </div>
                   <div className="flex h-full min-h-[176px] flex-col rounded-[24px] border border-[var(--line)]/80 bg-[var(--surface-1)] px-5 py-5">
-                    <div className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">Supported formats</div>
+                    <div className="text-[0.6875rem] uppercase tracking-[0.18em] text-[var(--muted)]">Supported formats</div>
                     <div className="mt-3 text-base font-semibold text-[var(--ink)]">{SUPPORTED_FORMATS.join(", ")}</div>
                     <p className="mt-3 text-sm leading-6 text-[var(--muted)]">
                       Set the decode path up front, then the review stays on the results.
@@ -981,7 +1258,7 @@ export function TruePeakWorkbench() {
                 <RecentSessionsPanel className="min-h-[260px]" recentSessions={recentSessions} compact onClear={requestClearHistory} />
               ) : (
                 <Card className="h-full min-h-[260px] p-5 sm:p-6">
-                  <div className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">Workflow notes</div>
+                  <div className="text-[0.6875rem] uppercase tracking-[0.18em] text-[var(--muted)]">Workflow notes</div>
                   <h2 className="mt-2 text-2xl font-semibold text-[var(--ink)]">How the defaults are set</h2>
                   <div className="mt-5 grid gap-3 sm:grid-cols-2">
                     <div className="flex h-full min-h-[160px] flex-col rounded-[22px] border border-[var(--line)]/80 bg-[var(--surface-1)] p-4">
@@ -991,9 +1268,9 @@ export function TruePeakWorkbench() {
                       </p>
                     </div>
                     <div className="flex h-full min-h-[160px] flex-col rounded-[22px] border border-[var(--line)]/80 bg-[var(--surface-1)] p-4">
-                      <div className="text-sm font-semibold text-[var(--ink)]">History is optional</div>
+                      <div className="text-sm font-semibold text-[var(--ink)]">Saved history is optional</div>
                       <p className="mt-2 text-sm leading-6 text-[var(--muted)]">
-                        Completed runs use local recovery storage until you clear the session. Recent History is an optional, separate summary list.
+                        Completed runs use local recovery storage until you clear the session. Saved history is an optional, separate summary list.
                       </p>
                     </div>
                   </div>
@@ -1005,26 +1282,6 @@ export function TruePeakWorkbench() {
         </>
       ) : (
         <>
-          <h1 className="sr-only">Review session</h1>
-          {isDragging ? (
-            <div
-              aria-hidden="true"
-              className="pointer-events-none fixed inset-0 z-[80] flex items-center justify-center bg-[color:var(--surface-0)]/72 p-6 backdrop-blur-[2px]"
-            >
-              <div className="rounded-[26px] border-2 border-dashed border-[var(--accent)] bg-[var(--surface-1)] px-8 py-6 text-center shadow-[var(--shadow-elevated)]">
-                <div className="text-lg font-semibold text-[var(--ink)]">Drop audio files to add them</div>
-                <div className="mt-1 text-sm text-[var(--muted)]">They join the current session queue. Folders are scanned for audio.</div>
-              </div>
-            </div>
-          ) : null}
-          <StudioToolbar />
-
-          <WorkspaceNotices
-            persistentWarning={persistentWarning}
-            transientNotice={transientNotice}
-            persistentAction={persistentAction}
-          />
-
           <WorkspaceSummaryRail
             variant={uiMode === "advanced" ? "compact" : "default"}
           />
@@ -1055,15 +1312,15 @@ export function TruePeakWorkbench() {
                       onClick={() => setWorkspaceTab(tab.id)}
                       onKeyDown={(event) => handleWorkspaceTabKeyDown(event, index)}
                       className={cn(
-                        "inline-flex min-w-0 items-center justify-center gap-1.5 rounded-[16px] border px-2 py-2.5 text-sm font-semibold transition-[background-color,border-color,color] duration-200 ease-out focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)]",
+                        "inline-flex min-w-0 items-center justify-center gap-1.5 rounded-[16px] border px-2 py-2.5 text-sm font-semibold transition-[background-color,border-color,color,scale] duration-150 ease-out motion-safe:active:scale-[0.97] aria-selected:transition-[scale] focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-[var(--accent)]",
                         selected
-                          ? "border-[color:var(--accent)] bg-[color:var(--accent-soft)] text-[var(--ink)]"
+                          ? "border-[color:var(--accent)] bg-[color:var(--accent-soft)] text-[var(--ink)] forced-colors:border-[Highlight] forced-colors:bg-[Highlight] forced-colors:text-[HighlightText] forced-colors:forced-color-adjust-none"
                           : "border-[var(--line)] bg-[var(--surface-0)] text-[var(--muted)] hover:border-[color:var(--accent)]/35 hover:text-[var(--ink)]",
                       )}
                     >
                       <Icon className="hidden h-4 w-4 shrink-0 sm:inline" aria-hidden="true" />
                       <span className="truncate">{tab.label}</span>
-                      <span className="shrink-0 rounded-full border border-[var(--line)] bg-[var(--surface-1)] px-1.5 py-0.5 text-[10px] tabular-nums text-[var(--muted)]">
+                      <span className="shrink-0 rounded-full border border-[var(--line)] bg-[var(--surface-1)] px-1.5 py-0.5 text-[0.6875rem] tabular-nums text-[var(--muted)]">
                         {sessionTabCounts[tab.id]}
                       </span>
                     </button>
@@ -1079,7 +1336,7 @@ export function TruePeakWorkbench() {
                 <Card className={cn(uiMode === "advanced" ? "p-4 sm:p-5" : "p-5 sm:p-6")}>
                   <div className={cn("flex flex-col gap-4", uiMode === "advanced" ? "lg:flex-row lg:items-center lg:justify-between" : "xl:flex-row xl:items-end xl:justify-between")}>
                     <div className="min-w-0">
-                      <div className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">
+                      <div className="text-[0.6875rem] uppercase tracking-[0.18em] text-[var(--muted)]">
                         {uiMode === "simple" ? "Results table" : "Queue"}
                       </div>
                       <h2 className={cn("mt-2 text-balance font-semibold text-[var(--ink)]", uiMode === "advanced" ? "text-xl" : "text-2xl")}>
@@ -1094,13 +1351,13 @@ export function TruePeakWorkbench() {
                       ) : null}
                     </div>
                     <div className="flex flex-wrap items-center gap-2">
-                      <Button type="button" size="sm" variant="secondary" onClick={retryIssueJobs} disabled={!queueCounts.issues}>
+                      <Button type="button" size="sm" variant="secondary" onClick={retryIssueJobs} aria-disabled={!queueCounts.issues}>
                         <RefreshCcw className="h-4 w-4" />
-                        Retry Issues
+                        Retry issues
                       </Button>
                       <Button type="button" size="sm" variant="secondary" onClick={openPicker}>
                         <Plus className="h-4 w-4" />
-                        Add Files
+                        Add files
                       </Button>
                     </div>
                   </div>
@@ -1110,7 +1367,7 @@ export function TruePeakWorkbench() {
                       filter buttons directly below and by the summary rail, so
                       the status chips were removed to give each count one
                       canonical home (UX-010 / UX-036). */}
-                  <div className={cn("flex flex-wrap gap-2 text-[11px] uppercase tracking-[0.16em] text-[var(--muted)]", uiMode === "advanced" ? "mt-4" : "mt-5")}>
+                  <div className={cn("flex flex-wrap gap-2 text-[0.6875rem] uppercase tracking-[0.16em] text-[var(--muted)]", uiMode === "advanced" ? "mt-4" : "mt-5")}>
                     <span className="rounded-full border border-[var(--line)] bg-[var(--surface-1)] px-3 py-1.5">{queueShownLabel}</span>
                   </div>
 
@@ -1126,12 +1383,11 @@ export function TruePeakWorkbench() {
                         type="search"
                         value={queueSearchDraft}
                         onChange={(event) => setQueueSearchDraft(event.target.value)}
-                        aria-label="Search files in the current session"
                         aria-keyshortcuts="/"
                         autoComplete="off"
                         spellCheck={false}
                         placeholder="Search by file, status, preset, decoder, or layout…"
-                        className={cn("w-full rounded-full border border-[var(--control-line)] bg-[var(--surface-1)] pl-11 pr-4 text-sm text-[var(--ink)] outline-none transition-[border-color,background-color] duration-200 ease-out focus:border-[var(--accent)] focus-visible:ring-2 focus-visible:ring-[var(--accent)]", uiMode === "advanced" ? "h-10" : "h-11")}
+                        className={cn("w-full rounded-full border border-[var(--control-line)] bg-[var(--surface-1)] pl-11 pr-4 text-sm text-[var(--ink)] focus-visible:outline-hidden transition-[border-color,background-color] duration-200 ease-out focus:border-[var(--accent)] focus-visible:ring-2 focus-visible:ring-[var(--accent)]", uiMode === "advanced" ? "h-10" : "h-11")}
                       />
                     </div>
                     <div className="flex flex-col gap-3 xl:items-end">
@@ -1143,7 +1399,7 @@ export function TruePeakWorkbench() {
                             aria-pressed={queueFilter === filter.id}
                             onClick={() => setQueueFilter(filter.id)}
                             className={cn(
-                              "rounded-full border px-3 text-xs font-semibold uppercase tracking-[0.16em] transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)]",
+                              "rounded-full border px-3 text-xs font-semibold uppercase tracking-[0.16em] transition-[background-color,border-color,color,scale] duration-150 ease-out motion-safe:active:scale-[0.97] aria-pressed:transition-[scale] focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-[var(--accent)]",
                               uiMode === "advanced" ? "py-1.5" : "py-2",
                               queueFilter === filter.id
                                 ? "border-[color:var(--accent)] bg-[color:var(--accent-soft)] text-[var(--ink)]"
@@ -1154,19 +1410,21 @@ export function TruePeakWorkbench() {
                           </button>
                         ))}
                       </div>
-                      <label htmlFor="queue-sort" className={cn("inline-flex items-center gap-2 rounded-full border border-[var(--control-line)] bg-[var(--surface-1)] px-4 text-sm text-[var(--muted)]", uiMode === "advanced" ? "py-1.5" : "py-2")}>
+                      {/* Vertical and trailing padding sit on the select, not the
+                          label, so the chip has no dead zone around it. */}
+                      <label htmlFor="queue-sort" className="inline-flex items-center gap-2 rounded-full border border-[var(--control-line)] bg-[var(--surface-1)] pl-4 text-sm text-[var(--muted)]">
                         <ArrowUpDown className="h-4 w-4" />
                         <span>Sort:</span>
-                        <select id="queue-sort" name="queue-sort" aria-label="Sort files in the current session" value={queueSort} onChange={(event) => setQueueSort(event.target.value as QueueSort)} className="rounded-[8px] bg-transparent font-semibold text-[var(--ink)] outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)]">
+                        <select id="queue-sort" name="queue-sort" value={queueSort} onChange={(event) => setQueueSort(event.target.value as QueueSort)} className={cn("rounded-[8px] bg-transparent pr-4 font-semibold text-[var(--ink)] focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-[var(--accent)]", uiMode === "advanced" ? "py-1.5" : "py-2")}>
                           {QUEUE_SORTS.map((option) => (
                             <option key={option.id} value={option.id}>{option.label}</option>
                           ))}
                         </select>
                       </label>
                       {queueViewIsFiltered ? (
-                        <Button type="button" size="sm" variant="ghost" onClick={resetQueueView} aria-label="Reset View: clears queue search, filters, and sort">
+                        <Button type="button" size="sm" variant="ghost" onClick={resetQueueViewAndFocusSearch} aria-label="Reset view" title="Clears queue search, filters, and sort">
                           <RefreshCcw className="h-4 w-4" aria-hidden="true" />
-                          Reset View
+                          Reset view
                         </Button>
                       ) : null}
                     </div>
@@ -1180,6 +1438,7 @@ export function TruePeakWorkbench() {
                     ref={queueRegionRef}
                     role="region"
                     aria-label="File queue"
+                    tabIndex={-1}
                     aria-keyshortcuts="ArrowUp ArrowDown Home End Enter"
                     className="mt-2 space-y-4"
                     onKeyDown={handleQueueKeyDown}
@@ -1190,20 +1449,20 @@ export function TruePeakWorkbench() {
                           analysisMode={analysisMode}
                           jobs={sortedQueueJobs}
                           selectedJobId={selectedJob?.id ?? null}
-                          onCancelJob={cancelJob}
+                          onCancelJob={cancelJobAndRecoverFocus}
                           onOpenJob={chooseJob}
                           onRemoveJob={requestRemoveJob}
                           onRetryJob={retrySingleJob}
                         />
                       ) : (
                         <div className="grid gap-2">
-                          {sortedQueueJobs.map((job) => (
+                          {deferredQueueJobs.map((job) => (
                             <AdvancedQueueRow
                               key={job.id}
                               job={job}
                               selected={job.id === selectedJob?.id}
                               analysisMode={analysisMode}
-                              onCancelJob={cancelJob}
+                              onCancelJob={cancelJobAndRecoverFocus}
                               onOpenJob={chooseJob}
                               onRemoveJob={requestRemoveJob}
                               onRetryJob={retrySingleJob}
@@ -1217,7 +1476,7 @@ export function TruePeakWorkbench() {
                         body={queueEmptyCopy.body}
                         icon={AudioLines}
                         actionLabel={queueEmptyCopy.actionLabel}
-                        onAction={jobs.length ? resetQueueView : openPicker}
+                        onAction={jobs.length ? resetQueueViewAndFocusSearch : openPicker}
                       />
                     )}
                   </div>
@@ -1269,7 +1528,7 @@ export function TruePeakWorkbench() {
                 onCompareViewChange={setCompareView}
                 onCompareSortChange={setCompareSort}
                 onCompareFilterChange={setCompareFilter}
-                onOpenQueue={() => setWorkspaceTab("queue")}
+                onOpenQueue={openQueue}
                 onOpenJob={chooseJob}
               />
             </section>
@@ -1288,8 +1547,8 @@ export function TruePeakWorkbench() {
                 analysisMode={analysisMode}
                 historyEnabled={historyEnabled}
                 recentSessionCount={recentSessions.length}
-                onOpenCompare={() => setWorkspaceTab("compare")}
-                onOpenQueue={() => setWorkspaceTab("queue")}
+                onOpenCompare={openCompare}
+                onOpenQueue={openQueue}
                 onOpenJob={chooseJob}
               />
             </section>
@@ -1310,16 +1569,7 @@ export function TruePeakWorkbench() {
 
       <PresetLibraryDrawer
         open={workspaceDrawer === "presets" && targetingEnabled}
-        onClose={() => {
-          // Escape, backdrop click, and the Close button all route through
-          // here (browser Back does not - see WP-17 notes). A dirty draft
-          // asks first instead of silently discarding it (UX-09).
-          if (draftIsDirty) {
-            requestClosePresetDrawer();
-            return;
-          }
-          setWorkspaceDrawer("none");
-        }}
+        onClose={closePresetDrawer}
         activeTarget={activeTarget}
         draftTarget={draftPreviewTarget}
         fieldErrors={draftResolution.errors}
@@ -1345,8 +1595,8 @@ export function TruePeakWorkbench() {
       <DrawerPanel
         open={workspaceDrawer === "history" && historyEnabled}
         onClose={() => setWorkspaceDrawer("none")}
-        title="Saved History"
-        description="Completed analyses stored locally in this browser. Turn history on only when you want quick recall between sessions."
+        title="Saved history"
+        description="Completed analyses stored locally in this browser. Turn saved history on only when you want quick recall between sessions."
         mobileMode="full"
         desktopClassName="lg:w-[min(760px,96vw)]"
       >
@@ -1356,7 +1606,7 @@ export function TruePeakWorkbench() {
       <DrawerPanel
         open={inspectorDrawerOpen}
         onClose={() => setWorkspaceDrawer("none")}
-        title={selectedJob ? selectedJob.fileName : "File details"}
+        title="File details"
         description="Review loudness, timeline, and technical details without leaving the current list."
         mobileMode="sheet"
         desktopClassName="lg:w-[min(760px,96vw)]"
@@ -1369,68 +1619,3 @@ export function TruePeakWorkbench() {
     </WorkspaceCommandProvider>
   );
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

@@ -1,11 +1,11 @@
 "use client";
 
-import { useEffect, useId, useMemo, useRef, useState } from "react";
+import { memo, useEffect, useId, useMemo, useRef, useState } from "react";
 import uPlot from "uplot";
 import { ChevronDown, ChevronUp, Download, RotateCcw, ZoomIn, ZoomOut } from "lucide-react";
 import { useMediaQuery } from "@/hooks/use-media-query";
 import { fileNameTimestamp, formatDuration, formatLufs, formatPeakDbtp } from "@/lib/format";
-import { downloadTextFile } from "@/lib/utils";
+import { cn, downloadTextFile } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import type { AnalysisTimeline } from "@/types/audio";
 
@@ -31,6 +31,21 @@ const ZOOM_IN_FACTOR = 0.6;
 const ZOOM_OUT_FACTOR = 1 / 0.6;
 const MIN_ZOOM_SPAN_SECONDS = 1;
 const ZOOM_EPSILON_SECONDS = 1e-3;
+// Whole-second x-axis steps, so a short file never gets fractional ticks that
+// round to the same label ("1s 1s 2s 2s").
+const X_AXIS_INCREMENTS = [1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600];
+// uPlot's default 50px y-axis gutter clips unit-suffixed ticks such as
+// "-15.0 LUFS" down to "0 LUFS".
+const Y_AXIS_SIZE = 92;
+// A near-constant signal leaves the y scale a hair wide, so every tick rounds
+// to the same label ("-14.6 LUFS" four times). These spans are the narrowest
+// each y scale may get.
+const LOUDNESS_MIN_SPAN_LU = 6;
+const PEAK_MIN_SPAN_DB = 3;
+// A touch has to travel this far before it is read as a scrub (horizontal) or
+// left to the page as a scroll (vertical).
+const TOUCH_AXIS_LOCK_PX = 10;
+const numberFormatter = new Intl.NumberFormat("en-GB");
 
 function readThemeToken(name: string, fallback: string) {
   const value = getComputedStyle(document.documentElement)
@@ -51,6 +66,21 @@ function minMax(values: Iterable<number>) {
     }
   }
   return { min, max };
+}
+
+// uPlot's default y range (10% padding snapped outwards), with a narrow data
+// range first widened to `minSpan` around its centre.
+function minimumSpanRange(minSpan: number): uPlot.Range.Function {
+  return (_self, dataMin, dataMax) => {
+    if (dataMin == null || dataMax == null) {
+      return [null, null];
+    }
+    if (dataMax - dataMin >= minSpan) {
+      return uPlot.rangeNum(dataMin, dataMax, 0.1, true);
+    }
+    const centre = (dataMin + dataMax) / 2;
+    return uPlot.rangeNum(centre - minSpan / 2, centre + minSpan / 2, 0.1, true);
+  };
 }
 
 function isRangeZoomed(domain: XDomain, min: number, max: number) {
@@ -80,6 +110,12 @@ function formatSeriesLegendValue(
   return uPlot.fmtNum(Number(rawValue.toFixed(2)));
 }
 
+// Legend entry for the x series: uPlot labels it "Value" by default.
+const TIME_SERIES = {
+  label: "Time",
+  value: (_self: uPlot, rawValue: number | null) => (rawValue == null ? "--" : formatDuration(rawValue)),
+};
+
 // uPlot treats a point as a gap only when it is `null` (`v != null`); it never
 // tests for NaN, so the NaN sentinels the typed loudness series carry would be
 // fed into the y-scale min/max and blank the chart. Translate them once per
@@ -88,7 +124,7 @@ export function toNullGappedSeries(series: ArrayLike<number>): Array<number | nu
   return Array.from(series, (value) => (Number.isFinite(value) ? value : null));
 }
 
-export function TimelineChart({ timeline }: TimelineChartProps) {
+export const TimelineChart = memo(function TimelineChart({ timeline }: TimelineChartProps) {
   const loudnessContainerRef = useRef<HTMLDivElement | null>(null);
   const peakContainerRef = useRef<HTMLDivElement | null>(null);
   const loudnessPlotRef = useRef<uPlot | null>(null);
@@ -346,17 +382,19 @@ export function TimelineChart({ timeline }: TimelineChartProps) {
         legend: { show: true },
         scales: {
           x: { time: false },
-          y: { auto: true },
+          y: { auto: true, range: minimumSpanRange(LOUDNESS_MIN_SPAN_LU) },
         },
         axes: [
           {
             stroke: readThemeToken("--chart-axis", "#95aca8"),
             grid: { stroke: readThemeToken("--chart-grid", "rgba(160,194,187,0.14)") },
-            values: (_plot, ticks) => ticks.map((value) => `${Math.round(value)}s`),
+            incrs: X_AXIS_INCREMENTS,
+            values: (_plot, ticks) => ticks.map((value) => formatDuration(value)),
           },
           {
             stroke: readThemeToken("--chart-axis", "#95aca8"),
             grid: { stroke: readThemeToken("--chart-grid", "rgba(160,194,187,0.14)") },
+            size: Y_AXIS_SIZE,
             values: (_plot, ticks) => ticks.map((value) => `${value.toFixed(1)} LUFS`),
           },
         ],
@@ -364,10 +402,10 @@ export function TimelineChart({ timeline }: TimelineChartProps) {
           drag: { x: dragEnabled, y: false },
         },
         series: [
-          {},
+          TIME_SERIES,
           {
             label: "Momentary (LUFS)",
-            stroke: readThemeToken("--chart-momentary", "#37d2be"),
+            stroke: readThemeToken("--chart-momentary", "#a3a0f3"),
             width: 2,
             spanGaps: false,
             show: loudnessSeriesShownRef.current[0],
@@ -375,7 +413,7 @@ export function TimelineChart({ timeline }: TimelineChartProps) {
           },
           {
             label: "Short-term (LUFS)",
-            stroke: readThemeToken("--chart-shortterm", "#f7b756"),
+            stroke: readThemeToken("--chart-shortterm", "#bbd55c"),
             width: 2,
             spanGaps: false,
             show: loudnessSeriesShownRef.current[1],
@@ -418,17 +456,19 @@ export function TimelineChart({ timeline }: TimelineChartProps) {
         legend: { show: true },
         scales: {
           x: { time: false },
-          y: { auto: true },
+          y: { auto: true, range: minimumSpanRange(PEAK_MIN_SPAN_DB) },
         },
         axes: [
           {
             stroke: readThemeToken("--chart-axis", "#95aca8"),
             grid: { stroke: readThemeToken("--chart-grid", "rgba(160,194,187,0.14)") },
-            values: (_plot, ticks) => ticks.map((value) => `${Math.round(value)}s`),
+            incrs: X_AXIS_INCREMENTS,
+            values: (_plot, ticks) => ticks.map((value) => formatDuration(value)),
           },
           {
             stroke: readThemeToken("--chart-axis", "#95aca8"),
             grid: { stroke: readThemeToken("--chart-grid", "rgba(160,194,187,0.14)") },
+            size: Y_AXIS_SIZE,
             values: (_plot, ticks) => ticks.map((value) => `${value.toFixed(2)} dBTP`),
           },
         ],
@@ -436,10 +476,10 @@ export function TimelineChart({ timeline }: TimelineChartProps) {
           drag: { x: dragEnabled, y: false },
         },
         series: [
-          {},
+          TIME_SERIES,
           {
             label: "True peak (dBTP)",
-            stroke: readThemeToken("--chart-truepeak", "#ff9c55"),
+            stroke: readThemeToken("--chart-truepeak", "#d066b1"),
             width: 2,
             spanGaps: true,
             value: formatSeriesLegendValue,
@@ -481,10 +521,26 @@ export function TimelineChart({ timeline }: TimelineChartProps) {
       const over = plot.over;
       let startX = 0;
       let startY = 0;
+      // null until the touch has moved TOUCH_AXIS_LOCK_PX, then fixed for the
+      // rest of the gesture.
+      let lockedAxis: "x" | "y" | null = null;
 
       const moveCursorTo = (touch: Touch) => {
         const bounds = over.getBoundingClientRect();
-        plot.setCursor({ left: touch.clientX - bounds.left, top: touch.clientY - bounds.top });
+        // uPlot hides the cursor for a negative left, so keep a drag that runs
+        // past the plot edge pinned to the edge instead.
+        plot.setCursor({
+          left: clamp(touch.clientX - bounds.left, 0, bounds.width),
+          top: clamp(touch.clientY - bounds.top, 0, bounds.height),
+        });
+      };
+
+      const endTouch = () => {
+        const scrubbed = lockedAxis === "x";
+        lockedAxis = null;
+        if (scrubbed) {
+          announce();
+        }
       };
 
       over.addEventListener("mouseleave", announce);
@@ -501,9 +557,9 @@ export function TimelineChart({ timeline }: TimelineChartProps) {
           }
           startX = touch.clientX;
           startY = touch.clientY;
-          moveCursorTo(touch);
+          lockedAxis = null;
         },
-        { passive: false },
+        { passive: true },
       );
       over.addEventListener(
         "touchmove",
@@ -512,17 +568,28 @@ export function TimelineChart({ timeline }: TimelineChartProps) {
           if (!touch) {
             return;
           }
-          // `.u-over` is `touch-action: pan-y`, so a vertical drag still
-          // scrolls the page; claim the gesture only once it is mostly
-          // horizontal.
-          if (Math.abs(touch.clientX - startX) > Math.abs(touch.clientY - startY) && event.cancelable) {
+          if (lockedAxis === null) {
+            const deltaX = Math.abs(touch.clientX - startX);
+            const deltaY = Math.abs(touch.clientY - startY);
+            if (Math.max(deltaX, deltaY) < TOUCH_AXIS_LOCK_PX) {
+              return;
+            }
+            lockedAxis = deltaX > deltaY ? "x" : "y";
+          }
+          // `.u-over` is `touch-action: pan-y`, so a vertical drag is left to
+          // scroll the page; only a horizontal one scrubs the cursor.
+          if (lockedAxis === "y") {
+            return;
+          }
+          if (event.cancelable) {
             event.preventDefault();
           }
           moveCursorTo(touch);
         },
         { passive: false },
       );
-      over.addEventListener("touchend", announce);
+      over.addEventListener("touchend", endTouch);
+      over.addEventListener("touchcancel", endTouch);
     };
 
     wireCursorInput(loudnessPlotRef.current, announceLoudness);
@@ -612,7 +679,7 @@ export function TimelineChart({ timeline }: TimelineChartProps) {
 
   const resetZoom = () => {
     const domain = xDomainRef.current;
-    if (!domain || !loudnessPlotRef.current) {
+    if (!isZoomed || !domain || !loudnessPlotRef.current) {
       return;
     }
     loudnessPlotRef.current.setScale("x", { min: domain.min, max: domain.max });
@@ -634,6 +701,7 @@ export function TimelineChart({ timeline }: TimelineChartProps) {
   // Starting values for the readout row under each chart: the last sample,
   // until a pointer moves the cursor.
   const lastSampleIndex = timeline.timeSeconds.length - 1;
+  const hasSamples = timeline.timeSeconds.length > 0;
 
   const downloadTimelineCsv = () => {
     const { timeSeconds, momentaryLufs, shortTermLufs, truePeakDbtp } = timeline;
@@ -659,29 +727,41 @@ export function TimelineChart({ timeline }: TimelineChartProps) {
   return (
     <div className="space-y-3">
       <div className="flex flex-wrap items-center justify-between gap-3">
-        <div className="flex flex-wrap items-center gap-2 text-[11px] uppercase tracking-[0.16em] text-[var(--muted)]">
+        <div className="flex flex-wrap items-center gap-2 text-[0.6875rem] uppercase tracking-[0.16em] text-[var(--muted)]">
           <span className="rounded-full border border-[var(--line)] bg-[var(--surface-0)] px-3 py-1.5">
             Timeline
           </span>
           <span>Loudness and true peak use separate axes.</span>
         </div>
         <div className="flex items-center gap-1.5" role="group" aria-label="Timeline zoom controls">
-          <Button type="button" size="sm" variant="ghost" onClick={() => applyZoom(ZOOM_IN_FACTOR)}>
+          <Button type="button" size="sm" variant="ghost" onClick={() => applyZoom(ZOOM_IN_FACTOR)} disabled={!hasSamples}>
             <ZoomIn className="h-4 w-4" aria-hidden="true" />
             <span className="sr-only sm:not-sr-only">Zoom in</span>
           </Button>
-          <Button type="button" size="sm" variant="ghost" onClick={() => applyZoom(ZOOM_OUT_FACTOR)}>
+          <Button type="button" size="sm" variant="ghost" onClick={() => applyZoom(ZOOM_OUT_FACTOR)} disabled={!hasSamples}>
             <ZoomOut className="h-4 w-4" aria-hidden="true" />
             <span className="sr-only sm:not-sr-only">Zoom out</span>
           </Button>
-          <Button type="button" size="sm" variant="ghost" onClick={resetZoom} disabled={!isZoomed}>
+          {/* aria-disabled, not disabled: resetting un-zooms, and a native
+              disabled button would drop keyboard focus to <body> mid-click. */}
+          <Button type="button" size="sm" variant="ghost" onClick={resetZoom} aria-disabled={!isZoomed}>
             <RotateCcw className="h-4 w-4" aria-hidden="true" />
-            Reset Zoom
+            Reset zoom
           </Button>
         </div>
       </div>
 
-      <div className="flex flex-wrap items-center gap-1.5" role="group" aria-label="Loudness chart series">
+      {hasSamples ? null : (
+        <p className="rounded-[24px] border border-[var(--line)] bg-[var(--surface-1)] px-4 py-6 text-sm text-[var(--muted)]">
+          No timeline data for this file.
+        </p>
+      )}
+
+      <div
+        className={cn("flex flex-wrap items-center gap-1.5", !hasSamples && "hidden")}
+        role="group"
+        aria-label="Loudness chart series"
+      >
         {LOUDNESS_SERIES.map((series, index) => (
           <Button
             key={series.label}
@@ -690,6 +770,7 @@ export function TimelineChart({ timeline }: TimelineChartProps) {
             variant="ghost"
             aria-pressed={loudnessSeriesShown[index]}
             onClick={() => toggleLoudnessSeries(index as 0 | 1)}
+            className="aria-pressed:forced-colors:border-[Highlight] aria-pressed:forced-colors:bg-[Highlight] aria-pressed:forced-colors:text-[HighlightText] aria-pressed:forced-colors:forced-color-adjust-none"
           >
             <span
               aria-hidden="true"
@@ -703,7 +784,7 @@ export function TimelineChart({ timeline }: TimelineChartProps) {
         ))}
       </div>
 
-      <p id={summaryId} className="sr-only">
+      <p id={summaryId} className={hasSamples ? "sr-only" : "hidden"}>
         {summaryText}
       </p>
 
@@ -711,7 +792,7 @@ export function TimelineChart({ timeline }: TimelineChartProps) {
           clientWidth, so padding here would make the chart wider than the
           visible box. Visual padding lives on the outer, non-scrolling
           border box instead; horizontal overflow scrolls only the mount. */}
-      <div className="rounded-[24px] border border-[var(--line)] bg-[var(--surface-1)] p-3">
+      <div className={cn("rounded-[24px] border border-[var(--line)] bg-[var(--surface-1)] p-3", !hasSamples && "hidden")}>
         <div className="overflow-x-auto overscroll-x-contain">
           <div
             ref={loudnessContainerRef}
@@ -746,7 +827,7 @@ export function TimelineChart({ timeline }: TimelineChartProps) {
         </dl>
         <p ref={loudnessStatusRef} role="status" className="sr-only" />
       </div>
-      <div className="rounded-[24px] border border-[var(--line)] bg-[var(--surface-1)] p-3">
+      <div className={cn("rounded-[24px] border border-[var(--line)] bg-[var(--surface-1)] p-3", !hasSamples && "hidden")}>
         <div className="overflow-x-auto overscroll-x-contain">
           <div
             ref={peakContainerRef}
@@ -777,7 +858,10 @@ export function TimelineChart({ timeline }: TimelineChartProps) {
       </div>
 
       <details
-        className="rounded-[16px] border border-[var(--line)] bg-[var(--surface-0)]/40 px-4 py-3 text-sm text-[var(--muted)]"
+        className={cn(
+          "rounded-[16px] border border-[var(--line)] bg-[var(--surface-0)]/40 px-4 py-3 text-sm text-[var(--muted)]",
+          !hasSamples && "hidden",
+        )}
         open={tableOpen}
         onToggle={(event) => setTableOpen(event.currentTarget.open)}
       >
@@ -788,7 +872,7 @@ export function TimelineChart({ timeline }: TimelineChartProps) {
         <div className="mt-3 space-y-3">
           <p className="text-xs leading-5 text-[var(--muted)]">
             {isTableDownsampled
-              ? `Showing ${tableRows.length} of ${timeline.timeSeconds.length} samples, evenly spaced. Download the CSV for every sample.`
+              ? `Showing ${numberFormatter.format(tableRows.length)} of ${numberFormatter.format(timeline.timeSeconds.length)} samples, evenly spaced. Download the CSV for every sample.`
               : "Every sample in this timeline."}
           </p>
           <div className="overflow-x-auto rounded-[12px] border border-[var(--line)]/70">
@@ -838,4 +922,4 @@ export function TimelineChart({ timeline }: TimelineChartProps) {
       </details>
     </div>
   );
-}
+});

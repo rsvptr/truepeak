@@ -13,7 +13,18 @@ const { LaneReservations } = await import(
 );
 const { runAnalysisJob } = await import("../../src/analysis/run-analysis-job.ts");
 const { JobStore } = await import("../../src/analysis/job-store.ts");
-const { DEFAULT_DECODE_BUDGET } = await import("../../src/audio/decode-budget.ts");
+const {
+  DEFAULT_DECODE_BUDGET,
+  LARGE_MEMORY_DECODE_BUDGET,
+  checkedDecodedBytes,
+  classifyReservationContention,
+  conservativeDecodePeakBytes,
+  resolveAdaptiveDecodeBudget,
+  resolveDecodeBudget,
+} = await import("../../src/audio/decode-budget.ts");
+const { resolveAggregatePeakBytes, resolveLaneLimit } = await import(
+  "../../src/hooks/use-truepeak-analyzer.ts"
+);
 
 /** @typedef {import("../../src/types/audio.ts").AnalysisJob} AnalysisJob */
 /** @typedef {import("../../src/types/audio.ts").JobStatus} JobStatus */
@@ -72,9 +83,19 @@ function lane(id, lease = null) {
  *   laneLimit?: number,
  *   circuitOpen?: boolean,
  *   run?: (subject: SchedulerHarness, lane: WorkerLane, lease: LaneLease) => void | Promise<void>,
+ *   aggregatePeakBytes?: number,
+ *   decodeBudget?: import("../../src/audio/decode-budget.ts").DecodeBudget,
+ *   browserFirst?: boolean,
  * }} [options]
  */
-function harness(jobs, { laneLimit = 2, circuitOpen = false, run } = {}) {
+function harness(jobs, {
+  laneLimit = 2,
+  circuitOpen = false,
+  run,
+  aggregatePeakBytes = Number.MAX_SAFE_INTEGER,
+  decodeBudget = DEFAULT_DECODE_BUDGET,
+  browserFirst = false,
+} = {}) {
   const jobStore = new JobStore(jobs);
   /** @type {{ current: Map<string, File> }} */
   const files = cell(new Map(jobs.map((job) => [
@@ -102,7 +123,7 @@ function harness(jobs, { laneLimit = 2, circuitOpen = false, run } = {}) {
     laneByJob,
     heavyJobActive,
     reservedPeakBytes,
-    aggregatePeakBytes: cell(Number.MAX_SAFE_INTEGER),
+    aggregatePeakBytes: cell(aggregatePeakBytes),
     terminateLaneWorkers: () => {},
     scheduleIdleLaneTeardown: () => {},
   });
@@ -125,7 +146,7 @@ function harness(jobs, { laneLimit = 2, circuitOpen = false, run } = {}) {
     resourcePlans,
     preparingPlanCount: cell(0),
     heavyFileBytes: cell(256 * 1024 * 1024),
-    decodeBudget: cell(DEFAULT_DECODE_BUDGET),
+    decodeBudget: cell(decodeBudget),
     reservations,
     transport: {
       attach: () => null,
@@ -152,7 +173,7 @@ function harness(jobs, { laneLimit = 2, circuitOpen = false, run } = {}) {
       tokens.set(jobId, token);
       return token;
     },
-    resolveBrowserFirstRoute: () => false,
+    resolveBrowserFirstRoute: () => browserFirst,
   };
   // Declared after `context` so both can be plain consts; `transport.run` only
   // reads `subject` when the scheduler actually starts a job.
@@ -652,4 +673,193 @@ test("a worker-route job passes through decoding before analyzing", async () => 
       decodingCheckpoint.progressPercent <= 0.84,
     "the decoding checkpoint sits inside the decoder progress range",
   );
+});
+
+// ---------------------------------------------------------------------------
+// Large-tier batch aggregate. Raising the per-file tier to 1.5 GiB must not
+// raise the batch-wide reservation cap on capable devices: it stays at the
+// value the former 1 GiB tier produced, while a single 13:33 stereo 192 kHz
+// FLAC (156,057,600 frames) still fits alone on every route.
+
+/**
+ * @template T
+ * @param {number | null} deviceMemory
+ * @param {boolean} coarsePointer
+ * @param {() => T} operation
+ * @returns {T}
+ */
+function onDevice(deviceMemory, coarsePointer, operation) {
+  const navigatorDescriptor = Object.getOwnPropertyDescriptor(globalThis, "navigator");
+  const windowDescriptor = Object.getOwnPropertyDescriptor(globalThis, "window");
+  Object.defineProperty(globalThis, "navigator", {
+    configurable: true,
+    value: { deviceMemory: deviceMemory ?? undefined, hardwareConcurrency: 12 },
+  });
+  Object.defineProperty(globalThis, "window", {
+    configurable: true,
+    value: { matchMedia: () => ({ matches: coarsePointer }) },
+  });
+  try {
+    return operation();
+  } finally {
+    if (navigatorDescriptor) {
+      Object.defineProperty(globalThis, "navigator", navigatorDescriptor);
+    } else {
+      Reflect.deleteProperty(globalThis, "navigator");
+    }
+    if (windowDescriptor) {
+      Object.defineProperty(globalThis, "window", windowDescriptor);
+    } else {
+      Reflect.deleteProperty(globalThis, "window");
+    }
+  }
+}
+
+const MiB = 1024 * 1024;
+const largeTier = resolveAdaptiveDecodeBudget(8, false);
+const formerLargeTier = resolveDecodeBudget({
+  ...LARGE_MEMORY_DECODE_BUDGET,
+  maxSourceBytes: 1024 * MiB,
+  maxDecodedBytes: 1024 * MiB,
+  maxOutputBytes: 1025 * MiB,
+});
+const formerCapableAggregate = 2 * conservativeDecodePeakBytes(formerLargeTier);
+const capableAggregate = onDevice(8, false, () => resolveAggregatePeakBytes(largeTier));
+const capableLanes = onDevice(8, false, () => resolveLaneLimit("auto"));
+const longFlacFrames = 156_057_600;
+const longFlacDecodedBytes = checkedDecodedBytes(longFlacFrames, 2);
+
+/**
+ * @param {number} frameCount
+ * @param {number} sampleRate
+ * @param {boolean} [trustedNative]
+ * @returns {JobResourcePlan}
+ */
+function knownStereoPlan(frameCount, sampleRate, trustedNative = false) {
+  return {
+    kind: "known",
+    decodedBytes: checkedDecodedBytes(frameCount, 2),
+    trustedNative,
+    sourceMetadata: {
+      sampleRate,
+      channelCount: 2,
+      frameCount,
+      durationSeconds: frameCount / sampleRate,
+      label: "FLAC STREAMINFO",
+      frameCountExact: true,
+    },
+  };
+}
+
+/**
+ * Admits `count` identical jobs on a capable device (6 lanes, large tier,
+ * resolved aggregate) through the real scheduler.
+ *
+ * @param {number} count
+ * @param {JobResourcePlan} plan
+ * @param {{ browserFirst?: boolean, fileSizeBytes?: number }} [options]
+ */
+function capableBatch(count, plan, { browserFirst = true, fileSizeBytes = 640 * MiB } = {}) {
+  const jobs = Array.from({ length: count }, (_, index) => queuedJob(`large-${index}`));
+  const subject = harness(jobs, {
+    laneLimit: capableLanes,
+    aggregatePeakBytes: capableAggregate,
+    decodeBudget: largeTier,
+    browserFirst,
+  });
+  for (const job of jobs) {
+    subject.resourcePlans.current.set(job.id, plan);
+    // Only size, name and type are read on admission, so a stand-in avoids
+    // allocating a real 640 MiB file.
+    subject.context.files.current.set(job.id, /** @type {File} */ (/** @type {unknown} */ ({
+      name: job.fileName,
+      type: job.mimeType,
+      size: fileSizeBytes,
+    })));
+  }
+  subject.scheduler.fillLanes();
+  return subject;
+}
+
+test("the capable large-tier aggregate stays at the former 1 GiB tier value", () => {
+  assert.equal(formerCapableAggregate, 8196 * MiB);
+  assert.equal(capableAggregate, formerCapableAggregate);
+  assert.equal(capableLanes, 6);
+  // A fine pointer with no memory signal resolves the same tier and cap.
+  assert.equal(
+    onDevice(null, false, () =>
+      resolveAggregatePeakBytes(resolveAdaptiveDecodeBudget(null, false))),
+    formerCapableAggregate,
+  );
+  // Constrained devices keep one conservative default-tier peak.
+  assert.equal(
+    onDevice(4, true, () =>
+      resolveAggregatePeakBytes(resolveAdaptiveDecodeBudget(4, true))),
+    conservativeDecodePeakBytes(DEFAULT_DECODE_BUDGET),
+  );
+});
+
+test("one 156,057,600-frame stereo FLAC is admitted alone on every route", () => {
+  assert.equal(longFlacDecodedBytes, 1_248_460_800);
+  const browser = capableBatch(1, knownStereoPlan(longFlacFrames, 192_000));
+  assert.equal(browser.runCalls.length, 1);
+  assert.equal(browser.reservedPeakBytes.current, 2 * longFlacDecodedBytes);
+
+  const native = capableBatch(1, knownStereoPlan(longFlacFrames, 192_000, true), {
+    browserFirst: false,
+  });
+  assert.equal(native.runCalls.length, 1);
+  assert.equal(native.reservedPeakBytes.current, 2 * longFlacDecodedBytes);
+
+  const compatibility = capableBatch(1, knownStereoPlan(longFlacFrames, 192_000), {
+    browserFirst: false,
+  });
+  assert.equal(compatibility.runCalls.length, 1);
+  assert.equal(compatibility.runCalls[0].lease.reservation.exclusive, true);
+  assert.ok(compatibility.reservedPeakBytes.current <= capableAggregate);
+
+  // A failed probe, or a post-decode escalation, takes the full conservative
+  // peak. That still fits an otherwise empty batch, so it waits and runs alone
+  // instead of failing as permanently over budget.
+  const unknown = capableBatch(1, { kind: "unknown" });
+  assert.equal(unknown.runCalls.length, 1);
+  assert.equal(
+    classifyReservationContention(conservativeDecodePeakBytes(largeTier), capableAggregate),
+    "retryable",
+  );
+});
+
+test("four such FLACs never reserve more than the former aggregate", () => {
+  const browser = capableBatch(4, knownStereoPlan(longFlacFrames, 192_000));
+  assert.equal(browser.runCalls.length, 3, "three fit the capped aggregate at once");
+  assert.equal(browser.reservedPeakBytes.current, 3 * 2 * longFlacDecodedBytes);
+  assert.ok(browser.reservedPeakBytes.current <= formerCapableAggregate);
+  finishRun(browser, "large-0");
+  browser.scheduler.fillLanes();
+  assert.equal(browser.runCalls.length, 4, "the fourth is admitted once one finishes");
+  assert.ok(browser.reservedPeakBytes.current <= formerCapableAggregate);
+
+  const native = capableBatch(4, knownStereoPlan(longFlacFrames, 192_000, true), {
+    browserFirst: false,
+  });
+  assert.equal(native.runCalls.length, 3);
+  assert.ok(native.reservedPeakBytes.current <= formerCapableAggregate);
+
+  // On the compatibility route each one drains the batch and runs alone.
+  const compatibility = capableBatch(4, knownStereoPlan(longFlacFrames, 192_000), {
+    browserFirst: false,
+  });
+  assert.equal(compatibility.runCalls.length, 1);
+});
+
+test("small known-footprint files still fill every capable lane", () => {
+  const cdQuality = capableBatch(6, knownStereoPlan(4 * 60 * 44_100, 44_100), {
+    fileSizeBytes: 24 * MiB,
+  });
+  assert.equal(cdQuality.runCalls.length, 6);
+  const hiRes = capableBatch(6, knownStereoPlan(4 * 60 * 192_000, 192_000), {
+    fileSizeBytes: 160 * MiB,
+  });
+  assert.equal(hiRes.runCalls.length, 6);
+  assert.ok(hiRes.reservedPeakBytes.current <= capableAggregate);
 });

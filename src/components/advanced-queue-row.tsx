@@ -12,17 +12,37 @@ import {
   formatRelativeDb,
 } from "@/lib/format";
 import { describeJobBadges, getJobErrorDisplay, getViewOnlyHint } from "@/lib/job-ui";
-import { isActiveJob, isPausedAnalysisJob } from "@/lib/session-selectors";
+import { isActiveJob, isIssueJob, isPausedAnalysisJob } from "@/lib/session-selectors";
 import { cn } from "@/lib/utils";
 import type { AnalysisJob, AnalysisMode } from "@/types/audio";
 
 function AdvancedQueueMetric({ label, value }: { label: string; value: string }) {
   return (
     <div className="min-w-0 rounded-[14px] border border-[var(--line)]/60 bg-[var(--surface-0)]/46 px-3 py-2">
-      <div className="text-[10px] uppercase tracking-[0.16em] text-[var(--muted)]">{label}</div>
+      <div className="text-[0.6875rem] uppercase tracking-[0.16em] text-[var(--muted)]">{label}</div>
       <div className="mt-1 break-words text-sm font-semibold leading-tight tabular-nums text-[var(--ink)]">{value}</div>
     </div>
   );
+}
+
+// Ref callback for a row's single Retry/Cancel slot. The slot unmounts when
+// neither action applies (e.g. the job finished while Cancel had focus);
+// React detaches refs before it removes the node, so focus can move to the
+// row's file-name button instead of dropping to <body>. Module-level so its
+// identity is stable and the cleanup only runs on unmount.
+export function keepRowActionFocus(element: HTMLButtonElement | null) {
+  if (!element) {
+    return;
+  }
+  return () => {
+    if (element.ownerDocument.activeElement !== element) {
+      return;
+    }
+    element
+      .closest("article, tr")
+      ?.querySelector<HTMLElement>('[data-queue-nav="true"]')
+      ?.focus({ preventScroll: true });
+  };
 }
 
 export const AdvancedQueueRow = memo(function AdvancedQueueRow({
@@ -44,6 +64,7 @@ export const AdvancedQueueRow = memo(function AdvancedQueueRow({
 }) {
   const errorDisplay = getJobErrorDisplay(job.error);
   const active = isActiveJob(job);
+  const issue = isIssueJob(job);
   const paused = isPausedAnalysisJob(job);
   const viewOnlyHint = getViewOnlyHint(job);
   const badgeOrder = new Map([
@@ -62,9 +83,9 @@ export const AdvancedQueueRow = memo(function AdvancedQueueRow({
   return (
     <article
       className={cn(
-        "tp-selected-row rounded-[18px] border overflow-hidden [content-visibility:auto] [contain-intrinsic-size:96px]",
+        "tp-selected-row rounded-[18px] border overflow-hidden [content-visibility:auto] [contain-intrinsic-size:auto_none_auto_96px]",
         selected
-          ? "border-[color:var(--accent)]/36 bg-[color:var(--accent-soft)] shadow-[0_14px_34px_rgba(0,0,0,0.12)]"
+          ? "border-[color:var(--accent)]/36 bg-[color:var(--accent-soft)] shadow-[0_14px_34px_rgba(0,0,0,0.12)] forced-colors:border-[Highlight] forced-colors:outline-2 forced-colors:outline-[Highlight]"
           : "border-[var(--line)]/72 bg-[var(--surface-0)]/48 hover:border-[color:var(--accent)]/24 hover:bg-[var(--surface-1)]/64",
       )}
       data-selected={selected}
@@ -75,7 +96,7 @@ export const AdvancedQueueRow = memo(function AdvancedQueueRow({
           <span
             className={cn(
               "mt-1 h-9 w-1.5 shrink-0 rounded-full",
-              selected ? "bg-[var(--accent)]" : active ? "bg-[var(--warning)]" : "bg-[var(--line)]",
+              selected ? "bg-[var(--accent)] forced-colors:bg-[Highlight]" : active ? "bg-[var(--warning)]" : "bg-[var(--line)]",
             )}
             aria-hidden="true"
           />
@@ -85,10 +106,10 @@ export const AdvancedQueueRow = memo(function AdvancedQueueRow({
               data-queue-nav="true"
               data-job-id={job.id}
               onClick={() => onOpenJob(job.id)}
-              className="min-w-0 rounded-[10px] text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)]"
+              className="min-w-0 max-w-full rounded-[10px] text-left focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-[var(--accent)]"
               aria-label={`Inspect ${job.fileName}`}
             >
-              <div className="break-words text-sm font-semibold leading-6 text-[var(--ink)]">
+              <div dir="auto" className="wrap-anywhere text-sm font-semibold leading-6 text-[var(--ink)]">
                 {job.fileName}
               </div>
             </button>
@@ -104,7 +125,7 @@ export const AdvancedQueueRow = memo(function AdvancedQueueRow({
         </div>
 
         <div className={cn("grid min-w-0 gap-2", analysisMode === "targeted" ? "grid-cols-2 sm:grid-cols-4" : "grid-cols-2 sm:grid-cols-3")}>
-          <AdvancedQueueMetric label="Integrated" value={job.result ? formatIntegratedLufs(job.result.metrics) : paused ? "Paused" : "Waiting"} />
+          <AdvancedQueueMetric label="Integrated" value={job.result ? formatIntegratedLufs(job.result.metrics) : issue ? job.status === "failed" ? "Failed" : "Unavailable" : paused ? "Paused" : "Waiting"} />
           <AdvancedQueueMetric label="True peak" value={job.result ? formatPeakDbtp(job.result.metrics.truePeakDbtp) : "n/a"} />
           {analysisMode === "targeted" ? (
             <AdvancedQueueMetric label="Gain" value={job.result ? formatRelativeDb(job.result.metrics.targetDeltaDb) : "n/a"} />
@@ -116,14 +137,18 @@ export const AdvancedQueueRow = memo(function AdvancedQueueRow({
           <Button type="button" size="sm" variant={selected ? "primary" : "secondary"} onClick={() => onOpenJob(job.id)} aria-label={`Inspect ${job.fileName}`}>
             Inspect
           </Button>
-          {job.status === "failed" || job.status === "canceled" ? (
-            <Button type="button" size="sm" variant="secondary" onClick={() => onRetryJob(job.id)} aria-label={`Retry ${job.fileName}`}>
-              <RefreshCcw className="h-4 w-4" aria-hidden="true" />
-            </Button>
-          ) : null}
-          {active ? (
-            <Button type="button" size="sm" variant="ghost" onClick={() => onCancelJob(job.id)} aria-label={`Cancel ${job.fileName}`}>
-              <Square className="h-4 w-4" aria-hidden="true" />
+          {/* One element for Retry and Cancel, so Cancel turning into Retry
+              (or back) keeps the same focused node. */}
+          {issue || active ? (
+            <Button
+              ref={keepRowActionFocus}
+              type="button"
+              size="sm"
+              variant={issue ? "secondary" : "ghost"}
+              onClick={() => (issue ? onRetryJob(job.id) : onCancelJob(job.id))}
+              aria-label={`${issue ? "Retry" : "Cancel"} ${job.fileName}`}
+            >
+              {issue ? <RefreshCcw className="h-4 w-4" aria-hidden="true" /> : <Square className="h-4 w-4" aria-hidden="true" />}
             </Button>
           ) : null}
           <Button type="button" size="sm" variant="ghost" onClick={() => onRemoveJob(job.id)} aria-label={`Remove ${job.fileName}`}>

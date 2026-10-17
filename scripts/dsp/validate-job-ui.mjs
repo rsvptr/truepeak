@@ -174,6 +174,21 @@ check(
     buildQueueSearchHaystack(completed).includes(term),
   ),
 );
+const retargetedCompleted = makeJob({
+  id: completed.id,
+  createdAt: completed.createdAt,
+  fileName: completed.fileName,
+  targetValue: makeTargetPreset({ label: "Broadcast Target", loudnessTargetLufs: -23 }),
+});
+const retargetedHaystack = buildQueueSearchHaystack(retargetedCompleted);
+check(
+  "search haystack cache follows a retargeted job's new verdict",
+  buildQueueSearchHaystack(completed).includes("on target") &&
+    retargetedHaystack.includes("broadcast target") &&
+    retargetedHaystack.includes("too hot") &&
+    !retargetedHaystack.includes("on target"),
+  retargetedHaystack,
+);
 check(
   "natural filename sorting is stable",
   [completed, invalid, active].sort((left, right) => sortQueueJobs(left, right, "name"))

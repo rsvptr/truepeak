@@ -1,6 +1,6 @@
 "use client";
 
-import { memo, useMemo, useState } from "react";
+import { memo, useMemo, useRef, useState } from "react";
 import { ArrowRightLeft, AudioLines, BarChart3, CircleAlert, Target, Waves } from "lucide-react";
 import { getComplianceSummary, type ComplianceState } from "@/audio/compliance";
 import {
@@ -67,19 +67,19 @@ const LANE_PREVIEW_COUNT = 8;
 // truncating.
 const MAIN_VIEW_PAGE_SIZE = 60;
 const TARGETED_VIEWS: Array<{ id: CompareView; label: string; description: string }> = [
-  { id: "cards", label: "Ranked Cards", description: "Scan the batch in a richer card view." },
-  { id: "board", label: "Status Board", description: "Group files by what needs attention next." },
-  { id: "reference", label: "Reference Delta", description: "See how each file differs from a chosen reference." },
-  { id: "table", label: "Comparison Table", description: "Use a dense table when you want everything at once." },
+  { id: "cards", label: "Ranked cards", description: "Scan the batch in a richer card view." },
+  { id: "board", label: "Status board", description: "Group files by what needs attention next." },
+  { id: "reference", label: "Reference delta", description: "See how each file differs from a chosen reference." },
+  { id: "table", label: "Comparison table", description: "Use a dense table when you want everything at once." },
 ];
 const MEASURE_ONLY_VIEWS: Array<{ id: CompareView; label: string; description: string }> = [
-  { id: "cards", label: "Ranked Cards", description: "Scan loudness, peak, and dynamics without applying a target." },
-  { id: "reference", label: "Reference Delta", description: "Compare measured deltas against a chosen file, or leave reference off." },
-  { id: "table", label: "Comparison Table", description: "Use a dense table when you want everything at once." },
+  { id: "cards", label: "Ranked cards", description: "Scan loudness, peak, and dynamics without applying a target." },
+  { id: "reference", label: "Reference delta", description: "Compare measured deltas against a chosen file, or leave reference off." },
+  { id: "table", label: "Comparison table", description: "Use a dense table when you want everything at once." },
 ];
 const TARGETED_SORTS: Array<{ id: CompareSort; label: string }> = [
   { id: "integrated", label: "Integrated" },
-  { id: "truePeak", label: "True Peak" },
+  { id: "truePeak", label: "True peak" },
   { id: "lra", label: "LRA" },
   { id: "gain", label: "Gain" },
   { id: "duration", label: "Duration" },
@@ -87,25 +87,28 @@ const TARGETED_SORTS: Array<{ id: CompareSort; label: string }> = [
 ];
 const MEASURE_ONLY_SORTS: Array<{ id: CompareSort; label: string }> = [
   { id: "integrated", label: "Integrated" },
-  { id: "truePeak", label: "True Peak" },
+  { id: "truePeak", label: "True peak" },
   { id: "lra", label: "LRA" },
   { id: "duration", label: "Duration" },
   { id: "name", label: "Name" },
 ];
 const COMPARE_FILTERS: Array<{ id: CompareFilter; label: string }> = [
   { id: "all", label: "All" },
-  { id: "on-target", label: "On Target" },
+  { id: "on-target", label: "On target" },
   { id: "attention", label: "Attention" },
 ];
 type BoardState = ComplianceState | "integrated-unavailable";
 
 const BOARD_COLUMNS: Array<{ state: BoardState; label: string; description: string }> = [
-  { state: "on-target", label: "On Target", description: "Inside the selected loudness window." },
-  { state: "below-target", label: "Needs Gain", description: "Below target and likely wants gain." },
-  { state: "above-target", label: "Too Hot", description: "Above target and likely wants attenuation." },
-  { state: "ceiling-limited", label: "Ceiling-Limited", description: "Projected peak is capping the gain move." },
-  { state: "integrated-unavailable", label: "Integrated Unavailable", description: "No valid integrated reading; re-analyze suitable programme material before target decisions." },
+  { state: "on-target", label: "On target", description: "Inside the selected loudness window." },
+  { state: "below-target", label: "Needs gain", description: "Below target and likely wants gain." },
+  { state: "above-target", label: "Too hot", description: "Above target and likely wants attenuation." },
+  { state: "ceiling-limited", label: "Ceiling-limited", description: "Projected peak is capping the gain move." },
+  { state: "integrated-unavailable", label: "Integrated unavailable", description: "No valid integrated reading; re-analyze suitable program material before target decisions." },
 ];
+// Forced colors drops the primary-variant fill, so pressed toggles need a
+// system-colour indication of their own.
+const FORCED_COLORS_PRESSED = "aria-pressed:forced-colors:border-[Highlight] aria-pressed:forced-colors:bg-[Highlight] aria-pressed:forced-colors:text-[HighlightText] aria-pressed:forced-colors:forced-color-adjust-none";
 
 function axisPercent(value: number, min: number, max: number) {
   if (!Number.isFinite(value) || !Number.isFinite(min) || !Number.isFinite(max) || max <= min) {
@@ -145,6 +148,18 @@ interface SuperlativeTile {
   accent?: boolean;
 }
 
+// ["Closest to target", "Quietest file", "Widest LRA"] reads as
+// "Closest to target, quietest file and widest LRA". Later labels drop their
+// leading capital unless the first word is an acronym or a mid-capped name
+// (LRA, LUFS, TruePeak), which stay as written.
+function joinTileLabels(labels: string[]) {
+  const words = labels.map((label, index) => {
+    const firstWord = label.split(" ")[0];
+    return index === 0 || /[A-Z]/.test(firstWord.slice(1)) ? label : label.charAt(0).toLowerCase() + label.slice(1);
+  });
+  return words.length < 2 ? words.join("") : `${words.slice(0, -1).join(", ")} and ${words[words.length - 1]}`;
+}
+
 // Small batches routinely have one file win every superlative category at
 // once (closest to target, quietest, hottest peak, widest LRA - see
 // UX-011), which used to render as several near-identical cards that all
@@ -153,6 +168,7 @@ interface SuperlativeTile {
 function mergeSuperlativeTiles(specs: SuperlativeSpec[]): SuperlativeTile[] {
   const tiles: SuperlativeTile[] = [];
   const tileIndexByJobId = new Map<string, number>();
+  const mergedLabelsByIndex = new Map<number, string[]>();
 
   for (const spec of specs) {
     if (!spec.job) {
@@ -174,7 +190,10 @@ function mergeSuperlativeTiles(specs: SuperlativeSpec[]): SuperlativeTile[] {
     }
 
     const existing = tiles[existingIndex];
-    existing.label = `${existing.label} + ${spec.label}`;
+    const labels = mergedLabelsByIndex.get(existingIndex) ?? [existing.label];
+    labels.push(spec.label);
+    mergedLabelsByIndex.set(existingIndex, labels);
+    existing.label = joinTileLabels(labels);
     // Closest-to-target and Quietest, say, are both the same job's
     // integrated LUFS - skip appending a metric that's already there
     // verbatim instead of repeating it in the merged hint.
@@ -262,7 +281,7 @@ interface TableRowModel {
 function buildTableRowModel(
   job: CompletedAnalysisJob,
   referenceJob: CompletedAnalysisJob | null,
-  selectedJobId: string | null,
+  isSelected: boolean,
   analysisMode: AnalysisMode,
 ): TableRowModel {
   const badges: TableRowBadge[] = describeResultBadges(job, analysisMode);
@@ -276,7 +295,7 @@ function buildTableRowModel(
       : null;
 
   return {
-    isSelected: selectedJobId === job.id,
+    isSelected,
     badges,
     integratedDisplay: formatIntegratedLufs(job.result.metrics),
     referenceDeltaDisplay: referenceJob ? formatRelativeLu(referenceDelta) : null,
@@ -300,6 +319,9 @@ function CompareMetricTile({
   hint?: string;
   accent?: boolean;
 }) {
+  // Keep a numeric reading and its unit on one line; a trailing qualifier such
+  // as "(unstable)" drops to its own muted line instead of wrapping mid-value.
+  const [, reading = value, qualifier] = /^(.*?)(?: (\([^)]*\)))?$/.exec(value) ?? [];
   return (
     <div
       className={cn(
@@ -309,8 +331,11 @@ function CompareMetricTile({
           : "border-[var(--line)]/70 bg-[var(--surface-1)]/64",
       )}
     >
-      <div className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">{label}</div>
-      <div className="mt-2 min-w-0 break-words text-[clamp(1.05rem,1.6vw,1.5rem)] font-semibold leading-tight tabular-nums text-[var(--ink)]">{value}</div>
+      <div className="text-[0.6875rem] uppercase tracking-[0.18em] text-[var(--muted)]">{label}</div>
+      <div className="mt-2 min-w-0 break-words text-[clamp(1.05rem,1.6vw,1.5rem)] font-semibold leading-tight tabular-nums text-[var(--ink)]">
+        <span className={/^[-+]?\d/.test(reading) ? "whitespace-nowrap" : undefined}>{reading}</span>
+        {qualifier ? <span className="mt-0.5 block text-xs font-medium text-[var(--muted)]">{qualifier}</span> : null}
+      </div>
       {hint ? <div className="mt-1 min-w-0 break-words text-xs leading-5 text-[var(--muted)]">{hint}</div> : null}
     </div>
   );
@@ -335,7 +360,7 @@ const CompareBoardCard = memo(function CompareBoardCard({
   return (
     <div
       className={cn(
-        "@container tp-selected-row overflow-hidden rounded-[20px] border p-4 [content-visibility:auto] [contain-intrinsic-size:260px]",
+        "@container tp-selected-row overflow-hidden rounded-[20px] border p-4 [content-visibility:auto] [contain-intrinsic-size:auto_none_auto_260px]",
         isSelected ? "border-[color:var(--accent)]/35 bg-[color:var(--accent-soft)]" : "border-[var(--line)] bg-[var(--surface-0)]",
       )}
       data-selected={isSelected}
@@ -343,7 +368,7 @@ const CompareBoardCard = memo(function CompareBoardCard({
     >
       <div className="flex flex-col gap-3 @[26rem]:flex-row @[26rem]:items-start @[26rem]:justify-between">
         <div className="min-w-0">
-          <div className="break-words text-sm font-semibold text-[var(--ink)]">{job.fileName}</div>
+          <div dir="auto" className="break-words text-sm font-semibold text-[var(--ink)]">{job.fileName}</div>
           <div className="mt-2 flex flex-wrap gap-2">
             {badges.map((badge) => (
               <Badge
@@ -393,7 +418,7 @@ function RangeLane({
 }) {
   return (
     <div>
-      <div className="flex items-start justify-between gap-3 text-[11px] uppercase tracking-[0.14em] text-[var(--muted)]">
+      <div className="flex items-start justify-between gap-3 text-[0.6875rem] uppercase tracking-[0.14em] text-[var(--muted)]">
         <span className="min-w-0 break-words">{label}</span>
         <span className="shrink-0 text-[var(--ink)]">{valueLabel}</span>
       </div>
@@ -403,13 +428,13 @@ function RangeLane({
         ) : null}
         <div
           className={cn(
-            "absolute top-1/2 h-4 w-4 -translate-x-1/2 -translate-y-1/2 rounded-full border border-white/20 shadow-[0_0_0_4px_rgba(255,255,255,0.04)]",
+            "absolute top-1/2 h-4 w-4 -translate-x-1/2 -translate-y-1/2 rounded-full border border-[var(--control-line)] shadow-[0_0_0_4px_var(--surface-1)]",
             toneClassName,
           )}
           style={{ left: `${valuePercent}%` }}
         />
       </div>
-      <div className="mt-1 grid grid-cols-[1fr_minmax(0,1.4fr)_1fr] gap-3 text-[10px] text-[var(--muted)]">
+      <div className="mt-1 grid grid-cols-[1fr_minmax(0,1.4fr)_1fr] gap-3 text-[0.6875rem] text-[var(--muted)]">
         <span className="min-w-0 break-words">{minLabel}</span>
         <span className="min-w-0 break-words text-center">{markerLabel ?? "Batch range"}</span>
         <span className="min-w-0 break-words text-right">{maxLabel}</span>
@@ -449,7 +474,7 @@ const CompareRankedCard = memo(function CompareRankedCard({
 
   return (
     <Card
-      className="tp-selected-row overflow-hidden border-[var(--line)] bg-[var(--surface-1)] p-5 [content-visibility:auto] [contain-intrinsic-size:360px]"
+      className="tp-selected-row overflow-hidden border-[var(--line)] bg-[var(--surface-1)] p-5 [content-visibility:auto] [contain-intrinsic-size:auto_none_auto_360px]"
       data-selected={isSelected}
       aria-current={isSelected ? "true" : undefined}
     >
@@ -460,7 +485,7 @@ const CompareRankedCard = memo(function CompareRankedCard({
             {badges.map((badge) => <Badge key={badge.key} className={badge.className}>{badge.label}</Badge>)}
             {job.result.metrics.normalizationLimited ? <Badge className="tone-warning">Ceiling-limited</Badge> : null}
           </div>
-          <h3 className="mt-3 break-words text-xl font-semibold text-[var(--ink)]">{job.fileName}</h3>
+          <h3 dir="auto" className="mt-3 break-words text-xl font-semibold text-[var(--ink)]">{job.fileName}</h3>
           <p className="mt-2 break-words text-sm leading-6 text-[var(--muted)]">{job.result.metadata.channelLayout.name}, {numberFormatter.format(job.result.metadata.sampleRate)} Hz, {job.result.metadata.decoderLabel}</p>
         </div>
         <Button type="button" size="sm" variant="secondary" onClick={() => onOpenJob(job.id)} aria-label={`Inspect ${job.fileName}`}>Inspect</Button>
@@ -473,16 +498,16 @@ const CompareRankedCard = memo(function CompareRankedCard({
       </div>
       <div className="mt-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
         <div className="rounded-[20px] border border-[var(--line)] bg-[var(--surface-0)] px-4 py-3">
-          <div className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">{analysisMode === "targeted" ? "Distance to target" : "Ungated loudness"}</div>
-          <div className="mt-2 text-lg font-semibold tabular-nums text-[var(--ink)]">{analysisMode === "targeted" ? formatDb(distanceToTarget, "LU") : formatLufs(job.result.metrics.ungatedLufs)}</div>
+          <div className="text-[0.6875rem] uppercase tracking-[0.18em] text-[var(--muted)]">{analysisMode === "targeted" ? "Distance to target" : "Ungated loudness"}</div>
+          <div className="mt-2 whitespace-nowrap text-lg font-semibold tabular-nums text-[var(--ink)]">{analysisMode === "targeted" ? formatDb(distanceToTarget, "LU") : formatLufs(job.result.metrics.ungatedLufs)}</div>
         </div>
         <div className="rounded-[20px] border border-[var(--line)] bg-[var(--surface-0)] px-4 py-3">
-          <div className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">{analysisMode === "targeted" ? "Gain move" : "Sample peak"}</div>
-          <div className="mt-2 text-lg font-semibold tabular-nums text-[var(--ink)]">{analysisMode === "targeted" ? formatRelativeDb(job.result.metrics.targetDeltaDb) : formatDb(job.result.metrics.samplePeakDbfs, "dBFS")}</div>
+          <div className="text-[0.6875rem] uppercase tracking-[0.18em] text-[var(--muted)]">{analysisMode === "targeted" ? "Gain move" : "Sample peak"}</div>
+          <div className="mt-2 whitespace-nowrap text-lg font-semibold tabular-nums text-[var(--ink)]">{analysisMode === "targeted" ? formatRelativeDb(job.result.metrics.targetDeltaDb) : formatDb(job.result.metrics.samplePeakDbfs, "dBFS")}</div>
         </div>
         <div className="rounded-[20px] border border-[var(--line)] bg-[var(--surface-0)] px-4 py-3">
-          <div className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">{analysisMode === "targeted" ? "Projected peak" : "Duration"}</div>
-          <div className="mt-2 text-lg font-semibold tabular-nums text-[var(--ink)]">{analysisMode === "targeted" ? formatPeakDbtp(job.result.metrics.projectedTruePeakDbtp) : formatDuration(job.result.metadata.durationSeconds)}</div>
+          <div className="text-[0.6875rem] uppercase tracking-[0.18em] text-[var(--muted)]">{analysisMode === "targeted" ? "Projected peak" : "Duration"}</div>
+          <div className="mt-2 whitespace-nowrap text-lg font-semibold tabular-nums text-[var(--ink)]">{analysisMode === "targeted" ? formatPeakDbtp(job.result.metrics.projectedTruePeakDbtp) : formatDuration(job.result.metadata.durationSeconds)}</div>
         </div>
       </div>
     </Card>
@@ -523,7 +548,7 @@ const CompareReferenceCard = memo(function CompareReferenceCard({
   return (
     <Card
       className={cn(
-        "tp-selected-row overflow-hidden border-[var(--line)] p-5 [content-visibility:auto] [contain-intrinsic-size:300px]",
+        "tp-selected-row overflow-hidden border-[var(--line)] p-5 [content-visibility:auto] [contain-intrinsic-size:auto_none_auto_300px]",
         isReference ? "bg-[color:var(--accent-soft)] shadow-[var(--shadow-elevated)]" : "bg-[var(--surface-1)]",
       )}
       data-selected={isReference}
@@ -535,16 +560,16 @@ const CompareReferenceCard = memo(function CompareReferenceCard({
             {isReference ? <Badge>Reference</Badge> : null}
             {badges.map((badge) => <Badge key={badge.key} className={badge.className}>{badge.label}</Badge>)}
           </div>
-          <h3 className="mt-3 break-words text-xl font-semibold text-[var(--ink)]">{job.fileName}</h3>
+          <h3 dir="auto" className="mt-3 break-words text-xl font-semibold text-[var(--ink)]">{job.fileName}</h3>
           <p className="mt-2 break-words text-sm leading-6 text-[var(--muted)]">Compare this file against {referenceJob.fileName} before making batch-wide decisions.</p>
         </div>
         <Button type="button" size="sm" variant="secondary" onClick={() => onOpenJob(job.id)} aria-label={`Inspect ${job.fileName}`} className="shrink-0">Inspect</Button>
       </div>
       <div className={cn("mt-5 grid gap-3", analysisMode === "targeted" ? "sm:grid-cols-2" : "sm:grid-cols-3")}>
-        <div className="rounded-[20px] border border-[var(--line)] bg-[var(--surface-0)] px-4 py-3"><div className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">Integrated delta</div><div className={cn("mt-2 text-lg font-semibold tabular-nums", deltaToneClass(integratedDelta))}>{formatRelativeLu(integratedDelta)}</div></div>
-        <div className="rounded-[20px] border border-[var(--line)] bg-[var(--surface-0)] px-4 py-3"><div className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">True peak delta</div><div className={cn("mt-2 text-lg font-semibold tabular-nums", deltaToneClass(truePeakDelta))}>{formatRelativeDb(truePeakDelta)}</div></div>
-        <div className="rounded-[20px] border border-[var(--line)] bg-[var(--surface-0)] px-4 py-3"><div className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">LRA delta</div><div className={cn("mt-2 text-lg font-semibold tabular-nums", deltaToneClass(lraDelta))}>{lraDeltaInvalid ? "No valid measurement" : lraDeltaUnstable ? "Unstable" : formatRelativeLu(lraDelta)}</div></div>
-        {analysisMode === "targeted" ? <div className="rounded-[20px] border border-[var(--line)] bg-[var(--surface-0)] px-4 py-3"><div className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">Gain delta</div><div className={cn("mt-2 text-lg font-semibold tabular-nums", deltaToneClass(gainDelta))}>{formatRelativeDb(gainDelta)}</div></div> : null}
+        <div className="rounded-[20px] border border-[var(--line)] bg-[var(--surface-0)] px-4 py-3"><div className="text-[0.6875rem] uppercase tracking-[0.18em] text-[var(--muted)]">Integrated delta</div><div className={cn("mt-2 text-lg font-semibold tabular-nums", deltaToneClass(integratedDelta))}>{formatRelativeLu(integratedDelta)}</div></div>
+        <div className="rounded-[20px] border border-[var(--line)] bg-[var(--surface-0)] px-4 py-3"><div className="text-[0.6875rem] uppercase tracking-[0.18em] text-[var(--muted)]">True peak delta</div><div className={cn("mt-2 text-lg font-semibold tabular-nums", deltaToneClass(truePeakDelta))}>{formatRelativeDb(truePeakDelta)}</div></div>
+        <div className="rounded-[20px] border border-[var(--line)] bg-[var(--surface-0)] px-4 py-3"><div className="text-[0.6875rem] uppercase tracking-[0.18em] text-[var(--muted)]">LRA delta</div><div className={cn("mt-2 text-lg font-semibold tabular-nums", deltaToneClass(lraDelta))}>{lraDeltaInvalid ? "No valid measurement" : lraDeltaUnstable ? "Unstable" : formatRelativeLu(lraDelta)}</div></div>
+        {analysisMode === "targeted" ? <div className="rounded-[20px] border border-[var(--line)] bg-[var(--surface-0)] px-4 py-3"><div className="text-[0.6875rem] uppercase tracking-[0.18em] text-[var(--muted)]">Gain delta</div><div className={cn("mt-2 text-lg font-semibold tabular-nums", deltaToneClass(gainDelta))}>{formatRelativeDb(gainDelta)}</div></div> : null}
       </div>
     </Card>
   );
@@ -553,7 +578,7 @@ const CompareReferenceCard = memo(function CompareReferenceCard({
 interface CompareTableRowProps {
   job: CompletedAnalysisJob;
   referenceJob: CompletedAnalysisJob | null;
-  selectedJobId: string | null;
+  isSelected: boolean;
   analysisMode: AnalysisMode;
   onOpenJob: (jobId: string) => void;
 }
@@ -569,16 +594,16 @@ interface CompareTableRowProps {
 const CompareTableMobileRow = memo(function CompareTableMobileRow({
   job,
   referenceJob,
-  selectedJobId,
+  isSelected,
   analysisMode,
   onOpenJob,
 }: CompareTableRowProps) {
-  const row = buildTableRowModel(job, referenceJob, selectedJobId, analysisMode);
+  const row = buildTableRowModel(job, referenceJob, isSelected, analysisMode);
 
   return (
     <article
       className={cn(
-        "tp-selected-row rounded-[22px] border p-4 text-[var(--ink)] [content-visibility:auto] [contain-intrinsic-size:280px]",
+        "tp-selected-row rounded-[22px] border p-4 text-[var(--ink)] [content-visibility:auto] [contain-intrinsic-size:auto_none_auto_280px]",
         row.isSelected ? "border-[color:var(--accent)]/40 bg-[color:var(--accent-soft)]" : "border-[var(--line)] bg-[var(--surface-1)]",
       )}
       data-selected={row.isSelected}
@@ -589,34 +614,34 @@ const CompareTableMobileRow = memo(function CompareTableMobileRow({
           <Badge key={badge.key} className={badge.className}>{badge.label}</Badge>
         ))}
       </div>
-      <h3 className="mt-3 break-words text-lg font-semibold">{job.fileName}</h3>
+      <h3 dir="auto" className="mt-3 wrap-anywhere text-lg font-semibold">{job.fileName}</h3>
       <div className="mt-4 grid grid-cols-2 gap-3">
         <div>
-          <div className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">Integrated</div>
+          <div className="text-[0.6875rem] uppercase tracking-[0.18em] text-[var(--muted)]">Integrated</div>
           <div className="mt-1 font-semibold tabular-nums">{row.integratedDisplay}</div>
         </div>
         {row.referenceDeltaDisplay != null ? (
           <div>
-            <div className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">Vs ref</div>
+            <div className="text-[0.6875rem] uppercase tracking-[0.18em] text-[var(--muted)]">Vs ref</div>
             <div className={cn("mt-1 font-semibold tabular-nums", row.referenceDeltaToneClass)}>{row.referenceDeltaDisplay}</div>
           </div>
         ) : null}
         {analysisMode === "targeted" ? (
           <div>
-            <div className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">Gain</div>
+            <div className="text-[0.6875rem] uppercase tracking-[0.18em] text-[var(--muted)]">Gain</div>
             <div className="mt-1 font-semibold tabular-nums">{row.gainDisplay}</div>
           </div>
         ) : null}
         <div>
-          <div className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">True peak</div>
+          <div className="text-[0.6875rem] uppercase tracking-[0.18em] text-[var(--muted)]">True peak</div>
           <div className="mt-1 font-semibold tabular-nums">{row.truePeakDisplay}</div>
         </div>
         <div>
-          <div className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">LRA</div>
+          <div className="text-[0.6875rem] uppercase tracking-[0.18em] text-[var(--muted)]">LRA</div>
           <div className="mt-1 font-semibold tabular-nums">{row.lraDisplay}</div>
         </div>
         <div>
-          <div className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">Duration</div>
+          <div className="text-[0.6875rem] uppercase tracking-[0.18em] text-[var(--muted)]">Duration</div>
           <div className="mt-1 font-semibold tabular-nums">{row.durationDisplay}</div>
         </div>
       </div>
@@ -630,11 +655,11 @@ const CompareTableMobileRow = memo(function CompareTableMobileRow({
 const CompareTableDesktopRow = memo(function CompareTableDesktopRow({
   job,
   referenceJob,
-  selectedJobId,
+  isSelected,
   analysisMode,
   onOpenJob,
 }: CompareTableRowProps) {
-  const row = buildTableRowModel(job, referenceJob, selectedJobId, analysisMode);
+  const row = buildTableRowModel(job, referenceJob, isSelected, analysisMode);
   const showReferenceColumn = referenceJob != null;
 
   return (
@@ -642,20 +667,20 @@ const CompareTableDesktopRow = memo(function CompareTableDesktopRow({
       className={cn("text-[var(--ink)]", row.isSelected ? "[&>td]:border-[color:var(--accent)]/40 [&>td]:bg-[color:var(--accent-soft)]" : "")}
       aria-current={row.isSelected ? "true" : undefined}
     >
-      <td className="rounded-l-[20px] border border-r-0 border-[var(--line)] px-4 py-4"><div className="break-words font-semibold">{job.fileName}</div><div className="mt-2 flex flex-wrap gap-2">{row.badges.map((badge) => <Badge key={badge.key} className={badge.className}>{badge.label}</Badge>)}</div></td>
-      <td className="border border-l-0 border-r-0 border-[var(--line)] px-4 py-4 tabular-nums">{row.integratedDisplay}</td>
-      {showReferenceColumn ? <td className={cn("border border-l-0 border-r-0 border-[var(--line)] px-4 py-4 font-semibold tabular-nums", row.referenceDeltaToneClass)}>{row.referenceDeltaDisplay}</td> : null}
-      {analysisMode === "targeted" ? <td className="border border-l-0 border-r-0 border-[var(--line)] px-4 py-4 tabular-nums">{row.gainDisplay}</td> : null}
-      <td className="border border-l-0 border-r-0 border-[var(--line)] px-4 py-4 tabular-nums">{row.truePeakDisplay}</td>
-      <td className="hidden border border-l-0 border-r-0 border-[var(--line)] px-4 py-4 tabular-nums md:table-cell">{row.lraDisplay}</td>
-      <td className="hidden border border-l-0 border-r-0 border-[var(--line)] px-4 py-4 tabular-nums xl:table-cell">{row.durationDisplay}</td>
+      <td className="rounded-l-[20px] border border-r-0 border-[var(--line)] px-4 py-4"><div dir="auto" className="wrap-anywhere font-semibold">{job.fileName}</div><div className="mt-2 flex flex-wrap gap-2">{row.badges.map((badge) => <Badge key={badge.key} className={badge.className}>{badge.label}</Badge>)}</div></td>
+      <td className="border border-l-0 border-r-0 border-[var(--line)] whitespace-nowrap px-4 py-4 tabular-nums">{row.integratedDisplay}</td>
+      {showReferenceColumn ? <td className={cn("border border-l-0 border-r-0 border-[var(--line)] whitespace-nowrap px-4 py-4 font-semibold tabular-nums", row.referenceDeltaToneClass)}>{row.referenceDeltaDisplay}</td> : null}
+      {analysisMode === "targeted" ? <td className="border border-l-0 border-r-0 border-[var(--line)] whitespace-nowrap px-4 py-4 tabular-nums">{row.gainDisplay}</td> : null}
+      <td className="border border-l-0 border-r-0 border-[var(--line)] whitespace-nowrap px-4 py-4 tabular-nums">{row.truePeakDisplay}</td>
+      <td className="hidden border border-l-0 border-r-0 border-[var(--line)] whitespace-nowrap px-4 py-4 tabular-nums md:table-cell">{row.lraDisplay}</td>
+      <td className="hidden border border-l-0 border-r-0 border-[var(--line)] whitespace-nowrap px-4 py-4 tabular-nums xl:table-cell">{row.durationDisplay}</td>
       <td className="hidden break-words border border-l-0 border-r-0 border-[var(--line)] px-4 py-4 2xl:table-cell">{row.decoderLabel}</td>
       <td className="rounded-r-[20px] border border-l-0 border-[var(--line)] px-4 py-4"><Button type="button" size="sm" variant="ghost" onClick={() => onOpenJob(job.id)} aria-label={`Inspect ${job.fileName}`}>Inspect</Button></td>
     </tr>
   );
 });
 
-export function CompareStudio({
+export const CompareStudio = memo(function CompareStudio({
   sessionStats,
   currentTarget,
   analysisMode,
@@ -776,7 +801,7 @@ export function CompareStudio({
   );
   const decoderSummary = decoderMix.length
     ? decoderMix.map(([label, count]) => `${label} x${count}`).join(" | ")
-    : "Waiting for completed jobs";
+    : "Waiting for completed files";
 
   const integratedRange = useMemo(() => {
     const values = readyJobs
@@ -813,6 +838,10 @@ export function CompareStudio({
     };
   }, [analysisMode, currentTarget, readyJobs]);
 
+  // Show all files and the quick reference actions unmount themselves, so
+  // focus moves to the control that now carries their result.
+  const allFilterButtonRef = useRef<HTMLButtonElement>(null);
+  const referenceSelectRef = useRef<HTMLSelectElement>(null);
   const [showAllLaneJobs, setShowAllLaneJobs] = useState(false);
   const topLaneJobs = useMemo(
     () => (showAllLaneJobs ? sortedJobs : sortedJobs.slice(0, LANE_PREVIEW_COUNT)),
@@ -853,21 +882,21 @@ export function CompareStudio({
           label: "Hottest peak",
           job: hottestPeakJob,
           metricText: hottestPeakJob ? formatPeakDbtp(hottestPeakJob.result.metrics.truePeakDbtp) : null,
-          emptyHint: "Waiting for completed jobs",
+          emptyHint: "Waiting for completed files",
         },
         {
           key: "widest",
           label: "Widest LRA",
           job: widestRangeJob,
           metricText: widestRangeJob ? formatLoudnessRange(widestRangeJob.result.metrics) : null,
-          emptyHint: "Waiting for completed jobs",
+          emptyHint: "Waiting for completed files",
         },
         {
           key: "largest-move",
           label: "Largest move",
           job: largestMoveJob,
           metricText: largestMoveJob ? formatRelativeDb(largestMoveJob.result.metrics.targetDeltaDb) : null,
-          emptyHint: "Waiting for completed jobs",
+          emptyHint: "Waiting for completed files",
         },
       ]);
     }
@@ -893,21 +922,21 @@ export function CompareStudio({
         label: "Hottest peak",
         job: hottestPeakJob,
         metricText: hottestPeakJob ? formatPeakDbtp(hottestPeakJob.result.metrics.truePeakDbtp) : null,
-        emptyHint: "Waiting for completed jobs",
+        emptyHint: "Waiting for completed files",
       },
       {
         key: "widest",
         label: "Widest LRA",
         job: widestRangeJob,
         metricText: widestRangeJob ? formatLoudnessRange(widestRangeJob.result.metrics) : null,
-        emptyHint: "Waiting for completed jobs",
+        emptyHint: "Waiting for completed files",
       },
       {
         key: "longest",
         label: "Longest file",
         job: longestJob,
         metricText: longestJob ? formatDuration(longestJob.result.metadata.durationSeconds) : null,
-        emptyHint: "Waiting for completed jobs",
+        emptyHint: "Waiting for completed files",
       },
     ]);
   }, [
@@ -927,7 +956,7 @@ export function CompareStudio({
 
   if (!readyJobs.length) {
     return (
-      <Card className="tp-enter-soft p-8 text-center">
+      <Card className="p-8 text-center">
         <div className="mx-auto flex h-16 w-16 items-center justify-center rounded-[22px] border border-[var(--line)] bg-[var(--surface-1)] text-[var(--muted)]">
           <BarChart3 className="h-7 w-7" aria-hidden="true" />
         </div>
@@ -938,7 +967,7 @@ export function CompareStudio({
         {onOpenQueue ? (
           <Button type="button" size="sm" variant="secondary" onClick={onOpenQueue} className="mt-5">
             <AudioLines className="h-4 w-4" aria-hidden="true" />
-            Open Queue
+            Open queue
           </Button>
         ) : null}
       </Card>
@@ -946,9 +975,9 @@ export function CompareStudio({
   }
 
   return (
-    <section className="tp-enter-soft space-y-6">
+    <section className="space-y-6">
       {unverifiedCount ? (
-        <div className="tone-warning rounded-[22px] border p-4 text-sm leading-6" role="status">
+        <div className="tone-warning rounded-[22px] border p-4 text-sm leading-6">
           <div className="flex items-start gap-3">
             <CircleAlert className="mt-0.5 h-5 w-5 shrink-0" aria-hidden="true" />
             <div>
@@ -968,7 +997,7 @@ export function CompareStudio({
           deduped by mergeSuperlativeTiles before render, since a small
           batch routinely has one file win every category. */}
       <details className="group rounded-[22px] border border-[var(--line)]/70 bg-[var(--surface-1)]/40 open:bg-transparent">
-        <summary className="cursor-pointer rounded-[22px] px-4 py-3 text-sm font-semibold text-[var(--ink)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)] group-open:rounded-b-none group-open:border-b group-open:border-[var(--line)]/70">
+        <summary className="cursor-pointer rounded-[22px] px-4 py-3 text-sm font-semibold text-[var(--ink)] focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-[var(--accent)] group-open:rounded-b-none group-open:border-b group-open:border-[var(--line)]/70">
           Batch snapshot &amp; statistics
           <span className="ml-2 font-normal text-[var(--muted)]">
             Superlatives, decoder mix, and per-file batch range
@@ -990,15 +1019,20 @@ export function CompareStudio({
             ) : (
               <Waves className="h-5 w-5 text-[var(--accent)]" aria-hidden="true" />
             )}
-            <div className="text-[11px] uppercase tracking-[0.18em]">Batch snapshot</div>
+            <div className="text-[0.6875rem] uppercase tracking-[0.18em]">Batch snapshot</div>
           </div>
           <h2 className="mt-3 text-2xl font-semibold text-[var(--ink)]">What stands out in this batch</h2>
           <div className="mt-5 space-y-3">
             {analysisMode === "targeted" ? (
               <>
                 <div className="rounded-[20px] border border-[var(--line)] bg-[var(--surface-1)] p-4 text-sm leading-6 text-[var(--muted)]">
-                  <div className="font-semibold text-[var(--ink)]">{numberFormatter.format(complianceCounts["on-target"])} file{complianceCounts["on-target"] === 1 ? "" : "s"} are already inside the target window.</div>
-                  <div className="mt-1">{numberFormatter.format(attentionJobs.length)} file{attentionJobs.length === 1 ? "" : "s"} need attention because they are outside the target window or have no valid integrated reading.</div>
+                  <div className="font-semibold text-[var(--ink)]">{numberFormatter.format(complianceCounts["on-target"])} {complianceCounts["on-target"] === 1 ? "file is" : "files are"} already inside the target window.</div>
+                  <div className="mt-1">
+                    {numberFormatter.format(attentionJobs.length)}{" "}
+                    {attentionJobs.length === 1
+                      ? "file needs attention because it is outside the target window or has no valid integrated reading."
+                      : "files need attention because they are outside the target window or have no valid integrated reading."}
+                  </div>
                 </div>
                 <div className="rounded-[20px] border border-[var(--line)] bg-[var(--surface-1)] p-4 text-sm leading-6 text-[var(--muted)]">
                   <div className="font-semibold text-[var(--ink)]">Decoder mix</div>
@@ -1042,7 +1076,7 @@ export function CompareStudio({
         <Card className="p-5 sm:p-6">
           <div className="flex items-center gap-3 text-[var(--muted)]">
             <BarChart3 className="h-5 w-5 text-[var(--accent)]" aria-hidden="true" />
-            <div className="text-[11px] uppercase tracking-[0.18em]">Batch range</div>
+            <div className="text-[0.6875rem] uppercase tracking-[0.18em]">Batch range</div>
           </div>
           <h2 className="mt-3 text-2xl font-semibold text-[var(--ink)]">See each file against the batch</h2>
           <p className="mt-2 text-sm leading-6 text-[var(--muted)]">
@@ -1067,10 +1101,10 @@ export function CompareStudio({
             {topLaneJobs.map((job) => {
               const badges = describeResultBadges(job, analysisMode, true);
               return (
-                  <div key={job.id} className="min-w-0 overflow-hidden rounded-[22px] border border-[var(--line)] bg-[var(--surface-1)] p-4 [content-visibility:auto] [contain-intrinsic-size:180px]">
+                  <div key={job.id} className="min-w-0 overflow-hidden rounded-[22px] border border-[var(--line)] bg-[var(--surface-1)] p-4 [content-visibility:auto] [contain-intrinsic-size:auto_none_auto_180px]">
                   <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
                     <div className="min-w-0">
-                      <div className="break-words text-sm font-semibold text-[var(--ink)]">{job.fileName}</div>
+                      <div dir="auto" className="break-words text-sm font-semibold text-[var(--ink)]">{job.fileName}</div>
                       <div className="mt-2 flex flex-wrap items-center gap-2">
                         {badges.map((badge) => (
                           <Badge
@@ -1111,13 +1145,13 @@ export function CompareStudio({
       <Card className="p-5 sm:p-6">
         <div className="flex flex-col gap-5 xl:flex-row xl:items-end xl:justify-between">
           <div className="min-w-0">
-            <div className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">Compare</div>
+            <div className="text-[0.6875rem] uppercase tracking-[0.18em] text-[var(--muted)]">Compare</div>
             <h2 className="mt-2 text-2xl font-semibold text-[var(--ink)]">Choose a view for this batch</h2>
             <p className="mt-2 max-w-3xl text-sm leading-6 text-[var(--muted)]">{availableViews.find((view) => view.id === compareView)?.description}</p>
           </div>
           <div className="flex flex-wrap gap-2" role="group" aria-label="Choose compare view">
             {availableViews.map((view) => (
-              <Button key={view.id} type="button" size="sm" variant={compareView === view.id ? "primary" : "secondary"} aria-pressed={compareView === view.id} onClick={() => onCompareViewChange(view.id)}>
+              <Button key={view.id} type="button" size="sm" variant={compareView === view.id ? "primary" : "secondary"} aria-pressed={compareView === view.id} className={FORCED_COLORS_PRESSED} onClick={() => onCompareViewChange(view.id)}>
                 {view.label}
               </Button>
             ))}
@@ -1126,17 +1160,17 @@ export function CompareStudio({
 
         <div className="mt-5 grid gap-4 xl:grid-cols-[minmax(0,0.86fr)_minmax(0,1.14fr)]">
           <div className="rounded-[22px] border border-[var(--line)] bg-[var(--surface-1)] p-4">
-            <div className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">Filter</div>
+            <div className="text-[0.6875rem] uppercase tracking-[0.18em] text-[var(--muted)]">Filter</div>
             <div role="group" aria-label="Filter compare items" className="mt-3 flex flex-wrap gap-2">
               {(analysisMode === "targeted" ? COMPARE_FILTERS : [{ id: "all", label: "All" }]).map((filter) => (
-                <Button key={filter.id} type="button" size="sm" variant={compareFilter === filter.id ? "primary" : "secondary"} aria-pressed={compareFilter === filter.id} onClick={() => onCompareFilterChange(filter.id as CompareFilter)}>
+                <Button key={filter.id} ref={filter.id === "all" ? allFilterButtonRef : undefined} type="button" size="sm" variant={compareFilter === filter.id ? "primary" : "secondary"} aria-pressed={compareFilter === filter.id} className={FORCED_COLORS_PRESSED} onClick={() => onCompareFilterChange(filter.id as CompareFilter)}>
                   {filter.label}
-                  {analysisMode === "targeted" ? <span className="text-[11px]">{numberFormatter.format(filterCounts[filter.id as CompareFilter])}</span> : null}
+                  {analysisMode === "targeted" ? <span className="text-[0.6875rem]">{numberFormatter.format(filterCounts[filter.id as CompareFilter])}</span> : null}
                 </Button>
               ))}
             </div>
             <p className="mt-3 text-sm leading-6 text-[var(--muted)]">
-              {analysisMode === "targeted" ? "Filter down to files already in range or the ones that still need attention." : "Raw mode keeps the full batch visible unless you choose a reference or another view."}
+              {analysisMode === "targeted" ? "Filter down to files already in range or the ones that still need attention." : "In Measure only, the full batch stays visible unless you choose a reference or another view."}
             </p>
           </div>
           <div className="rounded-[22px] border border-[var(--line)] bg-[var(--surface-1)] p-4">
@@ -1144,11 +1178,11 @@ export function CompareStudio({
               <>
                 <div className="flex items-center gap-3 text-[var(--muted)]">
                   <ArrowRightLeft className="h-4 w-4 text-[var(--accent)]" aria-hidden="true" />
-                  <div className="text-[11px] uppercase tracking-[0.18em]">Reference</div>
+                  <div className="text-[0.6875rem] uppercase tracking-[0.18em]">Reference</div>
                 </div>
                 <div className="mt-3 flex flex-col gap-3 xl:flex-row xl:items-center">
                   <label htmlFor="compare-reference" className="sr-only">Choose a reference file</label>
-                  <select id="compare-reference" name="compare-reference" aria-label="Choose reference file" value={referenceJob?.id ?? "none"} onChange={(event) => onReferenceIdChange(event.target.value === "none" ? null : event.target.value)} className="w-full rounded-full border border-[var(--control-line)] bg-[var(--surface-0)] px-4 py-3 text-sm text-[var(--ink)] outline-none transition-[border-color,background-color] duration-200 ease-out focus:border-[var(--accent)] focus-visible:ring-2 focus-visible:ring-[var(--accent)] xl:max-w-md">
+                  <select ref={referenceSelectRef} id="compare-reference" name="compare-reference" value={referenceJob?.id ?? "none"} onChange={(event) => onReferenceIdChange(event.target.value === "none" ? null : event.target.value)} className="w-full rounded-full border border-[var(--control-line)] bg-[var(--surface-0)] px-4 py-3 text-sm text-[var(--ink)] focus-visible:outline-hidden transition-[border-color,background-color] duration-200 ease-out focus:border-[var(--accent)] focus-visible:ring-2 focus-visible:ring-[var(--accent)] xl:max-w-md">
                     <option value="none">No reference</option>
                     {readyJobs.map((job) => (
                       <option key={job.id} value={job.id}>{job.fileName}</option>
@@ -1164,7 +1198,7 @@ export function CompareStudio({
               </>
             ) : (
               <>
-                <div className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">View guide</div>
+                <div className="text-[0.6875rem] uppercase tracking-[0.18em] text-[var(--muted)]">View guide</div>
                 <h3 className="mt-3 text-lg font-semibold text-[var(--ink)]">{compareView === "board" ? "Group the batch by likely action" : "Use cards for fast triage"}</h3>
                 <p className="mt-2 text-sm leading-6 text-[var(--muted)]">{compareView === "board" ? "The board groups files by the next likely move, which is helpful once larger sessions mix on-target and problematic masters." : "Cards give you more context than the table without locking the whole batch to a single reference."}</p>
               </>
@@ -1180,6 +1214,7 @@ export function CompareStudio({
               size="sm"
               variant={compareSort === option.id ? "primary" : "secondary"}
               aria-pressed={compareSort === option.id}
+              className={FORCED_COLORS_PRESSED}
               aria-label={
                 compareSort === option.id
                   ? `Sort by ${option.label}, ${formatSortDirection(compareDirection).toLowerCase()}`
@@ -1188,7 +1223,7 @@ export function CompareStudio({
               onClick={() => toggleCompareSort(option.id)}
             >
               {option.label}
-              {compareSort === option.id ? <span className="text-[11px]">{formatSortDirection(compareDirection)}</span> : null}
+              {compareSort === option.id ? <span className="text-[0.6875rem]">{formatSortDirection(compareDirection)}</span> : null}
             </Button>
           ))}
         </div>
@@ -1287,7 +1322,10 @@ export function CompareStudio({
                           type="button"
                           size="sm"
                           variant="secondary"
-                          onClick={() => onReferenceIdChange(action.job.id)}
+                          onClick={() => {
+                            onReferenceIdChange(action.job.id);
+                            referenceSelectRef.current?.focus();
+                          }}
                           aria-label={`${action.label}: ${action.job.fileName}`}
                         >
                           {action.label}
@@ -1308,13 +1346,13 @@ export function CompareStudio({
                   row is its own memoized component (CompareTableMobileRow /
                   CompareTableDesktopRow) so an unrelated job's progress tick
                   does not force every row to redo that derivation. */}
-              <div className="mt-5 grid gap-3 md:hidden">
+              <div className="mt-5 grid grid-cols-[minmax(0,1fr)] gap-3 md:hidden">
                 {visibleJobs.map((job) => (
                   <CompareTableMobileRow
                     key={job.id}
                     job={job}
                     referenceJob={referenceJob}
-                    selectedJobId={selectedJobId}
+                    isSelected={selectedJobId === job.id}
                     analysisMode={analysisMode}
                     onOpenJob={onOpenJob}
                   />
@@ -1332,7 +1370,7 @@ export function CompareStudio({
                       the rows at rest instead of docking it under the
                       toolbar. */}
                   <thead>
-                    <tr className="text-left text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">
+                    <tr className="text-left text-[0.6875rem] uppercase tracking-[0.18em] text-[var(--muted)]">
                       <th scope="col" className="sticky top-0 bg-[var(--surface-0)]/95 px-4 py-2 backdrop-blur">File</th>
                       <th scope="col" className="sticky top-0 bg-[var(--surface-0)]/95 px-4 py-2 backdrop-blur">Integrated</th>
                       {referenceJob ? <th scope="col" className="sticky top-0 bg-[var(--surface-0)]/95 px-4 py-2 backdrop-blur">Vs ref</th> : null}
@@ -1350,7 +1388,7 @@ export function CompareStudio({
                         key={job.id}
                         job={job}
                         referenceJob={referenceJob}
-                        selectedJobId={selectedJobId}
+                        isSelected={selectedJobId === job.id}
                         analysisMode={analysisMode}
                         onOpenJob={onOpenJob}
                       />
@@ -1365,9 +1403,18 @@ export function CompareStudio({
           <div className="mt-5 rounded-[22px] border border-dashed border-[var(--line)] bg-[var(--surface-1)] p-6 text-sm leading-6 text-[var(--muted)]">
             <div>Nothing matches the current filter. Try a different filter or finish more files.</div>
             {analysisMode === "targeted" && compareFilter !== "all" ? (
-              <Button type="button" size="sm" variant="secondary" onClick={() => onCompareFilterChange("all")} className="mt-4">
+              <Button
+                type="button"
+                size="sm"
+                variant="secondary"
+                onClick={() => {
+                  onCompareFilterChange("all");
+                  allFilterButtonRef.current?.focus();
+                }}
+                className="mt-4"
+              >
                 <AudioLines className="h-4 w-4" aria-hidden="true" />
-                Show All Files
+                Show all files
               </Button>
             ) : null}
           </div>
@@ -1375,4 +1422,4 @@ export function CompareStudio({
       </Card>
     </section>
   );
-}
+});

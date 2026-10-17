@@ -39,9 +39,9 @@ export interface LaneAdmissionPlan {
  *   holds the AudioBuffer plus planar copy. Compatibility decode holds the
  *   source plus three decoded-size PCM representations. Native parsing keeps
  *   the existing two-decoded-size lifecycle reservation for analysis scratch.
- * - Unknown footprints reserve the full conservative per-job peak. On devices
- *   whose aggregate holds two conservative routes that still allows two at
- *   once; constrained devices stay serial.
+ * - Unknown footprints reserve the full conservative per-job peak. No device
+ *   tier's aggregate holds two of those, so they run one at a time; on the
+ *   large tier smaller known footprints can still share the remaining room.
  * The hard-exclusive drain barrier applies to large unknown sources and to
  * compatibility jobs whose decoded PCM reaches the same device threshold.
  * Other known footprints do not need the source-size proxy because their
@@ -211,8 +211,11 @@ export function validateDecodeProbeMetadata(
     );
   }
 
-  const minimumFrameCount = Math.ceil(durationSeconds * sampleRate);
-  if (!Number.isSafeInteger(minimumFrameCount) || frameCount < minimumFrameCount) {
+  // Headers usually derive the duration as frameCount / sampleRate, and that
+  // float round trip can land a hair above the integer count. A half-frame
+  // tolerance absorbs the rounding while still rejecting a real shortfall.
+  const coveredFrames = durationSeconds * sampleRate;
+  if (!Number.isFinite(coveredFrames) || frameCount < coveredFrames - 0.5) {
     throw new DecodeResourceError(
       "invalid-metadata",
       `${label} frame count does not cover its reported duration.`,

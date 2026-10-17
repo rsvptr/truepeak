@@ -31,8 +31,8 @@ export function RecentSessionsPanel({
     <Card className={cn("h-full min-h-[260px] p-5 sm:p-6", className)}>
       <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
         <div>
-          <div className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">
-            Recent history
+          <div className="text-[0.6875rem] uppercase tracking-[0.18em] text-[var(--muted)]">
+            Saved history
           </div>
           <h2 className="mt-2 text-2xl font-semibold text-[var(--ink)]">
             Saved summaries from earlier runs
@@ -52,7 +52,7 @@ export function RecentSessionsPanel({
               disabled={!recentSessions.length}
             >
               <Trash2 className="h-4 w-4" />
-              Clear History
+              Clear saved history
             </Button>
           ) : null}
         </div>
@@ -75,7 +75,7 @@ export function RecentSessionsPanel({
               </div>
               <div className="mt-2 flex flex-wrap items-center gap-2">
                 {session.analysisMode === "measure-only" ? (
-                  <Badge>Measure Only</Badge>
+                  <Badge>Measure only</Badge>
                 ) : session.targetLabel ? (
                   <Badge>{session.targetLabel}</Badge>
                 ) : (
@@ -103,7 +103,7 @@ export function RecentSessionsPanel({
               </div>
               <div className="mt-4 grid grid-cols-2 gap-3 text-sm tabular-nums">
                 <div>
-                  <div className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">
+                  <div className="text-[0.6875rem] uppercase tracking-[0.18em] text-[var(--muted)]">
                     Integrated
                   </div>
                   <div className="mt-1 font-semibold text-[var(--ink)]">
@@ -111,7 +111,7 @@ export function RecentSessionsPanel({
                   </div>
                 </div>
                 <div>
-                  <div className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">
+                  <div className="text-[0.6875rem] uppercase tracking-[0.18em] text-[var(--muted)]">
                     True peak
                   </div>
                   <div className="mt-1 font-semibold text-[var(--ink)]">
@@ -119,7 +119,7 @@ export function RecentSessionsPanel({
                   </div>
                 </div>
               </div>
-              <div className="mt-4 flex min-w-0 flex-wrap items-center gap-2 text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">
+              <div className="mt-4 flex min-w-0 flex-wrap items-center gap-2 text-[0.6875rem] uppercase tracking-[0.18em] text-[var(--muted)]">
                 <span className="min-w-0 break-words">{session.channelLayoutName}</span>
                 <span className="min-w-0 break-words">{session.decoderLabel}</span>
               </div>
@@ -160,19 +160,19 @@ export function HistoryPreferenceCard({
     <Card className={cn("h-full min-h-[260px] p-5 sm:p-6", className)}>
       <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
         <div>
-          <div className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">
-            Local history
+          <div className="text-[0.6875rem] uppercase tracking-[0.18em] text-[var(--muted)]">
+            Saved history
           </div>
           <h2 className="mt-2 text-2xl font-semibold text-[var(--ink)]">
             Save finished readings only when you want to
           </h2>
           <p className="mt-2 max-w-2xl text-sm leading-6 text-[var(--muted)]">
-            History controls the view-only recent-summary list. Full completed results use a separate local recovery session until you choose Clear Session.
+            Saved history keeps view-only summaries of finished files. Full completed results use a separate local recovery session until you choose Clear session.
           </p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
           <Badge className={historyEnabled ? "tone-success" : "border-[var(--line)] bg-[var(--surface-1)] text-[var(--muted)]"}>
-            {historyEnabled ? "History On" : "History Off"}
+            {historyEnabled ? "History on" : "History off"}
           </Badge>
           {recentCount > 0 ? (
             <Badge className="border-[var(--line)] bg-[var(--surface-1)] text-[var(--muted)]">
@@ -185,22 +185,22 @@ export function HistoryPreferenceCard({
       <div className="mt-5 flex flex-wrap items-center gap-2">
         <Button type="button" size="sm" variant={historyEnabled ? "secondary" : "primary"} onClick={onToggle}>
           <History className="h-4 w-4" />
-          {historyEnabled ? "Turn History Off" : "Turn History On"}
+          {historyEnabled ? "Turn history off" : "Turn history on"}
         </Button>
         {recentCount > 0 ? (
           <Button type="button" size="sm" variant="ghost" onClick={onClear}>
             <Trash2 className="h-4 w-4" />
-            Clear Saved History
+            Clear saved history
           </Button>
         ) : null}
       </div>
 
       <div className="mt-4 rounded-[20px] border border-[var(--line)] bg-[var(--surface-1)] px-4 py-3 text-sm leading-6 text-[var(--muted)]">
         {historyEnabled
-          ? "New completed runs are also saved as compact view-only summaries. Clear Saved History removes those summaries; Clear Session removes the full recovery results."
+          ? "New completed runs are also saved as compact view-only summaries. Clear saved history removes those summaries; Clear session removes the full recovery results."
           : recentCount > 0
-            ? "Recent-summary history is off, so no new summaries are added. Existing saved summaries remain until you use Clear Saved History. Full completed results may also remain in recovery storage until you use Clear Session."
-            : "Recent-summary history is off. Full completed results may still be stored locally for crash/reload recovery until you use Clear Session."}
+            ? "Saved history is off, so no new summaries are added. Existing saved summaries remain until you use Clear saved history. Full completed results may also remain in recovery storage until you use Clear session."
+            : "Saved history is off. Full completed results may still be stored locally for crash/reload recovery until you use Clear session."}
       </div>
     </Card>
   );

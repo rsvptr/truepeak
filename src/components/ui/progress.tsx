@@ -23,7 +23,7 @@ export function Progress({ value, label = "Progress", className, ...props }: Pro
           the compositor, so parallel lanes ticking at once cause no layout work,
           and the rounded end cap keeps its shape. */}
       <div
-        className="h-full w-full rounded-full bg-[linear-gradient(90deg,var(--accent),var(--accent-strong))] transition-transform duration-300 ease-out"
+        className="h-full w-full rounded-full bg-[linear-gradient(90deg,var(--accent),var(--accent-strong))] transition-transform duration-150 ease-linear"
         style={{ transform: `translateX(-${100 - clamped}%)` }}
       />
     </div>

@@ -75,7 +75,14 @@ export function useQueueView({
     () => deriveSessionStats(completedJobs, activeTarget, analysisMode),
     [activeTarget, analysisMode, completedJobs],
   );
-  const queueCounts = useMemo(() => countQueueJobs(jobs), [jobs]);
+  // Progress ticks replace `jobs` without changing these counts, so the counts
+  // object keeps its identity until one of them actually changes.
+  const rawQueueCounts = useMemo(() => countQueueJobs(jobs), [jobs]);
+  const { all: allCount, active: activeCount, complete: completeCount, issues: issuesCount } = rawQueueCounts;
+  const queueCounts = useMemo(
+    () => ({ all: allCount, active: activeCount, complete: completeCount, issues: issuesCount }),
+    [activeCount, allCount, completeCount, issuesCount],
+  );
   const batchProgress = useMemo(
     () => deriveBatchProgress(jobs, parallelLimit),
     [jobs, parallelLimit],
@@ -87,7 +94,7 @@ export function useQueueView({
   return {
     batchProgress,
     complianceCounts: sessionStats.complianceCounts,
-    currentModeLabel: analysisMode === "targeted" ? activeTarget.label : "Measure Only",
+    currentModeLabel: analysisMode === "targeted" ? activeTarget.label : "Measure only",
     finishedCount: queueCounts.complete + queueCounts.issues,
     hottestTruePeak: sessionStats.hottestPeakJob?.result?.metrics.truePeakDbtp ?? null,
     queueAverage: sessionStats.averageIntegrated,
